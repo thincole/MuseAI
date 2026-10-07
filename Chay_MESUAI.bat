@@ -10,43 +10,44 @@ echo                  Phiên Bản Desktop Windows
 echo ====================================================================
 echo.
 
-:: Tìm đường dẫn Python 3
-set "PY_CMD="
+:: Tìm đường dẫn Python 3 (dùng goto để tránh lỗi %errorlevel% bị expand sớm trong khối ngoặc)
+set "PY_EXE="
+set "PY_ARGS="
 
 where python >nul 2>nul
-if %errorlevel% equ 0 (
-    set "PY_CMD=python"
-) else (
-    if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
-        set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
-    ) else if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" (
-        set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
-    ) else if exist "%LOCALAPPDATA%\Programs\Python\Python310\python.exe" (
-        set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
-    ) else if exist "C:\Python312\python.exe" (
-        set "PY_CMD=C:\Python312\python.exe"
-    ) else (
-        where py >nul 2>nul
-        if %errorlevel% equ 0 (
-            set "PY_CMD=py -3.12"
-        )
+if not errorlevel 1 (
+    set "PY_EXE=python"
+    goto :py_found
+)
+for %%V in (312 313 311 310) do (
+    if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" (
+        set "PY_EXE=%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"
+        goto :py_found
     )
 )
-
-if "%PY_CMD%"=="" (
-    echo [LOI] Khong tim thay Python tren he thong!
-    echo Vui long cai dat Python 3.10 tro len va tich vao "Add Python to PATH".
-    echo Nhan phim bat ky de thoat...
-    pause > nul
-    exit /b 1
+if exist "C:\Python312\python.exe" (
+    set "PY_EXE=C:\Python312\python.exe"
+    goto :py_found
+)
+where py >nul 2>nul
+if not errorlevel 1 (
+    set "PY_EXE=py"
+    set "PY_ARGS=-3"
+    goto :py_found
 )
 
-echo [*] Su dung trinh thuc thi Python: %PY_CMD%
-echo [*] Xoa trang nhat ky cu va khoi dong ung dung Desktop...
-if exist log.txt del /f /q log.txt >nul 2>&1
+echo [LOI] Khong tim thay Python tren he thong!
+echo Vui long cai dat Python 3.10 tro len va tich vao "Add Python to PATH".
+echo Nhan phim bat ky de thoat...
+pause > nul
+exit /b 1
+
+:py_found
+echo [*] Su dung trinh thuc thi Python: %PY_EXE% %PY_ARGS%
+echo [*] Khoi dong ung dung Desktop (nhat ky phien truoc duoc giu o log.txt.1)...
 echo.
 
-"%PY_CMD%" desktop_app.py
+"%PY_EXE%" %PY_ARGS% desktop_app.py
 
 if %errorlevel% neq 0 (
     echo.

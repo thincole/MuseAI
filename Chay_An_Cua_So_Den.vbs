@@ -1,3 +1,5 @@
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run "cmd /c Chay_Phan_Mem.bat", 0, False
+scriptDir = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
+WshShell.CurrentDirectory = scriptDir
+WshShell.Run "cmd /c """ & scriptDir & "\Chay_MESUAI.bat""", 0, False
 Set WshShell = Nothing
