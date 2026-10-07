@@ -43,7 +43,21 @@ data/mail_accounts.txt
 chrome-profile/
 muse2api-profiles/
 
+# Danh sách tài khoản / cookie / proxy (chứa email, mật khẩu, token, cookie phiên) — tuyệt đối không commit
+*-MUSE.txt
+*MUSE*.txt
+*khoa*.txt
+muse*lỗi*.txt
+data/auto_login_results.json
+data/auto_login_success_cookies.txt
+data/proxy_pool.json
+data/shopee_settings.json
+data/shopee_clip_cache.json
+data/shopee_blacklist.json
+data/tmp*
+
 # Logs & Backups
+log.txt
 *.log
 *.bak
 *.bak*

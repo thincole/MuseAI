@@ -1,0 +1,3716 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MuseAI Video Studio Pro - Phần Mềm Tạo Video AI Chuyên Nghiệp</title>
+  <link rel="icon" type="image/svg+xml" href="/muse-logo.svg">
+  <link rel="shortcut icon" href="/muse-logo.ico">
+  <style>
+    :root {
+      --bg: #070a12;
+      --bg-card: #0d1322;
+      --bg-card-hover: #121a30;
+      --panel: rgba(18, 26, 44, 0.7);
+      --border: rgba(255, 255, 255, 0.08);
+      --border-focus: #3b82f6;
+      --accent: #3b82f6;
+      --accent-glow: rgba(59, 130, 246, 0.4);
+      --purple: #8b5cf6;
+      --purple-glow: rgba(139, 92, 246, 0.35);
+      --pink: #ec4899;
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --radius: 14px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: radial-gradient(circle at 15% 10%, #172554 0%, #070a12 55%), #070a12;
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      overflow-x: hidden;
+      user-select: none;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25); }
+
+    /* Layout */
+    .app-container {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    /* Top Navigation Bar */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 24px;
+      background: rgba(10, 15, 26, 0.85);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+      z-index: 50;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 16px var(--accent-glow);
+    }
+
+    .brand-icon svg { width: 22px; height: 22px; fill: white; }
+
+    .brand-text h1 {
+      font-size: 17px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      background: linear-gradient(135deg, #ffffff, #cbd5e1);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-text span {
+      font-size: 11px;
+      font-weight: 500;
+      color: #60a5fa;
+      background: rgba(59, 130, 246, 0.15);
+      padding: 1px 6px;
+      border-radius: 4px;
+      margin-left: 6px;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-muted);
+      background: rgba(255, 255, 255, 0.04);
+      padding: 6px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 10px var(--success);
+    }
+    .dot.offline { background: var(--danger); box-shadow: 0 0 10px var(--danger); }
+    .dot.warning { background: var(--warning); box-shadow: 0 0 10px var(--warning); }
+
+    .btn-header {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 7px 14px;
+      border-radius: 8px;
+      font-size: 12.5px;
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+    .btn-header:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    /* Main Body Area */
+    .main-body {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* Sidebar Navigation */
+    aside.sidebar {
+      width: 230px;
+      background: rgba(10, 14, 25, 0.6);
+      border-right: 1px solid var(--border);
+      padding: 20px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 11px 14px;
+      border-radius: 10px;
+      color: var(--text-muted);
+      font-size: 13.5px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+      border: 1px solid transparent;
+    }
+
+    .nav-item svg { width: 19px; height: 19px; fill: currentColor; }
+
+    .nav-item:hover {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .nav-item.active {
+      color: #fff;
+      background: linear-gradient(90deg, rgba(59, 130, 246, 0.2) 0%, rgba(139, 92, 246, 0.1) 100%);
+      border-color: rgba(59, 130, 246, 0.4);
+      box-shadow: 0 2px 12px rgba(59, 130, 246, 0.15);
+    }
+
+    .nav-item.active svg { fill: #60a5fa; }
+
+    .sidebar-footer {
+      margin-top: auto;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .account-summary-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 12px;
+    }
+
+    .account-summary-title {
+      color: var(--text-dim);
+      margin-bottom: 4px;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .account-summary-count {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--success);
+    }
+
+    /* Content Area */
+    .content-area {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 32px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .tab-content { display: none; }
+    .tab-content.active { display: block; animation: fadeIn 0.2s ease; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Studio Grid */
+    .studio-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 24px;
+      align-items: start;
+    }
+
+    /* Cards */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+      position: relative;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+
+    .card-title {
+      font-size: 15px;
+      font-weight: 650;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .card-title svg { width: 18px; height: 18px; fill: #60a5fa; }
+
+    /* Segmented Mode Switcher */
+    .seg-switch {
+      display: flex;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 3px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      margin-bottom: 18px;
+    }
+
+    .seg-btn {
+      flex: 1;
+      text-align: center;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .seg-btn.active {
+      background: linear-gradient(135deg, #2563eb, #3b82f6);
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
+    }
+
+    /* Form Controls */
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    .form-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12.5px;
+      font-weight: 500;
+      color: var(--text-muted);
+      margin-bottom: 7px;
+    }
+
+    .form-label span.action-link {
+      color: #60a5fa;
+      cursor: pointer;
+      font-size: 12px;
+      text-decoration: underline;
+    }
+
+    textarea.prompt-input {
+      width: 100%;
+      height: 110px;
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      color: #fff;
+      font-size: 13.5px;
+      font-family: inherit;
+      line-height: 1.5;
+      resize: vertical;
+      outline: none;
+      transition: border 0.2s;
+    }
+
+    textarea.prompt-input:focus {
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+    }
+
+    /* Template Chips & Prompt Enhancer */
+    .prompt-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 8px;
+      gap: 10px;
+    }
+
+    .btn-enhance {
+      background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(236, 72, 153, 0.2));
+      border: 1px solid rgba(139, 92, 246, 0.4);
+      color: #d8b4fe;
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+
+    .btn-enhance:hover {
+      background: linear-gradient(135deg, rgba(139, 92, 246, 0.35), rgba(236, 72, 153, 0.35));
+      border-color: rgba(139, 92, 246, 0.6);
+      transform: translateY(-1px);
+    }
+
+    .chip-container {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      max-width: 65%;
+    }
+
+    .chip {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 11.5px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+
+    .chip:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    /* Camera Movement Presets */
+    .camera-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    .cam-btn {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 6px;
+      text-align: center;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .cam-btn:hover {
+      background: rgba(255, 255, 255, 0.08);
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .cam-btn.active {
+      background: rgba(59, 130, 246, 0.2);
+      border-color: #3b82f6;
+      color: #93c5fd;
+      font-weight: 600;
+    }
+
+    /* Image Upload Box */
+    .image-dropzone {
+      border: 2px dashed rgba(255, 255, 255, 0.15);
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+      background: rgba(0, 0, 0, 0.25);
+      cursor: pointer;
+      position: relative;
+      transition: all 0.2s;
+    }
+
+    .image-dropzone:hover {
+      border-color: #3b82f6;
+      background: rgba(59, 130, 246, 0.05);
+    }
+
+    .image-preview-box {
+      position: relative;
+      width: 100%;
+      height: 180px;
+      border-radius: 10px;
+      overflow: hidden;
+      display: none;
+      background: #000;
+    }
+
+    .image-preview-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .btn-remove-img {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(239, 68, 68, 0.85);
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+
+    /* Options Row */
+    .options-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .option-group-title {
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+    }
+
+    .pills-group {
+      display: flex;
+      gap: 6px;
+    }
+
+    .pill-btn {
+      flex: 1;
+      text-align: center;
+      padding: 8px 6px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 12px;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .pill-btn:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+    .pill-btn.active {
+      background: rgba(59, 130, 246, 0.25);
+      border-color: #3b82f6;
+      color: #fff;
+      font-weight: 600;
+    }
+
+    /* Main CTA Button */
+    .btn-generate {
+      width: 100%;
+      margin-top: 20px;
+      padding: 14px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #2563eb, #8b5cf6);
+      border: none;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      box-shadow: 0 4px 20px rgba(59, 130, 246, 0.4);
+      transition: all 0.2s;
+    }
+
+    .btn-generate:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 24px rgba(139, 92, 246, 0.5);
+      background: linear-gradient(135deg, #1d4ed8, #7c3aed);
+    }
+
+    .btn-generate:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    /* Right Column: Player & Live Monitor */
+    .monitor-card {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .video-viewport {
+      width: 100%;
+      height: 380px;
+      background: #04060a;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+
+    .video-viewport video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .viewport-placeholder {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: var(--text-dim);
+      font-size: 13px;
+      text-align: center;
+      padding: 24px;
+    }
+
+    .viewport-placeholder svg { width: 48px; height: 48px; fill: rgba(255, 255, 255, 0.1); }
+
+    /* Progress Banner */
+    .progress-banner {
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      display: none;
+    }
+
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12.5px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .progress-bar-bg {
+      width: 100%;
+      height: 8px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 8px;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #3b82f6, #ec4899);
+      border-radius: 999px;
+      transition: width 0.4s ease;
+      box-shadow: 0 0 12px rgba(236, 72, 153, 0.6);
+    }
+
+    .progress-details {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11.5px;
+      color: var(--text-dim);
+    }
+
+    /* Video Actions */
+    .video-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 4px;
+    }
+
+    .btn-action {
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all 0.2s;
+    }
+
+    .btn-action:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .btn-action.primary {
+      background: rgba(59, 130, 246, 0.2);
+      border-color: rgba(59, 130, 246, 0.5);
+      color: #93c5fd;
+    }
+    .btn-action.primary:hover {
+      background: rgba(59, 130, 246, 0.35);
+    }
+
+    /* Gallery Grid */
+    .gallery-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .gallery-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      transition: all 0.2s;
+      position: relative;
+    }
+
+    .gallery-card:hover {
+      transform: translateY(-2px);
+      border-color: rgba(255, 255, 255, 0.2);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    }
+
+    .gallery-thumb {
+      width: 100%;
+      height: 160px;
+      background: #030509;
+      position: relative;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .gallery-thumb video, .gallery-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .gallery-play-icon {
+      position: absolute;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      pointer-events: none;
+    }
+
+    .gallery-info {
+      padding: 12px;
+    }
+
+    .gallery-filename {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 4px;
+    }
+
+    .gallery-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+
+    .gallery-acts {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+      border-top: 1px solid var(--border);
+      padding-top: 8px;
+    }
+
+    .btn-tiny {
+      flex: 1;
+      padding: 5px 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 11px;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.15s;
+    }
+
+    .btn-tiny:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+    }
+
+    .btn-tiny.danger:hover {
+      background: rgba(239, 68, 68, 0.2);
+      color: #f87171;
+      border-color: rgba(239, 68, 68, 0.4);
+    }
+
+    /* Account Table */
+    .acc-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin-top: 12px;
+    }
+
+    .acc-table th {
+      text-align: left;
+      padding: 10px 14px;
+      background: rgba(0, 0, 0, 0.3);
+      color: var(--text-dim);
+      font-size: 11.5px;
+      font-weight: 600;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .acc-table td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    /* Shopee UI Elements (Matching Novagate) */
+    .shopee-card {
+      background: #0d1322;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 18px;
+      margin-bottom: 12px;
+    }
+    .shopee-card-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .shopee-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .shopee-row:last-child {
+      margin-bottom: 0;
+    }
+    .shopee-lbl {
+      font-size: 12px;
+      color: #94a3b8;
+      white-space: nowrap;
+    }
+    .shopee-select {
+      background: #2563eb;
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      padding: 5px 8px;
+      font-size: 12px;
+      font-weight: 500;
+      outline: none;
+      cursor: pointer;
+    }
+    .shopee-select option {
+      background: #0f172a;
+      color: #fff;
+    }
+    .shopee-input {
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      padding: 5px 8px;
+      font-size: 12px;
+      color: #fff;
+      outline: none;
+    }
+    .shopee-input:focus {
+      border-color: #3b82f6;
+    }
+    .shopee-btn {
+      padding: 6px 14px;
+      border-radius: 6px;
+      border: none;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      color: #fff;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: opacity 0.15s;
+    }
+    .shopee-btn:hover { opacity: 0.9; }
+    .shopee-btn:active { transform: translateY(1px); }
+    .shopee-btn-blue { background: #2563eb; }
+    .shopee-btn-red { background: #E53935; }
+    .shopee-btn-lightred { background: #E57373; }
+    .shopee-btn-grey { background: #5f6368; }
+    .shopee-btn-green { background: #10b981; }
+    .shopee-chk {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11.5px;
+      color: #cbd5e1;
+      cursor: pointer;
+    }
+    .shopee-chk input {
+      accent-color: #2563eb;
+      width: 14px;
+      height: 14px;
+      cursor: pointer;
+    }
+    .shopee-console {
+      width: 100%;
+      height: 240px;
+      background: #030712;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+      font-size: 11.5px;
+      color: #e2e8f0;
+      line-height: 1.55;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* Modals / Toasts */
+    .toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .toast {
+      background: rgba(15, 23, 42, 0.95);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 18px;
+      color: #fff;
+      font-size: 13px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      animation: slideIn 0.3s ease;
+    }
+
+    @keyframes slideIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+
+    /* Modal Player */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.8);
+      backdrop-filter: blur(8px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+
+    .modal-content {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      width: 90%;
+      max-width: 900px;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    }
+  </style>
+</head>
+<body>
+
+<div class="app-container">
+  <!-- Top Navigation Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon" style="background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); box-shadow: none;">
+        <img src="/muse-logo.svg" alt="Muse Logo" style="width: 24px; height: 24px; object-fit: contain;">
+      </div>
+      <div class="brand-text">
+        <h1>MuseAI Video Studio <span id="appVersionBadge">Desktop v1.2.1</span></h1>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <div class="status-badge">
+        <span class="dot" id="serverDot"></span>
+        <span id="serverStatusText">Đang kết nối...</span>
+      </div>
+
+      <button class="btn-header" onclick="openMediaFolder()" title="Mở thư mục lưu trữ video trên máy tính">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M19 4h-6l-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"/></svg>
+        Thư Mục Video
+      </button>
+
+      <button class="btn-header" onclick="openAdmin()" title="Mở trang Quản trị chi tiết cũ">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Admin Console
+      </button>
+
+      <button class="btn-header" onclick="refreshAll()" title="Làm mới trạng thái">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Body Section -->
+  <div class="main-body">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <div class="nav-item active" onclick="switchTab('studio')">
+        <svg viewBox="0 0 24 24"><path d="m15 10 4.55-2.27A1 1 0 0 1 21 8.62v6.76a1 1 0 0 1-1.45.89L15 14v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2z"/></svg>
+        Tạo Video AI
+      </div>
+
+      <div class="nav-item" onclick="switchTab('shopee')">
+        <svg viewBox="0 0 24 24"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>
+        Shopee DB & Batch
+      </div>
+
+      <div class="nav-item" onclick="switchTab('image')">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+        Tạo Ảnh AI
+      </div>
+
+      <div class="nav-item" onclick="switchTab('gallery')">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        Thư Viện Media
+      </div>
+
+      <div class="nav-item" onclick="switchTab('accounts')">
+        <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        Tài Khoản Muse
+      </div>
+
+      <div class="nav-item" onclick="switchTab('settings')">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Cài Đặt & Hướng Dẫn
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="account-summary-card">
+          <div class="account-summary-title">
+            <span>TÀI KHOẢN POOL</span>
+            <span id="activeAccCount" class="account-summary-count">0 Sẵn Sàng</span>
+          </div>
+          <div style="color:var(--text-dim);font-size:11px;" id="accountDetailText">Kiểm tra kết nối...</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Content Workspace -->
+    <main class="content-area">
+
+      <!-- ==================== TAB 1: TẠO VIDEO AI ==================== -->
+      <section id="tab-studio" class="tab-content active">
+        <div class="studio-grid">
+          <!-- Left: Video Creator Controls -->
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">
+                <svg viewBox="0 0 24 24"><path d="m15 10 4.55-2.27A1 1 0 0 1 21 8.62v6.76a1 1 0 0 1-1.45.89L15 14v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2z"/></svg>
+                Trình Tạo Video AI Chuyên Nghiệp
+              </div>
+            </div>
+
+            <!-- Mode Switcher -->
+            <div class="seg-switch">
+              <div class="seg-btn active" id="modeTextBtn" onclick="setVideoMode('text')">📝 Văn Bản Thành Video (Text-to-Video)</div>
+              <div class="seg-btn" id="modeImageBtn" onclick="setVideoMode('image')">🖼️ Ảnh Thành Video (Image-to-Video)</div>
+            </div>
+
+            <!-- Reference Image Input Box (Visible in Image mode) -->
+            <div id="imageInputSection" style="display:none;" class="form-group">
+              <div class="form-label">
+                <span>Khung hình đầu tham khảo (First Frame)</span>
+                <span class="action-link" onclick="triggerPickImage()">Duyệt từ máy</span>
+              </div>
+              
+              <div class="image-dropzone" id="dropzoneBox" onclick="triggerPickImage()">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-bottom:8px;color:#60a5fa;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+                <div style="font-size:13px;font-weight:600;color:#fff;">Kéo thả ảnh vào đây hoặc bấm để chọn ảnh</div>
+                <div style="font-size:11.5px;color:var(--text-dim);margin-top:4px;">Hỗ trợ PNG, JPG, WebP. Hoặc nhấn Ctrl+V để dán ảnh</div>
+              </div>
+
+              <div class="image-preview-box" id="previewBox">
+                <img id="previewImg" src="" alt="First frame preview">
+                <button type="button" class="btn-remove-img" onclick="removeSelectedImage(event)">✕ Xóa ảnh</button>
+              </div>
+              <input type="file" id="hiddenFileInput" accept="image/*" style="display:none" onchange="handleFilePicked(event)">
+            </div>
+
+            <!-- Prompt Box -->
+            <div class="form-group">
+              <div class="form-label">
+                <span>Kịch bản & Mô tả chuyển động Video</span>
+                <span style="color:var(--text-dim);font-size:11px;" id="charCount">0 ký tự</span>
+              </div>
+              <textarea class="prompt-input" id="videoPrompt" placeholder="Nhập kịch bản video... Ví dụ: Một phi hành gia bước đi trên bề mặt sao Hỏa phủ đầy cát đỏ, ánh hoàng hôn chiếu rọi qua mũ kính, chuyển động chậm điện ảnh..."></textarea>
+              
+              <div class="prompt-toolbar">
+                <button type="button" class="btn-enhance" onclick="enhancePrompt()" title="Tự động dịch và bổ sung từ khóa điện ảnh chất lượng cao">
+                  ✨ Tối Ưu Prompt AI
+                </button>
+
+                <div class="chip-container">
+                  <div class="chip" onclick="applyTemplate('cyberpunk')">🌃 Cyberpunk</div>
+                  <div class="chip" onclick="applyTemplate('cinematic')">🎬 Điện Ảnh 8K</div>
+                  <div class="chip" onclick="applyTemplate('anime')">🌸 Anime Shinkai</div>
+                  <div class="chip" onclick="applyTemplate('drone')">🦅 Flycam FPV</div>
+                  <div class="chip" onclick="applyTemplate('slowmo')">🐢 Slow-Motion</div>
+                  <div class="chip" onclick="applyTemplate('ocean')">🌊 Đại Dương Sâu</div>
+                  <div class="chip" onclick="applyTemplate('nature')">🌿 Rừng Mưa Nhiệt Đới</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Camera Movement Controls -->
+            <div class="form-group">
+              <div class="form-label">
+                <span>Góc quay & Chuyển động Camera (Camera Movement)</span>
+              </div>
+              <div class="camera-grid">
+                <div class="cam-btn" onclick="toggleCamera(this, 'Zoom In, máy quay tiến tới gần chủ thể')">🔍 Zoom In</div>
+                <div class="cam-btn" onclick="toggleCamera(this, 'Zoom Out, máy quay lùi xa mở rộng góc')">🔎 Zoom Out</div>
+                <div class="cam-btn" onclick="toggleCamera(this, 'Pan Left, máy quay quét mượt sang trái')">⬅️ Pan Trái</div>
+                <div class="cam-btn" onclick="toggleCamera(this, 'Pan Right, máy quay quét mượt sang phải')">➡️ Pan Phải</div>
+                <div class="cam-btn" onclick="toggleCamera(this, 'Orbit 360 degree, máy quay lượn vòng cung quanh chủ thể')">🔄 Quay Vòng</div>
+                <div class="cam-btn" onclick="toggleCamera(this, 'Drone shot, góc nhìn flycam từ trên cao lướt xuống')">🚁 Flycam</div>
+                <div class="cam-btn" onclick="toggleCamera(this, 'Cinematic slow-motion 120fps, chuyển động siêu chậm')">🐢 Slow-Mo</div>
+                <div class="cam-btn" onclick="toggleCamera(this, 'Tilt Up, máy quay hướng từ dưới chân lên trời')">⬆️ Hướng Lên</div>
+              </div>
+            </div>
+
+            <!-- Parameters Grid (Ratio & Duration) -->
+            <div class="options-row">
+              <div>
+                <div class="option-group-title">TỶ LỆ KHUNG HÌNH (ASPECT RATIO)</div>
+                <div class="pills-group">
+                  <div class="pill-btn active" onclick="setRatio(this, '16:9')">🖥️ 16:9 Ngang</div>
+                  <div class="pill-btn" onclick="setRatio(this, '9:16')">📱 9:16 Dọc</div>
+                  <div class="pill-btn" onclick="setRatio(this, '1:1')">⏹️ 1:1 Vuông</div>
+                </div>
+              </div>
+
+              <div>
+                <div class="option-group-title">THỜI LƯỢNG VIDEO (DURATION)</div>
+                <div class="pills-group">
+                  <div class="pill-btn active" onclick="setDuration(this, 8)">8 Giây</div>
+                  <div class="pill-btn" onclick="setDuration(this, 10)">10 Giây</div>
+                  <div class="pill-btn" onclick="setDuration(this, 16)">16 Giây</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Generate Button -->
+            <button class="btn-generate" id="generateBtn" onclick="startGenerateVideo()">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48 2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48 2.83-2.83"/></svg>
+              BẮT ĐẦU TẠO VIDEO AI
+            </button>
+          </div>
+
+          <!-- Right: Live Monitor & Player -->
+          <div class="card monitor-card">
+            <div class="card-header">
+              <div class="card-title">
+                <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                Xem Trước & Trình Phát Video
+              </div>
+              <span id="currentStatusTag" style="font-size:11.5px;color:var(--text-dim);">Sẵn sàng</span>
+            </div>
+
+            <!-- Video Player Viewport -->
+            <div class="video-viewport" id="videoViewport">
+              <div class="viewport-placeholder" id="videoPlaceholder">
+                <svg viewBox="0 0 24 24"><path d="m15 10 4.55-2.27A1 1 0 0 1 21 8.62v6.76a1 1 0 0 1-1.45.89L15 14v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2z"/></svg>
+                <div>Video AI của bạn sau khi tạo sẽ hiển thị tại đây</div>
+                <div style="font-size:11px;">Hỗ trợ phát lặp lại, xem toàn màn hình và tải trực tiếp về máy</div>
+              </div>
+              <video id="mainPlayer" controls loop style="display:none;"></video>
+            </div>
+
+            <!-- Progress Monitor Card -->
+            <div class="progress-banner" id="progressBanner">
+              <div class="progress-header">
+                <span id="progressStateText">Đang khởi tạo tiến trình...</span>
+                <span id="progressPercentText" style="color:#60a5fa;">10%</span>
+              </div>
+              <div class="progress-bar-bg">
+                <div class="progress-bar-fill" id="progressBarFill"></div>
+              </div>
+              <div class="progress-details">
+                <span id="progressTaskId">Mã Task: --</span>
+                <span id="progressTimer">Đã chạy: 0s</span>
+              </div>
+            </div>
+
+            <!-- Action Buttons for Video -->
+            <div class="video-actions" id="videoActionsBar" style="display:none;">
+              <button class="btn-action primary" onclick="downloadCurrentVideo()">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4m4-5 5 5 5-5m-5 5V3"/></svg>
+                Lưu Video (.MP4)
+              </button>
+
+              <button class="btn-action" onclick="openMediaFolder()">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                Mở Thư Mục
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 2: TẠO ẢNH AI ==================== -->
+      <section id="tab-image" class="tab-content">
+        <div class="card" style="max-width:850px;margin:0 auto;">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+              Tạo Ảnh AI (Mẫu Khung Hình Đầu)
+            </div>
+          </div>
+
+          <div class="form-group">
+            <div class="form-label">Mô tả ảnh nghệ thuật cần tạo</div>
+            <textarea class="prompt-input" id="imagePrompt" placeholder="Nhập mô tả hình ảnh... Ví dụ: Chân dung chiến binh Cyberpunk với giáp kim loại phản chiếu ánh đèn neon Tokyo, độ sắc nét cao 8k..."></textarea>
+          </div>
+
+          <div class="options-row">
+            <div>
+              <div class="option-group-title">TỶ LỆ KHUNG ẢNH</div>
+              <div class="pills-group">
+                <div class="pill-btn active" onclick="setImageRatio(this, '16:9')">16:9 Ngang</div>
+                <div class="pill-btn" onclick="setImageRatio(this, '9:16')">9:16 Dọc</div>
+                <div class="pill-btn" onclick="setImageRatio(this, '1:1')">1:1 Vuông</div>
+              </div>
+            </div>
+          </div>
+
+          <button class="btn-generate" id="generateImgBtn" onclick="startGenerateImage()" style="margin-top:16px;">
+            🎨 TẠO ẢNH AI NGAY
+          </button>
+
+          <div id="imageResultSection" style="margin-top:24px;display:none;text-align:center;">
+            <div style="border-radius:12px;overflow:hidden;border:1px solid var(--border);background:#000;display:inline-block;max-width:100%;max-height:480px;">
+              <img id="generatedImgResult" src="" alt="Generated image" style="max-width:100%;max-height:480px;object-fit:contain;display:block;">
+            </div>
+            <div style="margin-top:14px;display:flex;gap:10px;justify-content:center;">
+              <button class="btn-action primary" onclick="sendImageToVideoStudio()">
+                🎬 Dùng Ảnh Này Tạo Video Ngay
+              </button>
+              <button class="btn-action" onclick="downloadGeneratedImage()">
+                💾 Tải Ảnh Về Máy
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 3: THƯ VIỆN MEDIA ==================== -->
+      <section id="tab-gallery" class="tab-content">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+              Bộ Sưu Tập Video & Ảnh Đã Tạo
+            </div>
+            <div style="display:flex;gap:10px;">
+              <button class="btn-header" onclick="loadGallery()">🔄 Tải Lại Thư Viện</button>
+              <button class="btn-header" onclick="openMediaFolder()">📂 Mở Thư Mục Ổ Đĩa</button>
+            </div>
+          </div>
+
+          <div class="gallery-grid" id="galleryGrid">
+            <div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-dim);">
+              Đang tải danh sách media...
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 4: QUẢN LÝ TÀI KHOẢN ==================== -->
+      <section id="tab-accounts" class="tab-content">
+        <div class="card" style="margin-bottom:20px;">
+          <div class="card-header">
+            <div class="card-title">
+              <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+              Thêm Tài Khoản Muse.ai Mới Vào Pool
+            </div>
+          </div>
+
+          <div style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">
+            Muse.ai cung cấp lượt tạo video & ảnh miễn phí cho tài khoản. Bạn có thể nhập nhiều tài khoản để phần mềm tự động luân phiên xoay vòng và duy trì kết nối 48 giờ.
+          </div>
+
+          <div style="display:grid;grid-template-columns:1fr 2.5fr auto;gap:12px;align-items:flex-end;">
+            <div>
+              <div class="form-label">Tên / Ghi chú</div>
+              <input type="text" id="accLabelInput" placeholder="Ví dụ: Tài khoản Muse 1" style="width:100%;padding:10px;border-radius:8px;background:rgba(0,0,0,0.4);border:1px solid var(--border);color:#fff;">
+            </div>
+
+            <div>
+              <div class="form-label">Cookie Header (Dán chuỗi Cookie từ F12 hoặc Extension)</div>
+              <input type="text" id="accCookieInput" placeholder="hatch_sess=...; hatch_vml=...; hatch_gw=..." style="width:100%;padding:10px;border-radius:8px;background:rgba(0,0,0,0.4);border:1px solid var(--border);color:#fff;font-family:monospace;font-size:12px;">
+            </div>
+
+            <button class="btn-action primary" onclick="submitAddAccount()" style="padding:10px 18px;height:42px;">
+              ➕ Thêm Tài Khoản
+            </button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              Danh Sách Tài Khoản Trong Hệ Thống
+            </div>
+            <div style="display:flex;gap:8px;">
+              <button class="btn-header" onclick="syncThinAptmProxy()" style="background:rgba(59,130,246,0.15);border:1px solid #3b82f6;color:#60a5fa;" title="Tự động nạp danh sách HomeProxy từ E:\ThinAptm0707 và gán cố định cho từng tài khoản">
+                🌐 Nạp Proxy ThinAptm
+              </button>
+              <button class="btn-header" onclick="triggerKeepaliveAll()">
+                ⚡ Giữ Kết Nối & Đánh Thức VM (Keepalive All)
+              </button>
+            </div>
+          </div>
+
+          <div style="background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.25);border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:10px;">
+            <span style="font-size:20px;">🛡️</span>
+            <div style="font-size:12px;color:#94a3b8;line-height:1.5;">
+              <b style="color:#38bdf8;">Cơ chế bảo vệ máy tính khi nhập số lượng lớn (Ví dụ: 100 tài khoản):</b><br>
+              Hệ thống <b>không bao giờ</b> chạy cùng lúc 100 tài khoản gây đơ hoặc quá tải máy tính. Bạn hoàn toàn chủ động giới hạn tại mục <b>"Số luồng song song"</b> ở Tab Shopee (mặc định 2 luồng). Hệ thống sẽ tự động mượn luân phiên từng tài khoản rảnh từ kho 100 tài khoản để xử lý, làm xong trả về và chuyển sang tài khoản tiếp theo! Mỗi tài khoản được gắn <b>1 Proxy cố định</b> từ HomeProxy, chỉ đổi khi proxy bị chết.
+            </div>
+          </div>
+
+          <table class="acc-table">
+            <thead>
+              <tr>
+                <th>Tên Tài Khoản</th>
+                <th>Trạng Thái</th>
+                <th>Proxy Cố Định</th>
+                <th>Số Cookie</th>
+                <th>Hạn Sử Dụng</th>
+                <th>Số Lần Dùng</th>
+                <th>Thao Tác</th>
+              </tr>
+            </thead>
+            <tbody id="accountsTableBody">
+              <tr>
+                <td colspan="7" style="text-align:center;color:var(--text-dim);padding:30px;">
+                  Đang tải danh sách tài khoản...
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ==================== TAB 5: CÀI ĐẶT & HƯỚNG DẪN ==================== -->
+      <section id="tab-settings" class="tab-content">
+        <div class="studio-grid">
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">
+                <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                Thông Số Hệ Thống
+              </div>
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:12px;font-size:13px;">
+              <div>
+                <div style="color:var(--text-dim);font-size:11.5px;margin-bottom:4px;">BASE URL API</div>
+                <input type="text" id="cfgBaseUrl" readonly style="width:100%;padding:8px 12px;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:8px;color:#fff;font-family:monospace;">
+              </div>
+
+              <div>
+                <div style="color:var(--text-dim);font-size:11.5px;margin-bottom:4px;">API KEY BẢO MẬT</div>
+                <input type="text" id="cfgApiKey" readonly style="width:100%;padding:8px 12px;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:8px;color:#fff;font-family:monospace;">
+              </div>
+
+              <div>
+                <div style="color:var(--text-dim);font-size:11.5px;margin-bottom:4px;">ĐƯỜNG DẪN TRÌNH DUYỆT CHROME/CHROMIUM</div>
+                <input type="text" id="cfgChromium" readonly style="width:100%;padding:8px 12px;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:8px;color:#fff;font-family:monospace;">
+              </div>
+
+              <div>
+                <div style="color:var(--text-dim);font-size:11.5px;margin-bottom:4px;">THƯ MỤC LƯU VIDEO</div>
+                <input type="text" id="cfgMediaDir" readonly style="width:100%;padding:8px 12px;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:8px;color:#fff;font-family:monospace;">
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">
+                📖 Hướng Dẫn Lấy Cookie Muse.ai Trong 1 Phút
+              </div>
+            </div>
+
+            <div style="font-size:13px;line-height:1.7;color:var(--text-muted);">
+              <ol style="padding-left:20px;display:flex;flex-direction:column;gap:10px;">
+                <li>
+                  <b>Cách 1 (Khuyên Dùng) - Cài Tiện Ích Chrome Extension:</b><br>
+                  Mở trình duyệt Chrome/Edge, vào <code style="color:#60a5fa;">chrome://extensions</code>, bật <b>Developer mode (Chế độ nhà phát triển)</b>, bấm <b>Load unpacked (Tải tiện ích đã giải nén)</b> và chọn thư mục <code style="color:#60a5fa;">extension</code> trong thư mục phần mềm. Sau đó đăng nhập <a href="https://muse.ai" target="_blank" style="color:#60a5fa;">muse.ai</a> và bấm biểu tượng tiện ích để nhập tự động!
+                </li>
+                <li>
+                  <b>Cách 2 - Dùng Tampermonkey Script:</b><br>
+                  Cài tiện ích Tampermonkey, thêm tệp <code style="color:#60a5fa;">tools/muse2api_cookie_importer.user.js</code>. Khi mở muse.ai sẽ có nút bấm nhanh ở góc màn hình.
+                </li>
+                <li>
+                  <b>Cách 3 - Thủ công F12:</b><br>
+                  Nhấn <kbd>F12</kbd> trên trang muse.ai -> Chọn tab <b>Application</b> -> <b>Cookies</b> -> Lấy các giá trị: <code style="color:#60a5fa;">hatch_sess</code> và <code style="color:#60a5fa;">hatch_vml</code> dán vào ô thêm tài khoản.
+                </li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB SHOPEE DATABASE & BATCH ==================== -->
+      <section id="tab-shopee" class="tab-content">
+        <!-- Card 0: Bảo vệ Trình Duyệt & Anti-Detect (HomeProxy & TTL Lifecycle) -->
+        <div class="shopee-card" style="border: 1px solid rgba(59, 130, 246, 0.35); background: linear-gradient(180deg, rgba(30, 41, 59, 0.65) 0%, rgba(15, 23, 42, 0.85) 100%); margin-bottom:12px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <div class="shopee-card-title" style="margin-bottom:0; color:#60a5fa; font-size:13px; font-weight:700;">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-right:4px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+              🛡️ BẢO VỆ TRÌNH DUYỆT & CHỐNG PHÁT HIỆN BOT (HOMEPROXY + TTL LIFECYCLE)
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button type="button" class="shopee-btn" onclick="syncThinAptmProxy()" style="background:#2563eb; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;">
+                🌐 Nạp Proxy ThinAptm
+              </button>
+              <button type="button" class="shopee-btn" onclick="recycleBrowserSessions()" style="background:#475569; color:#f8fafc; font-size:11px; padding:4px 10px; font-weight:600;" title="Giải phóng RAM và tái sinh phiên trình duyệt sạch">
+                ♻️ Làm Mới / Dọn RAM Trình Duyệt
+              </button>
+            </div>
+          </div>
+
+          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-bottom:10px;">
+            <div style="background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.06);">
+              <div style="font-size:11px; color:var(--text-dim); margin-bottom:2px;">🌐 HomeProxy Sticky</div>
+              <div id="spHomeProxyStatus" style="font-size:13px; font-weight:600; color:#38bdf8;">Đang nạp dữ liệu...</div>
+            </div>
+            <div style="background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.06);">
+              <div style="font-size:11px; color:var(--text-dim); margin-bottom:2px;">⏱️ TTL Phiên Trình Duyệt</div>
+              <div id="spBrowserTtlStatus" style="font-size:13px; font-weight:600; color:#4ade80;">30 phút / 5 tác vụ</div>
+            </div>
+            <div style="background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.06);">
+              <div style="font-size:11px; color:var(--text-dim); margin-bottom:2px;">🛡️ Anti-Detect Stealth</div>
+              <div style="font-size:13px; font-weight:600; color:#a78bfa;">WebRTC Lock + GPU Spoof (Bật)</div>
+            </div>
+          </div>
+
+          <div class="shopee-row" style="margin-bottom:0; flex-wrap:wrap; gap:8px; align-items:center;">
+            <span class="shopee-lbl">Thời gian sống TTL:</span>
+            <select class="shopee-select" id="sp_browser_ttl" onchange="changeBrowserTtl(this.value)">
+              <option value="900">15 phút (900s)</option>
+              <option value="1800" selected>30 phút (1800s - Khuyên dùng)</option>
+              <option value="3600">60 phút (3600s)</option>
+              <option value="7200">120 phút (7200s)</option>
+            </select>
+
+            <span class="shopee-lbl" style="margin-left:8px;">Giới hạn Task trước khi Reset:</span>
+            <select class="shopee-select" id="sp_browser_max_tasks" onchange="changeBrowserMaxTasks(this.value)">
+              <option value="3">3 task / phiên</option>
+              <option value="5" selected>5 task / phiên (Khuyên dùng)</option>
+              <option value="10">10 task / phiên</option>
+            </select>
+
+            <span style="font-size:11px; color:var(--text-dim); margin-left:6px;">
+              💡 Tự động hủy và tạo mới Browser Context sạch sẽ sau khi đạt hạn TTL, chống tràn RAM và tránh bị Muse phát hiện bot.
+            </span>
+          </div>
+        </div>
+
+        <!-- Card 1: Cài đặt Video & Prompt -->
+        <div class="shopee-card">
+          <div class="shopee-card-title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            ⚙ Cài đặt Video & Prompt
+          </div>
+
+          <!-- Row 1: Tỉ lệ, Khung cảnh, Độ dài, Ngôn ngữ -->
+          <div class="shopee-row">
+            <span class="shopee-lbl">Tỉ lệ:</span>
+            <select class="shopee-select" id="sp_aspect">
+              <option value="Dọc 9:16 (TikTok)" selected>Dọc 9:16 (TikTok)</option>
+              <option value="Ngang 16:9">Ngang 16:9</option>
+              <option value="Vuông 1:1">Vuông 1:1</option>
+            </select>
+
+            <span class="shopee-lbl" style="margin-left:8px;">Khung cảnh:</span>
+            <select class="shopee-select" id="sp_scene" style="min-width:170px;">
+              <option value="🎲 Random" selected>🎲 Random</option>
+              <option value="📦 Tổng kho hàng hóa">📦 Tổng kho hàng hóa</option>
+              <option value="🛒 Siêu thị hiện đại">🛒 Siêu thị hiện đại</option>
+              <option value="🎥 Phòng review chuyên nghiệp">🎥 Phòng review chuyên nghiệp</option>
+              <option value="🛋 Phòng khách sang trọng">🛋 Phòng khách sang trọng</option>
+              <option value="💼 Văn phòng hiện đại">💼 Văn phòng hiện đại</option>
+              <option value="🌳 Ngoài trời công viên">🌳 Ngoài trời công viên</option>
+              <option value="📸 Studio chụp ảnh">📸 Studio chụp ảnh</option>
+              <option value="🏬 Showroom trưng bày">🏬 Showroom trưng bày</option>
+              <option value="☕ Quán café hiện đại">☕ Quán café hiện đại</option>
+              <option value="📦 Bàn unboxing">📦 Bàn unboxing</option>
+              <option value="⚖ Bàn so sánh sản phẩm">⚖ Bàn so sánh sản phẩm</option>
+              <option value="📱 Studio livestream">📱 Studio livestream</option>
+              <option value="🏭 Nhà máy sản xuất">🏭 Nhà máy sản xuất</option>
+            </select>
+
+            <span class="shopee-lbl" style="margin-left:8px;">Độ dài:</span>
+            <select class="shopee-select" id="sp_duration" onchange="onShopeeDurationChange()">
+              <option value="8s" selected>8s</option>
+              <option value="10s">10s</option>
+              <option value="16s">16s</option>
+            </select>
+
+            <span class="shopee-lbl" style="margin-left:8px;">Ngôn ngữ:</span>
+            <select class="shopee-select" id="sp_lang" style="min-width:165px;" onchange="saveShopeeSettings()">
+              <option value="Tiếng Philippines" selected>Tiếng Philippines</option>
+              <option value="Tiếng Việt">Tiếng Việt</option>
+              <option value="Tiếng Thái">Tiếng Thái (ภาษาไทย)</option>
+              <option value="Tiếng Indonesia">Tiếng Indonesia</option>
+              <option value="Tiếng Malaysia">Tiếng Malaysia (Melayu)</option>
+              <option value="Tiếng Trung (Đài Loan)">Tiếng Trung (Đài Loan)</option>
+              <option value="Tiếng Anh">Tiếng Anh</option>
+            </select>
+          </div>
+
+          <!-- Row 2: Kiểu Review, AI Prompt, Buttons, Checkboxes -->
+          <div class="shopee-row">
+            <span class="shopee-lbl">Kiểu Review:</span>
+            <select class="shopee-select" id="sp_review_style" style="min-width:160px;">
+              <option value="Unboxing" selected>Unboxing</option>
+              <option value="🎲 Random">🎲 Random</option>
+              <option value="Review kho hàng">Review kho hàng</option>
+              <option value="Ngồi Review">Ngồi Review</option>
+              <option value="POV (Góc nhìn thứ nhất)">POV (Góc nhìn thứ nhất)</option>
+              <option value="UGC Authentic">UGC Authentic</option>
+              <option value="Demo Công Dụng">Demo Công Dụng</option>
+              <option value="Review tự nhiên">Review tự nhiên</option>
+              <option value="So Sánh/Đánh Giá">So Sánh/Đánh Giá</option>
+            </select>
+
+            <span class="shopee-lbl" style="margin-left:8px;">AI Prompt:</span>
+            <select class="shopee-select" id="sp_ai_prompt" style="min-width:160px;">
+              <option value="Template (mặc định)" selected>Template (mặc định)</option>
+              <option value="Prompt A + B">Prompt A + B</option>
+              <option value="Gemini">Gemini</option>
+              <option value="Groq">Groq</option>
+            </select>
+
+            <button type="button" class="shopee-btn shopee-btn-grey" onclick="testShopeePrompt()" title="Xem trước prompt sinh từ sản phẩm">
+              🧪 Test Prompt
+            </button>
+
+            <button type="button" class="shopee-btn shopee-btn-blue" onclick="openAiKeysDialog()" title="Quản lý API Key Gemini/Groq nếu dùng AI Prompt">
+              🔑 AI Keys
+            </button>
+
+            <label class="shopee-chk" style="margin-left:6px;">
+              <input type="checkbox" id="sp_del_img" checked>
+              <span>Xóa ảnh</span>
+            </label>
+
+            <label class="shopee-chk" style="margin-left:6px;">
+              <input type="checkbox" id="sp_ghep_anh" checked>
+              <span>🎞 Ghép ảnh (12s)</span>
+            </label>
+          </div>
+
+          <!-- Row 3: Đặt tên video, Lưu Video -->
+          <div class="shopee-row">
+            <span class="shopee-lbl">Đặt tên video:</span>
+            <select class="shopee-select" id="sp_naming" style="min-width:160px;">
+              <option value="Theo Item ID" selected>Theo Item ID</option>
+              <option value="15 ký tự đầu prompt">15 ký tự đầu prompt</option>
+              <option value="Số thứ tự (001...)">Số thứ tự (001...)</option>
+            </select>
+
+            <span class="shopee-lbl" style="margin-left:8px;">Lưu Video:</span>
+            <input type="text" class="shopee-input" id="sp_out_dir" value="F:/Video AI/PH/shopapi" style="width:360px;">
+            <button type="button" class="shopee-btn shopee-btn-blue" onclick="pickShopeeFolder()">Chọn</button>
+          </div>
+        </div>
+
+        <!-- Card 2: Nhận Lô Sản Phẩm từ Database Shopee -->
+        <div class="shopee-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <div class="shopee-card-title" style="margin-bottom:0;">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+              📦 Nhận Lô Sản Phẩm từ Database Shopee
+            </div>
+            <div style="font-size:11px;color:var(--text-dim);">
+              Server: <code style="color:#60a5fa;" id="sp_db_display_url">http://100.79.170.67:3000</code> | Client: <code style="color:#60a5fa;">XEON-CT2A_822d66_nova</code>
+            </div>
+          </div>
+
+          <!-- Row 1: Số lượng, Ưu tiên, Thị trường, ItemID từ, Hoa hồng từ, SL bán từ -->
+          <div class="shopee-row">
+            <span class="shopee-lbl">Số lượng:</span>
+            <input type="number" class="shopee-input" id="sp_limit" value="2000" style="width:65px;">
+
+            <span class="shopee-lbl" style="margin-left:6px;">Ưu tiên:</span>
+            <select class="shopee-select" id="sp_sort_by" style="min-width:140px;">
+              <option value="Số bán cao nhất" selected>Số bán cao nhất</option>
+              <option value="Hoa hồng cao nhất">Hoa hồng cao nhất</option>
+            </select>
+
+            <span class="shopee-lbl" style="margin-left:6px;">Thị trường:</span>
+            <select class="shopee-select" id="sp_market" style="min-width:65px;" onchange="onShopeeMarketChange()">
+              <option value="PH" selected>PH</option>
+              <option value="VN">VN</option>
+              <option value="ID">ID</option>
+              <option value="TH">TH</option>
+              <option value="MY">MY</option>
+              <option value="SG">SG</option>
+            </select>
+
+            <span class="shopee-lbl" style="margin-left:6px;">ItemID từ:</span>
+            <input type="text" class="shopee-input" id="sp_min_item_id" value="40000000000" style="width:120px;">
+
+            <span class="shopee-lbl" style="margin-left:6px;">Hoa hồng từ:</span>
+            <input type="number" class="shopee-input" id="sp_min_commission" value="1" style="width:45px;">
+
+            <span class="shopee-lbl" style="margin-left:6px;">SL bán từ:</span>
+            <input type="number" class="shopee-input" id="sp_min_sold" value="0" style="width:55px;">
+          </div>
+
+          <!-- Row 2: Giá bán từ ... đến -->
+          <div class="shopee-row">
+            <span class="shopee-lbl">Giá bán từ:</span>
+            <input type="number" class="shopee-input" id="sp_min_price" value="0" style="width:75px;">
+            <span class="shopee-lbl">đến:</span>
+            <input type="number" class="shopee-input" id="sp_max_price" value="" placeholder="" style="width:75px;">
+            <span class="shopee-lbl" style="color:var(--text-dim);font-size:11px;">(để trống = không giới hạn giá trên)</span>
+          </div>
+
+          <!-- Row 3: Buttons -->
+          <div class="shopee-row" style="margin-top:10px;">
+            <button type="button" class="shopee-btn shopee-btn-blue" id="btnClaimShopee" onclick="claimShopeeProducts()">
+              📥 Nhận SP
+            </button>
+
+            <button type="button" class="shopee-btn shopee-btn-red" onclick="releaseStuckShopeeJobs()">
+              🔄 Giải phóng SP kẹt
+            </button>
+
+            <button type="button" class="shopee-btn shopee-btn-lightred" onclick="clearPolicyViolations()">
+              🗑 Xóa Vi Phạm CS
+            </button>
+
+            <button type="button" class="shopee-btn" style="background:#475569;color:white;border:1px solid #64748b;" onclick="openBlacklistModal()" title="Cài đặt từ khóa và danh sách Item ID bị chặn">
+              🚫 Quản Lý Blacklist
+            </button>
+          </div>
+        </div>
+
+        <!-- Card 3: Danh sách sản phẩm & Tiến trình chạy hàng loạt -->
+        <div class="shopee-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:10px;">
+            <div class="shopee-card-title" style="margin-bottom:0;">
+              📋 Danh Sách Sản Phẩm (<span id="shopeeProductCount">0 SP</span>)
+            </div>
+
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+              <!-- Concurrency thread selector control -->
+              <div style="display:flex;align-items:center;gap:6px;background:rgba(56,189,248,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(56,189,248,0.35);" title="Chọn số luồng chạy song song để máy tính không bị quá tải. Hệ thống sẽ tự động ép số luồng không bao giờ vượt quá số tài khoản còn sống.">
+                <span style="font-size:12px;font-weight:700;color:#38bdf8;">⚡ Luồng chạy song song:</span>
+                <select class="shopee-select" id="sp_threads_select" onchange="onShopeeThreadsChange()" style="font-weight:bold;color:#38bdf8;padding:4px 8px;min-width:130px;background:#0d1117;">
+                  <option value="1">1 Luồng (Rất nhẹ)</option>
+                  <option value="2" selected>2 Luồng (Khuyên dùng)</option>
+                  <option value="3">3 Luồng</option>
+                  <option value="4">4 Luồng</option>
+                  <option value="5">5 Luồng (Máy khỏe)</option>
+                  <option value="8">8 Luồng</option>
+                  <option value="10">10 Luồng (Xeon/Server)</option>
+                  <option value="custom">Tùy chỉnh số luồng...</option>
+                </select>
+                <input type="number" id="sp_threads" min="1" max="100" value="2" style="display:none;width:55px;padding:4px 6px;background:#0d1117;border:1px solid #38bdf8;border-radius:6px;color:#38bdf8;font-weight:bold;text-align:center;font-size:12px;" oninput="onShopeeThreadsCustomChange()" onchange="saveShopeeSettings()" title="Nhập số luồng cụ thể bạn muốn">
+                <span id="sp_threads_alive_hint" style="font-size:11px;font-weight:600;margin-left:4px;"></span>
+              </div>
+
+              <span id="shopeeSpeedText" style="font-size:12.5px;color:#fbbf24;font-weight:700;display:none;background:rgba(251,191,36,0.1);padding:3px 8px;border-radius:6px;border:1px solid rgba(251,191,36,0.3);">⚡ -- video/phút</span>
+              <span id="batchProgressText" style="font-size:12px;color:#34d399;font-weight:600;"></span>
+
+              <button type="button" class="shopee-btn shopee-btn-green" id="btnStartBatch" onclick="startShopeeBatch()">
+                ▶ Bắt đầu chạy hàng loạt (Start Batch)
+              </button>
+
+              <button type="button" class="shopee-btn shopee-btn-red" id="btnStopBatch" onclick="stopShopeeBatch()" disabled>
+                ⏹ Dừng
+              </button>
+
+              <button type="button" class="shopee-btn shopee-btn-grey" onclick="openShopeeOutDir()">
+                📂 Mở Thư Mục Video
+              </button>
+            </div>
+          </div>
+
+          <div style="font-size:11.5px;color:#94a3b8;margin-bottom:10px;padding:6px 10px;background:rgba(255,255,255,0.02);border-radius:6px;display:flex;align-items:center;gap:6px;">
+            <span>💡</span>
+            <span><b>Bảo vệ tải CPU/RAM:</b> Dù bạn có 50 hay 100 tài khoản, hệ thống chỉ chạy đồng thời đúng số luồng bạn chọn ở trên. Các tài khoản trong kho sẽ tự động mượn luân phiên (xoay tua), máy tính chạy cực kỳ êm ái và không bao giờ bị đơ giật!</span>
+          </div>
+
+          <!-- Console view for claimed products -->
+          <div class="shopee-console" id="shopeeProductsConsole">
+            Chưa có sản phẩm nào. Bấm [📥 Nhận SP] để nhận lô sản phẩm từ Database!
+          </div>
+
+          <!-- Live Log output -->
+          <div style="margin-top:10px;font-size:11px;color:var(--text-dim);display:flex;justify-content:space-between;">
+            <span>Nhật ký xử lý:</span>
+            <span id="shopeeElapsedTimer">Thời gian: 0s</span>
+          </div>
+          <div class="shopee-console" id="shopeeLiveLog" style="height:140px;margin-top:4px;color:#94a3b8;font-size:11px;">
+            [Hệ thống] Sẵn sàng nhận lô sản phẩm và tạo video qua Muse.ai.
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<!-- Video Lightbox Modal -->
+<div class="modal-overlay" id="lightboxModal" onclick="closeLightbox(event)">
+  <div class="modal-content" onclick="event.stopPropagation()">
+    <div style="padding:14px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);">
+      <div style="font-weight:650;" id="lightboxTitle">Xem Video</div>
+      <button onclick="closeLightbox()" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;">✕</button>
+    </div>
+    <div style="background:#000;display:flex;align-items:center;justify-content:center;max-height:75vh;">
+      <video id="lightboxVideo" controls autoplay loop style="max-width:100%;max-height:75vh;"></video>
+      <img id="lightboxImg" style="display:none;max-width:100%;max-height:75vh;object-fit:contain;">
+    </div>
+    <div style="padding:14px 20px;display:flex;justify-content:flex-end;gap:10px;">
+      <button class="btn-action primary" id="lightboxDownloadBtn" onclick="downloadLightboxMedia()">Lưu Về Máy</button>
+      <button class="btn-action" onclick="closeLightbox()">Đóng</button>
+    </div>
+  </div>
+</div>
+
+<!-- Blacklist Management Modal -->
+<div class="modal-overlay" id="blacklistModal" onclick="closeBlacklistModal(event)">
+  <div class="modal-content" onclick="event.stopPropagation()" style="max-width: 650px;">
+    <div style="padding:14px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);">
+      <div style="font-weight:700;font-size:16px;color:#f87171;display:flex;align-items:center;gap:8px;">
+        <span>🚫</span> Quản Lý Blacklist Sản Phẩm Vi Phạm
+      </div>
+      <button onclick="closeBlacklistModal()" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;">✕</button>
+    </div>
+    
+    <div style="padding:20px;display:flex;flex-direction:column;gap:16px;max-height:70vh;overflow-y:auto;">
+      <div style="font-size:12.5px;color:var(--text-muted);line-height:1.5;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);padding:10px 14px;border-radius:8px;">
+        Hệ thống sẽ tự động quét và <b>bỏ qua (không render)</b> các sản phẩm có tên chứa từ khóa cấm hoặc Item ID nằm trong Blacklist, giúp tiết kiệm tối đa lượt tạo video và phòng tránh bị khóa tài khoản Muse.ai do vi phạm chính sách an toàn.
+      </div>
+
+      <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;">
+        <label class="shopee-chk" style="font-weight:600;color:#f1f5f9;">
+          <input type="checkbox" id="bl_enabled" checked>
+          <span>Bật tính năng lọc Blacklist</span>
+        </label>
+
+        <label class="shopee-chk" style="font-weight:600;color:#f1f5f9;">
+          <input type="checkbox" id="bl_auto_block" checked>
+          <span>Tự động chặn SP khi Muse báo vi phạm</span>
+        </label>
+      </div>
+
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:6px;display:block;">
+          Từ khóa cấm (Mỗi từ hoặc cụm từ một dòng, không phân biệt hoa thường):
+        </label>
+        <textarea id="bl_keywords" rows="6" style="width:100%;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:8px;color:#fff;padding:8px 12px;font-family:monospace;font-size:12px;line-height:1.5;resize:vertical;" placeholder="vape&#10;pod&#10;sex&#10;18+&#10;thuốc lá&#10;cờ bạc&#10;vũ khí"></textarea>
+      </div>
+
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:6px;display:block;">
+          Danh sách Item ID cấm (Mỗi Item ID một dòng):
+        </label>
+        <textarea id="bl_item_ids" rows="5" style="width:100%;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:8px;color:#fff;padding:8px 12px;font-family:monospace;font-size:12px;line-height:1.5;resize:vertical;" placeholder="24381029381&#10;19203918293"></textarea>
+      </div>
+    </div>
+
+    <div style="padding:14px 20px;display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--border);background:rgba(0,0,0,0.2);">
+      <span id="bl_status_text" style="font-size:12px;color:#34d399;"></span>
+      <div style="display:flex;gap:10px;">
+        <button class="btn-action primary" onclick="saveBlacklistData()" style="background:#ef4444;border-color:#f87171;">💾 Lưu Blacklist</button>
+        <button class="btn-action" onclick="closeBlacklistModal()">Đóng</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toasts Container -->
+<div class="toast-container" id="toastBox"></div>
+
+<script>
+  // Global State
+  let API_BASE = window.location.origin;
+  let API_KEY = "";
+  let currentVideoMode = "text"; // "text" or "image"
+  let selectedImageDataUrl = null;
+  let selectedRatio = "16:9";
+  let selectedDuration = 8;
+  let selectedImageRatio = "16:9";
+  let currentActiveTaskId = null;
+  let pollInterval = null;
+  let pollStartTime = 0;
+  let currentGeneratedVideoUrl = null;
+  let currentGeneratedVideoFilename = null;
+  let lightboxMediaItem = null;
+
+  // Initialize
+  window.addEventListener("DOMContentLoaded", async () => {
+    await initConfig();
+    await checkServerStatus();
+    await loadAccounts();
+    await loadGallery();
+    await loadShopeeSettings();
+
+    // Setup paste listener for clipboard image
+    window.addEventListener("paste", handlePasteEvent);
+    
+    // Auto update char count
+    document.getElementById("videoPrompt").addEventListener("input", (e) => {
+      document.getElementById("charCount").innerText = `${e.target.value.length} ký tự`;
+    });
+  });
+
+  // Config loader
+  async function initConfig() {
+    try {
+      // 1. Try Desktop pywebview API if available
+      if (window.pywebview && window.pywebview.api) {
+        const dCfg = await window.pywebview.api.get_desktop_config();
+        if (dCfg && dCfg.api_key) API_KEY = dCfg.api_key;
+        if (dCfg && dCfg.media_dir) document.getElementById("cfgMediaDir").value = dCfg.media_dir;
+      }
+      
+      // 2. Fetch config endpoint from FastAPI
+      const res = await fetch("/api/studio/config");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.api_key) API_KEY = data.api_key;
+        document.getElementById("cfgBaseUrl").value = API_BASE;
+        document.getElementById("cfgApiKey").value = API_KEY || "(Không đặt)";
+        document.getElementById("cfgChromium").value = data.chromium || "Tự động phát hiện";
+        document.getElementById("cfgMediaDir").value = data.media_dir || "data/media";
+      }
+    } catch (e) {
+      console.warn("Config load fallback:", e);
+      document.getElementById("cfgBaseUrl").value = API_BASE;
+    }
+  }
+
+  // Auth Header helper
+  function getHeaders() {
+    const h = { "Content-Type": "application/json" };
+    if (API_KEY) {
+      h["Authorization"] = `Bearer ${API_KEY}`;
+    }
+    return h;
+  }
+
+  // Server health check
+  async function checkServerStatus() {
+    const dot = document.getElementById("serverDot");
+    const txt = document.getElementById("serverStatusText");
+    try {
+      const res = await fetch("/admin/status", { headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        dot.className = "dot";
+        txt.innerText = "Đã kết nối Server";
+        const accsList = Array.isArray(data.accounts) ? data.accounts : [];
+        const totalAccs = data.stats?.total ?? accsList.length;
+        const enabledAccs = data.stats?.enabled ?? accsList.filter(a => a.enabled !== false).length;
+        document.getElementById("activeAccCount").innerText = `${enabledAccs}/${totalAccs} Sẵn Sàng`;
+        document.getElementById("accountDetailText").innerText = `${enabledAccs} tài khoản hoạt động bình thường`;
+
+        // Lấy phiên bản hiển thị
+        try {
+          const vRes = await fetch("/api/version");
+          if (vRes.ok) {
+            const vData = await vRes.json();
+            if (vData.version) {
+              const b = document.getElementById("appVersionBadge");
+              if (b) b.innerText = `Desktop v${vData.version}`;
+            }
+          }
+        } catch (_) {}
+      } else {
+        dot.className = "dot warning";
+        txt.innerText = "Cần API Key";
+      }
+    } catch (err) {
+      dot.className = "dot offline";
+      txt.innerText = "Mất kết nối máy chủ";
+    }
+  }
+
+  // Tab switcher
+  function switchTab(tabName) {
+    document.querySelectorAll(".nav-item").forEach(item => item.classList.remove("active"));
+    document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
+
+    const tabMap = {
+      studio: { nav: 0, content: "tab-studio" },
+      shopee: { nav: 1, content: "tab-shopee" },
+      image: { nav: 2, content: "tab-image" },
+      gallery: { nav: 3, content: "tab-gallery" },
+      accounts: { nav: 4, content: "tab-accounts" },
+      settings: { nav: 5, content: "tab-settings" }
+    };
+
+    const target = tabMap[tabName];
+    if (target) {
+      document.querySelectorAll(".nav-item")[target.nav].classList.add("active");
+      document.getElementById(target.content).classList.add("active");
+      if (tabName === "gallery") loadGallery();
+      if (tabName === "accounts") loadAccounts();
+      if (tabName === "shopee") loadShopeeSettings();
+    }
+  }
+
+  // Video Mode: text vs image
+  function setVideoMode(mode) {
+    currentVideoMode = mode;
+    const txtBtn = document.getElementById("modeTextBtn");
+    const imgBtn = document.getElementById("modeImageBtn");
+    const imgSec = document.getElementById("imageInputSection");
+
+    if (mode === "text") {
+      txtBtn.classList.add("active");
+      imgBtn.classList.remove("active");
+      imgSec.style.display = "none";
+    } else {
+      imgBtn.classList.add("active");
+      txtBtn.classList.remove("active");
+      imgSec.style.display = "block";
+    }
+  }
+
+  // Camera Movement Toggle
+  function toggleCamera(btn, text) {
+    const isAct = btn.classList.contains("active");
+    document.querySelectorAll(".cam-btn").forEach(b => b.classList.remove("active"));
+    const promptEl = document.getElementById("videoPrompt");
+    if (!isAct) {
+      btn.classList.add("active");
+      if (!promptEl.value.includes(text)) {
+        promptEl.value = promptEl.value.trim() ? `${promptEl.value.trim()}, ${text}` : text;
+      }
+    }
+  }
+
+  // Aspect ratio & duration
+  function setRatio(btn, val) {
+    btn.parentElement.querySelectorAll(".pill-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    selectedRatio = val;
+  }
+
+  function setDuration(btn, val) {
+    btn.parentElement.querySelectorAll(".pill-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    selectedDuration = val;
+  }
+
+  function setImageRatio(btn, val) {
+    btn.parentElement.querySelectorAll(".pill-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    selectedImageRatio = val;
+  }
+
+  // Image Upload Handling
+  async function triggerPickImage() {
+    // If pywebview native dialog available
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.choose_image) {
+      try {
+        const res = await window.pywebview.api.choose_image();
+        if (res && res.success && res.data_url) {
+          applyImageDataUrl(res.data_url);
+          showToast("Đã nạp ảnh thành công từ máy tính", "success");
+          return;
+        }
+      } catch (e) {
+        console.warn("pywebview pick failed:", e);
+      }
+    }
+    // Fallback to HTML input
+    document.getElementById("hiddenFileInput").click();
+  }
+
+  function handleFilePicked(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      applyImageDataUrl(evt.target.result);
+      showToast("Đã tải ảnh lên!", "success");
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function handlePasteEvent(e) {
+    if (currentVideoMode !== "image") return;
+    const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+    for (let item of items) {
+      if (item.type.indexOf("image") !== -1) {
+        const blob = item.getAsFile();
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+          applyImageDataUrl(evt.target.result);
+          showToast("Đã dán ảnh từ Clipboard!", "success");
+        };
+        reader.readAsDataURL(blob);
+        break;
+      }
+    }
+  }
+
+  function applyImageDataUrl(dataUrl) {
+    selectedImageDataUrl = dataUrl;
+    document.getElementById("dropzoneBox").style.display = "none";
+    document.getElementById("previewBox").style.display = "block";
+    document.getElementById("previewImg").src = dataUrl;
+  }
+
+  function removeSelectedImage(e) {
+    if (e) e.stopPropagation();
+    selectedImageDataUrl = null;
+    document.getElementById("dropzoneBox").style.display = "block";
+    document.getElementById("previewBox").style.display = "none";
+    document.getElementById("previewImg").src = "";
+    document.getElementById("hiddenFileInput").value = "";
+  }
+
+  // Prompt Enhancer
+  function enhancePrompt() {
+    const el = document.getElementById("videoPrompt");
+    let val = el.value.trim();
+    if (!val) {
+      showToast("Vui lòng nhập ý tưởng kịch bản trước khi tối ưu!", "warning");
+      return;
+    }
+    const enhancements = "cinematic lighting, photorealistic 8k, dynamic camera movement, ultra-detailed textures, volumetric lighting, masterpiece, high frame rate";
+    if (!val.toLowerCase().includes("cinematic")) {
+      el.value = `${val}, ${enhancements}`;
+      showToast("✨ Đã tối ưu hóa kịch bản với các từ khóa điện ảnh cao cấp!", "success");
+    } else {
+      showToast("Prompt đã được tối ưu trước đó!", "info");
+    }
+  }
+
+  // Template prompt picker
+  function applyTemplate(type) {
+    const templates = {
+      cyberpunk: "Một thành phố tương lai rực rỡ ánh đèn neon tím và xanh, xe bay lướt nhanh qua các tòa nhà chọc trời, mưa đêm phản chiếu mặt đường ướt, chuyển động mượt mà điện ảnh 8k",
+      cinematic: "Một siêu xe thể thao cổ điển màu đỏ đang chạy trên cung đường đèo ven biển hoàng hôn tuyệt đẹp, ánh nắng vàng rực rỡ, góc quay máy bay drone bám sát đuôi xe",
+      anime: "Một cô gái đứng trên ngọn đồi ngắm nhìn bầu trời đầy sao băng và mây ngũ sắc lấp lánh phong cách hoạt hình Makoto Shinkai, gió thổi mái tóc bay nhẹ",
+      drone: "Góc quay flycam FPV bay lượn siêu tốc từ trên đỉnh núi tuyết phủ trắng xóa lao vút xuống thung lũng thông xanh ngát, thác nước đổ hùng vĩ",
+      slowmo: "Chuyển động siêu chậm 240fps của một giọt nước rơi xuống mặt hồ trong vắt tạo thành những gợn sóng lan tỏa huyền ảo, phản chiếu ánh bình minh",
+      ocean: "Đàn cá voi khổng lồ bơi lội dưới đáy đại dương sâu thẳm phát ra luồng ánh sáng sinh học phát quang kỳ bí, tia nắng xuyên qua làn nước xanh biếc",
+      nature: "Cảnh rừng nhiệt đới Amazon mờ sương sớm, một chú báo hoa mai bước đi uyển chuyển trên cành cây cổ thụ, chim chóc bay lượn xung quanh"
+    };
+
+    if (templates[type]) {
+      document.getElementById("videoPrompt").value = templates[type];
+      showToast("Đã áp dụng mẫu kịch bản!", "success");
+    }
+  }
+
+  // ==================== GENERATE VIDEO ====================
+  async function startGenerateVideo() {
+    const prompt = document.getElementById("videoPrompt").value.trim();
+    if (!prompt) {
+      showToast("Vui lòng nhập kịch bản mô tả video!", "warning");
+      return;
+    }
+
+    if (currentVideoMode === "image" && !selectedImageDataUrl) {
+      showToast("Vui lòng chọn hoặc dán ảnh đầu khung hình (First Frame)!", "warning");
+      return;
+    }
+
+    const genBtn = document.getElementById("generateBtn");
+    genBtn.disabled = true;
+    genBtn.innerText = "⏳ Đang gửi yêu cầu tạo video...";
+
+    // Show Progress Banner
+    const pBanner = document.getElementById("progressBanner");
+    pBanner.style.display = "block";
+    document.getElementById("videoActionsBar").style.display = "none";
+    document.getElementById("progressBarFill").style.width = "10%";
+    document.getElementById("progressPercentText").innerText = "10%";
+    document.getElementById("progressStateText").innerText = "Đang gửi yêu cầu và xếp hàng...";
+    document.getElementById("currentStatusTag").innerText = "Đang render...";
+
+    try {
+      const payload = {
+        prompt: prompt,
+        duration: selectedDuration,
+        aspect_ratio: selectedRatio,
+        size: selectedRatio,
+        model: "muse-video"
+      };
+
+      if (currentVideoMode === "image" && selectedImageDataUrl) {
+        payload.reference_image = selectedImageDataUrl;
+      }
+
+      const res = await fetch("/v1/videos", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify(payload)
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(err || `Lỗi máy chủ (${res.status})`);
+      }
+
+      const data = await res.json();
+      currentActiveTaskId = data.id || data.task_id;
+      document.getElementById("progressTaskId").innerText = `Mã Task: ${currentActiveTaskId}`;
+      showToast("Đã khởi tạo tác vụ render video AI!", "success");
+
+      // Start polling
+      pollStartTime = Date.now();
+      startPollingTask(currentActiveTaskId);
+
+    } catch (e) {
+      showToast(`Không thể tạo video: ${e.message}`, "danger");
+      genBtn.disabled = false;
+      genBtn.innerHTML = `BẮT ĐẦU TẠO VIDEO AI`;
+      pBanner.style.display = "none";
+      document.getElementById("currentStatusTag").innerText = "Lỗi";
+    }
+  }
+
+  function startPollingTask(taskId) {
+    if (pollInterval) clearInterval(pollInterval);
+
+    pollInterval = setInterval(async () => {
+      const elapsed = Math.round((Date.now() - pollStartTime) / 1000);
+      document.getElementById("progressTimer").innerText = `Đã chạy: ${elapsed}s`;
+
+      try {
+        const res = await fetch(`/v1/videos/${taskId}`, { headers: getHeaders() });
+        if (!res.ok) return;
+
+        const data = await res.json();
+        const status = data.status || "";
+        const prog = data.progress || 15;
+
+        document.getElementById("progressBarFill").style.width = `${prog}%`;
+        document.getElementById("progressPercentText").innerText = `${prog}%`;
+
+        if (status === "queued") {
+          document.getElementById("progressStateText").innerText = "Đang xếp hàng chờ xử lý...";
+        } else if (status === "processing") {
+          if (elapsed < 15) {
+            document.getElementById("progressStateText").innerText = "Đang đánh thức máy ảo Muse.ai & nạp tài khoản...";
+          } else if (elapsed < 35) {
+            document.getElementById("progressStateText").innerText = "Đang truyền tải prompt và render video AI...";
+          } else {
+            document.getElementById("progressStateText").innerText = "Mô hình Muse AI đang tổng hợp khung hình MP4...";
+          }
+        } else if (status === "completed" || status === "succeeded") {
+          // Finished!
+          clearInterval(pollInterval);
+          document.getElementById("progressBarFill").style.width = "100%";
+          document.getElementById("progressPercentText").innerText = "100%";
+          document.getElementById("progressStateText").innerText = "🎉 Hoàn tất thành công!";
+          document.getElementById("currentStatusTag").innerText = "Hoàn tất";
+
+          const vUrl = data.url || (data.result && data.result.url);
+          if (vUrl) {
+            displayGeneratedVideo(vUrl, data.result?.filename);
+          }
+          finishTaskUi();
+          showToast("🎉 Video AI đã được render thành công!", "success");
+          loadGallery();
+
+        } else if (status === "failed") {
+          clearInterval(pollInterval);
+          document.getElementById("progressStateText").innerText = `❌ Lỗi: ${data.error || "Tạo video thất bại"}`;
+          document.getElementById("currentStatusTag").innerText = "Thất bại";
+          showToast(`Lỗi tạo video: ${data.error || "Thất bại"}`, "danger");
+          finishTaskUi();
+        }
+      } catch (e) {
+        console.warn("Poll err:", e);
+      }
+    }, 2500);
+  }
+
+  function finishTaskUi() {
+    const genBtn = document.getElementById("generateBtn");
+    genBtn.disabled = false;
+    genBtn.innerHTML = `BẮT ĐẦU TẠO VIDEO AI`;
+  }
+
+  function displayGeneratedVideo(url, filename) {
+    currentGeneratedVideoUrl = url;
+    currentGeneratedVideoFilename = filename || `video_${Date.now()}.mp4`;
+
+    const player = document.getElementById("mainPlayer");
+    const placeholder = document.getElementById("videoPlaceholder");
+    placeholder.style.display = "none";
+    player.style.display = "block";
+    player.src = url;
+    player.play().catch(() => {});
+
+    document.getElementById("videoActionsBar").style.display = "grid";
+  }
+
+  async function downloadCurrentVideo() {
+    if (!currentGeneratedVideoFilename) return;
+
+    // Check if running inside desktop pywebview
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.save_video_dialog) {
+      try {
+        const res = await window.pywebview.api.save_video_dialog(currentGeneratedVideoFilename);
+        if (res && res.success) {
+          showToast(`Đã lưu video thành công: ${res.saved_path}`, "success");
+          return;
+        }
+      } catch (e) {
+        console.warn("Desktop save dialog failed:", e);
+      }
+    }
+
+    // Fallback standard download
+    if (currentGeneratedVideoUrl) {
+      const a = document.createElement("a");
+      a.href = currentGeneratedVideoUrl;
+      a.download = currentGeneratedVideoFilename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      showToast("Đang tải file video xuống...", "info");
+    }
+  }
+
+  async function openMediaFolder() {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.open_video_folder) {
+      await window.pywebview.api.open_video_folder();
+      showToast("Đã mở thư mục lưu video", "success");
+      return;
+    }
+    // Web fallback
+    window.open("/admin/media", "_blank");
+  }
+
+  function openAdmin() {
+    const url = API_KEY ? `/admin?key=${API_KEY}` : "/admin";
+    window.open(url, "_blank");
+  }
+
+  // ==================== TAB 2: IMAGE GENERATION ====================
+  async function startGenerateImage() {
+    const prompt = document.getElementById("imagePrompt").value.trim();
+    if (!prompt) {
+      showToast("Vui lòng nhập mô tả ảnh cần tạo!", "warning");
+      return;
+    }
+
+    const btn = document.getElementById("generateImgBtn");
+    btn.disabled = true;
+    btn.innerText = "⏳ Đang tạo ảnh AI...";
+
+    try {
+      const payload = {
+        prompt: prompt,
+        size: selectedImageRatio,
+        response_format: "url"
+      };
+
+      const res = await fetch("/v1/images/generations", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify(payload)
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(err || "Tạo ảnh thất bại");
+      }
+
+      const data = await res.json();
+      const imgUrl = data.data && data.data[0] ? data.data[0].url : null;
+      if (imgUrl) {
+        document.getElementById("generatedImgResult").src = imgUrl;
+        document.getElementById("imageResultSection").style.display = "block";
+        showToast("Tạo ảnh thành công!", "success");
+        loadGallery();
+      }
+    } catch (e) {
+      showToast(`Lỗi tạo ảnh: ${e.message}`, "danger");
+    } finally {
+      btn.disabled = false;
+      btn.innerText = "🎨 TẠO ẢNH AI NGAY";
+    }
+  }
+
+  function sendImageToVideoStudio() {
+    const imgEl = document.getElementById("generatedImgResult");
+    if (!imgEl.src) return;
+
+    // Convert to base64 or pass url directly
+    applyImageDataUrl(imgEl.src);
+    setVideoMode("image");
+    switchTab("studio");
+    showToast("Đã nạp ảnh vào chế độ Ảnh thành Video!", "success");
+  }
+
+  function downloadGeneratedImage() {
+    const imgEl = document.getElementById("generatedImgResult");
+    if (!imgEl.src) return;
+    const a = document.createElement("a");
+    a.href = imgEl.src;
+    a.download = `muse_img_${Date.now()}.webp`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  // ==================== TAB 3: GALLERY ====================
+  async function loadGallery() {
+    const grid = document.getElementById("galleryGrid");
+    try {
+      const res = await fetch("/admin/media", { headers: getHeaders() });
+      if (!res.ok) return;
+
+      const data = await res.json();
+      const items = Array.isArray(data) ? data : (data.media || []);
+      if (!items || items.length === 0) {
+        grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-dim);">Chưa có video hay ảnh nào được tạo. Hãy tạo tác phẩm đầu tiên!</div>`;
+        return;
+      }
+
+      grid.innerHTML = items.map(item => {
+        const isVid = item.kind === "video" || item.name.endsWith(".mp4") || item.name.endsWith(".webm");
+        const sz = (item.bytes ? (item.bytes / 1024 / 1024).toFixed(1) : (item.size ? (item.size / 1024 / 1024).toFixed(1) : "0")) + " MB";
+        const mTime = item.mtime ? (new Date(item.mtime * 1000).toLocaleDateString("vi-VN") + " " + new Date(item.mtime * 1000).toLocaleTimeString("vi-VN", {hour:"2-digit", minute:"2-digit"})) : "";
+
+        return `
+          <div class="gallery-card">
+            <div class="gallery-thumb" onclick="openLightbox('${item.url}', '${item.name}', ${isVid})">
+              ${isVid 
+                ? `<video src="${item.url}#t=0.5" preload="metadata"></video><div class="gallery-play-icon"><svg width="18" height="18" fill="#fff" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3"/></svg></div>`
+                : `<img src="${item.url}" alt="${item.name}" loading="lazy">`
+              }
+            </div>
+            <div class="gallery-info">
+              <div class="gallery-filename" title="${item.name}">${item.name}</div>
+              <div class="gallery-meta">
+                <span>${sz}</span>
+                <span>${mTime}</span>
+              </div>
+              <div class="gallery-acts">
+                <button class="btn-tiny" onclick="downloadMedia('${item.name}')">💾 Lưu</button>
+                ${isVid ? `<button class="btn-tiny" onclick="useAsFirstFrame('${item.url}')">🖼️ Dùng Khung Hình</button>` : `<button class="btn-tiny" onclick="useAsFirstFrame('${item.url}')">🎬 Tạo Video</button>`}
+                <button class="btn-tiny danger" onclick="deleteMedia('${item.name}')">🗑️</button>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("");
+
+    } catch (e) {
+      grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--danger);">Lỗi tải thư viện: ${e.message}</div>`;
+    }
+  }
+
+  function openLightbox(url, name, isVid) {
+    lightboxMediaItem = { url, name, isVid };
+    document.getElementById("lightboxTitle").innerText = name;
+    const vEl = document.getElementById("lightboxVideo");
+    const iEl = document.getElementById("lightboxImg");
+
+    if (isVid) {
+      vEl.style.display = "block";
+      iEl.style.display = "none";
+      vEl.src = url;
+      vEl.play().catch(()=>{});
+    } else {
+      vEl.style.display = "none";
+      iEl.style.display = "block";
+      iEl.src = url;
+    }
+
+    document.getElementById("lightboxModal").style.display = "flex";
+  }
+
+  function closeLightbox(e) {
+    document.getElementById("lightboxModal").style.display = "none";
+    document.getElementById("lightboxVideo").pause();
+  }
+
+  function downloadLightboxMedia() {
+    if (lightboxMediaItem) {
+      downloadMedia(lightboxMediaItem.name);
+    }
+  }
+
+  async function downloadMedia(filename) {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.save_video_dialog) {
+      try {
+        const res = await window.pywebview.api.save_video_dialog(filename);
+        if (res && res.success) {
+          showToast(`Đã lưu file: ${res.saved_path}`, "success");
+          return;
+        }
+      } catch (e) {}
+    }
+    const a = document.createElement("a");
+    a.href = `/v1/media/${filename}`;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function useAsFirstFrame(url) {
+    applyImageDataUrl(url);
+    setVideoMode("image");
+    switchTab("studio");
+    showToast("Đã nạp làm khung hình đầu cho video!", "success");
+  }
+
+  async function deleteMedia(filename) {
+    if (!confirm(`Bạn có chắc muốn xóa file ${filename}?`)) return;
+    try {
+      const res = await fetch(`/admin/media/${filename}`, {
+        method: "DELETE",
+        headers: getHeaders()
+      });
+      if (res.ok) {
+        showToast("Đã xóa file", "info");
+        loadGallery();
+      }
+    } catch (e) {
+      showToast(`Lỗi xóa file: ${e.message}`, "danger");
+    }
+  }
+
+  // ==================== TAB 4: ACCOUNTS ====================
+  let cachedAccounts = [];
+  let cachedAliveCount = 0;
+
+  async function loadAccounts() {
+    const tbody = document.getElementById("accountsTableBody");
+    try {
+      const res = await fetch("/admin/accounts", { headers: getHeaders() });
+      if (!res.ok) {
+        let err = `Lỗi tải tài khoản (${res.status})`;
+        try {
+          const ej = await res.json();
+          err = ej.detail || err;
+        } catch (_) {}
+        tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--danger);padding:20px;">${err}</td></tr>`;
+        return;
+      }
+
+      const resData = await res.json();
+      const accs = Array.isArray(resData) ? resData : (resData.accounts || []);
+      cachedAccounts = accs;
+      const nowTs = Date.now() / 1000;
+      cachedAliveCount = typeof resData.alive_count === "number"
+        ? resData.alive_count
+        : accs.filter(a => a.is_alive !== false && a.ok !== false && a.enabled !== false && (!a.expires_at || a.expires_at > nowTs)).length;
+      updateShopeeThreadsHint();
+
+      if (!accs || accs.length === 0) {
+        cachedAliveCount = 0;
+        updateShopeeThreadsHint();
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = accs.map(a => {
+        let statusBadge = `<span class="status-pill unknown">Chưa kiểm tra</span>`;
+        if (a.ok === true) statusBadge = `<span class="status-pill good">🟢 Hoạt động</span>`;
+        else if (a.ok === false) statusBadge = `<span class="status-pill bad" title="${a.note || ''}">🔴 Lỗi / Hết hạn</span>`;
+
+        let expStr = "Không rõ";
+        if (a.expires_at) {
+          const diffHours = Math.round((a.expires_at - Date.now()/1000) / 3600);
+          expStr = diffHours > 0 ? `Còn ~${diffHours} giờ` : `Đã hết hạn`;
+        }
+
+        const cookieCount = a.cookie_count || Object.keys(a.cookies || {}).length;
+        let displayNote = a.note || "";
+        displayNote = displayNote.replace(/会话有效/g, "Phiên hợp lệ · Sẵn sàng")
+                                 .replace(/自动保活/g, "Tự động duy trì")
+                                 .replace(/会话正常/g, "Phiên hợp lệ")
+                                 .replace(/已更新 cookie/g, "Đã cập nhật Cookie")
+                                 .replace(/RUNNING/g, "Đang chạy");
+        const noteColor = (a.ok === true) ? "#34d399" : (a.ok === false ? "#f87171" : "var(--text-dim)");
+        const noteHtml = displayNote ? `<div style="font-size:11px;color:${noteColor};margin-top:2px;">${displayNote}</div>` : "";
+
+        let proxyHtml = `<span style="color:var(--text-dim);font-size:11px;">Chưa gán</span> <button class="btn-tiny" onclick="rotateAccountProxy('${a.id}')" style="margin-left:4px;padding:2px 6px;">Gán Proxy</button>`;
+        if (a.proxy) {
+          const rawHost = a.proxy.split('@').pop() || a.proxy;
+          const isAlive = a.proxy_status === "alive";
+          const isDead = a.proxy_status === "dead";
+          const pillClass = isAlive ? "good" : (isDead ? "bad" : "unknown");
+          const pillText = isAlive ? "🟢 Sống" : (isDead ? "🔴 Chết" : "⚪ Chưa test");
+          const ipText = a.proxy_ip ? `IP: ${a.proxy_ip}` : rawHost;
+          proxyHtml = `
+            <div style="font-family:monospace;font-size:11.5px;">
+              <span style="color:#60a5fa;font-weight:600;" title="${a.proxy}">🌐 ${ipText}</span>
+              <div style="display:flex;gap:4px;align-items:center;margin-top:4px;">
+                <span class="status-pill ${pillClass}" style="padding:1px 6px;font-size:10.5px;">${pillText}</span>
+                <button class="btn-tiny" onclick="testAccountProxy('${a.id}')" title="Kiểm tra IP proxy" style="padding:1px 6px;">Test</button>
+                <button class="btn-tiny" onclick="rotateAccountProxy('${a.id}')" title="Đổi sang proxy khác từ Pool khi proxy này die" style="padding:1px 6px;background:rgba(239,68,68,0.15);color:#f87171;border-color:rgba(239,68,68,0.4);">Đổi</button>
+              </div>
+            </div>
+          `;
+        }
+
+        return `
+          <tr>
+            <td><b>${a.label || a.id}</b><br><span style="font-size:11px;color:var(--text-dim);font-family:monospace;">ID: ${a.id}</span>${noteHtml}</td>
+            <td>${statusBadge}</td>
+            <td>${proxyHtml}</td>
+            <td>${cookieCount} cookies</td>
+            <td>${expStr}</td>
+            <td>${a.use_count || 0} lượt</td>
+            <td>
+              <div style="display:flex;gap:6px;">
+                <button class="btn-tiny" onclick="testAccount('${a.id}')">Kiểm Tra</button>
+                <button class="btn-tiny danger" onclick="deleteAccount('${a.id}')">Xóa</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join("");
+
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
+    }
+  }
+
+  async function submitAddAccount() {
+    const label = document.getElementById("accLabelInput").value.trim();
+    const cookie = document.getElementById("accCookieInput").value.trim();
+
+    if (!cookie) {
+      showToast("Vui lòng dán chuỗi Cookie!", "warning");
+      return;
+    }
+
+    const btn = event?.target || document.querySelector("button[onclick='submitAddAccount()']");
+    const oldText = btn ? btn.innerText : "";
+    if (btn) {
+      btn.disabled = true;
+      btn.innerText = "⏳ Đang thêm...";
+    }
+
+    try {
+      const res = await fetch("/admin/accounts", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({
+          label: label || `Tài khoản ${Date.now().toString().slice(-4)}`,
+          cookie_header: cookie
+        })
+      });
+
+      if (!res.ok) {
+        let errMsg = `Lỗi thêm tài khoản (${res.status})`;
+        try {
+          const ej = await res.json();
+          errMsg = ej.detail || ej.message || errMsg;
+        } catch (_) {
+          const et = await res.text();
+          if (et) errMsg = et;
+        }
+        throw new Error(errMsg);
+      }
+
+      const data = await res.json();
+      if (data.warning) {
+        showToast(`Đã thêm tài khoản! Lưu ý: ${data.warning}`, "warning");
+      } else {
+        showToast(`Đã thêm thành công ${data.count || 1} tài khoản!`, "success");
+      }
+      document.getElementById("accLabelInput").value = "";
+      document.getElementById("accCookieInput").value = "";
+      await loadAccounts();
+      await checkServerStatus();
+
+    } catch (e) {
+      showToast(`Không thể thêm tài khoản: ${e.message}`, "danger");
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerText = oldText || "➕ Thêm Tài Khoản";
+      }
+    }
+  }
+
+  async function testAccount(aid) {
+    showToast("Đang kiểm tra tài khoản với Muse.ai...", "info");
+    try {
+      const res = await fetch(`/admin/accounts/${aid}/test`, {
+        method: "POST",
+        headers: getHeaders()
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast("Tài khoản hoạt động tốt!", "success");
+      } else {
+        showToast(`Tài khoản lỗi: ${data.note || data.message || "Không kết nối được"}`, "danger");
+      }
+      loadAccounts();
+    } catch (e) {
+      showToast(`Lỗi test: ${e.message}`, "danger");
+    }
+  }
+
+  async function deleteAccount(aid) {
+    if (!confirm("Bạn có chắc muốn xóa tài khoản này khỏi hệ thống?")) return;
+    try {
+      const res = await fetch(`/admin/accounts/${aid}`, {
+        method: "DELETE",
+        headers: getHeaders()
+      });
+      if (res.ok) {
+        showToast("Đã xóa tài khoản", "info");
+        loadAccounts();
+        checkServerStatus();
+      }
+    } catch (e) {
+      showToast(`Lỗi xóa: ${e.message}`, "danger");
+    }
+  }
+
+  async function triggerKeepaliveAll() {
+    showToast("Đang gửi lệnh kích hoạt và gia hạn toàn bộ tài khoản...", "info");
+    try {
+      const res = await fetch("/admin/accounts/keepalive", {
+        method: "POST",
+        headers: getHeaders()
+      });
+      if (res.ok) {
+        showToast("Đã gia hạn và đánh thức các tài khoản!", "success");
+        loadAccounts();
+      }
+    } catch (e) {
+      showToast(`Lỗi: ${e.message}`, "danger");
+    }
+  }
+
+  // ==================== TAB SHOPEE DATABASE & BATCH ====================
+  let shopeeClaimedProducts = [];
+  let isShopeeBatchRunning = false;
+  let shopeeStopRequested = false;
+  let shopeeForceStopRequested = false;
+  let shopeeBatchTimer = null;
+  let shopeeBatchStartTime = 0;
+
+  async function loadShopeeSettings() {
+    try {
+      const res = await fetch("/api/shopee/settings", { headers: getHeaders() });
+      if (!res.ok) return;
+      const data = await res.json();
+
+      if (data.sv_server_url) {
+        const el = document.getElementById("sp_db_display_url");
+        if (el) el.innerText = data.sv_server_url;
+      }
+      if (data.aspect) document.getElementById("sp_aspect").value = data.aspect;
+      if (data.scene) document.getElementById("sp_scene").value = data.scene;
+      if (data.duration) document.getElementById("sp_duration").value = data.duration;
+      if (data.lang) document.getElementById("sp_lang").value = data.lang;
+      if (data.review_style) document.getElementById("sp_review_style").value = data.review_style;
+      if (data.ai_prompt) document.getElementById("sp_ai_prompt").value = data.ai_prompt;
+      if (data.naming) document.getElementById("sp_naming").value = data.naming;
+      if (data.out_dir) document.getElementById("sp_out_dir").value = data.out_dir;
+      if (data.claim_limit) document.getElementById("sp_limit").value = data.claim_limit;
+      if (data.sort_by) document.getElementById("sp_sort_by").value = data.sort_by;
+      if (data.market) document.getElementById("sp_market").value = data.market;
+      if (data.min_item_id) document.getElementById("sp_min_item_id").value = data.min_item_id;
+      if (data.min_commission) document.getElementById("sp_min_commission").value = data.min_commission;
+      if (data.min_sold) document.getElementById("sp_min_sold").value = data.min_sold;
+      if (data.min_price !== undefined) document.getElementById("sp_min_price").value = data.min_price;
+      if (data.max_price !== undefined) document.getElementById("sp_max_price").value = data.max_price || "";
+      if (data.threads) {
+        const val = String(data.threads);
+        const sel = document.getElementById("sp_threads_select");
+        const numInput = document.getElementById("sp_threads");
+        if (numInput) numInput.value = val;
+        if (sel) {
+          const matchOpt = Array.from(sel.options).find(o => o.value === val);
+          if (matchOpt) {
+            sel.value = val;
+            if (numInput) numInput.style.display = "none";
+          } else {
+            sel.value = "custom";
+            if (numInput) numInput.style.display = "inline-block";
+          }
+        }
+      }
+      if (data.del_img !== undefined) document.getElementById("sp_del_img").checked = !!data.del_img;
+      if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
+    } catch (e) {
+      console.warn("Lỗi tải cài đặt Shopee:", e);
+    }
+  }
+
+  function updateShopeeThreadsHint() {
+    const sel = document.getElementById("sp_threads_select");
+    const numInput = document.getElementById("sp_threads");
+    const hintEl = document.getElementById("sp_threads_alive_hint");
+    if (!hintEl) return;
+    
+    let userThreads = 2;
+    if (sel && sel.value === "custom" && numInput) {
+      userThreads = Math.max(1, parseInt(numInput.value) || 2);
+    } else if (sel) {
+      userThreads = Math.max(1, parseInt(sel.value) || 2);
+    }
+
+    const alive = cachedAliveCount;
+    if (alive <= 0) {
+      hintEl.innerHTML = `<span style="color:#ef4444;font-weight:700;">(🔴 0 TK sống - Cần nạp Cookie)</span>`;
+    } else if (userThreads > alive) {
+      hintEl.innerHTML = `<span style="color:#f59e0b;font-weight:700;">(⚠️ Chọn ${userThreads} luồng > ${alive} TK sống → Tối đa chạy ${alive} luồng)</span>`;
+    } else {
+      hintEl.innerHTML = `<span style="color:#34d399;font-weight:600;">(🟢 ${userThreads} luồng / ${alive} TK sống)</span>`;
+    }
+  }
+
+  function onShopeeThreadsChange() {
+    const sel = document.getElementById("sp_threads_select");
+    const numInput = document.getElementById("sp_threads");
+    if (!sel || !numInput) return;
+    if (sel.value === "custom") {
+      numInput.style.display = "inline-block";
+      numInput.focus();
+    } else {
+      numInput.style.display = "none";
+      numInput.value = sel.value;
+    }
+    updateShopeeThreadsHint();
+    saveShopeeSettings();
+  }
+
+  function onShopeeThreadsCustomChange() {
+    updateShopeeThreadsHint();
+    saveShopeeSettings();
+  }
+
+  function getShopeeFormData() {
+    return {
+      threads: parseInt(document.getElementById("sp_threads")?.value) || 2,
+      aspect: document.getElementById("sp_aspect").value,
+      scene: document.getElementById("sp_scene").value,
+      duration: document.getElementById("sp_duration").value,
+      lang: document.getElementById("sp_lang").value,
+      review_style: document.getElementById("sp_review_style").value,
+      ai_prompt: document.getElementById("sp_ai_prompt").value,
+      del_img: document.getElementById("sp_del_img").checked,
+      ghep_anh: document.getElementById("sp_ghep_anh").checked,
+      naming: document.getElementById("sp_naming").value,
+      out_dir: document.getElementById("sp_out_dir").value.trim(),
+      limit: parseInt(document.getElementById("sp_limit").value) || 2000,
+      sort_by: document.getElementById("sp_sort_by").value,
+      market: document.getElementById("sp_market").value,
+      min_item_id: document.getElementById("sp_min_item_id").value.trim(),
+      min_commission: parseFloat(document.getElementById("sp_min_commission").value) || 1,
+      min_sold: parseInt(document.getElementById("sp_min_sold").value) || 0,
+      min_price: parseFloat(document.getElementById("sp_min_price").value) || 0,
+      max_price: document.getElementById("sp_max_price").value.trim() ? parseFloat(document.getElementById("sp_max_price").value) : null
+    };
+  }
+
+  async function saveShopeeSettings() {
+    try {
+      const payload = getShopeeFormData();
+      await fetch("/api/shopee/save-settings", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify(payload)
+      });
+    } catch (_) {}
+  }
+
+  function appendShopeeLog(msg) {
+    const logEl = document.getElementById("shopeeLiveLog");
+    if (!logEl) return;
+    const time = new Date().toLocaleTimeString("vi-VN", {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+    logEl.innerText += `\n[${time}] ${msg}`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  let shopeeCompletionTimes = [];
+
+  function recordShopeeCompletion() {
+    shopeeCompletionTimes.push(Date.now());
+    updateShopeeSpeedLabel();
+  }
+
+  function updateShopeeSpeedLabel() {
+    const now = Date.now();
+    shopeeCompletionTimes = shopeeCompletionTimes.filter(t => (now - t) <= 300000);
+    const speedEl = document.getElementById("shopeeSpeedText");
+    if (!speedEl) return;
+    if (shopeeCompletionTimes.length === 0) {
+      speedEl.innerText = "⚡ 0.0 video/phút";
+      return;
+    }
+    if (shopeeCompletionTimes.length === 1) {
+      const elapsedMin = Math.max((now - shopeeBatchStartTime) / 60000, 0.2);
+      const rate = (1 / elapsedMin).toFixed(1);
+      speedEl.innerText = `⚡ ${rate} video/phút`;
+      return;
+    }
+    const windowDurationSec = (now - shopeeCompletionTimes[0]) / 1000;
+    const minutes = Math.max(windowDurationSec / 60, 0.2);
+    const rate = (shopeeCompletionTimes.length / minutes).toFixed(1);
+    speedEl.innerText = `⚡ ${rate} video/phút`;
+  }
+
+  function onShopeeMarketChange() {
+    const m = document.getElementById("sp_market").value;
+    const langSel = document.getElementById("sp_lang");
+    const marketLangMap = {
+      "PH": "Tiếng Philippines",
+      "VN": "Tiếng Việt",
+      "TH": "Tiếng Thái",
+      "ID": "Tiếng Indonesia",
+      "MY": "Tiếng Malaysia",
+      "TW": "Tiếng Trung (Đài Loan)",
+      "SG": "Tiếng Anh"
+    };
+    const targetLang = marketLangMap[m];
+    if (targetLang && langSel) {
+      for (let i = 0; i < langSel.options.length; i++) {
+        if (langSel.options[i].value.includes(targetLang) || targetLang.includes(langSel.options[i].value)) {
+          langSel.selectedIndex = i;
+          break;
+        }
+      }
+    }
+    const outInput = document.getElementById("sp_out_dir");
+    if (outInput && outInput.value.includes("/Video AI/")) {
+      outInput.value = `F:/Video AI/${m}/shopapi`;
+    }
+    renderShopeeProductsConsole();
+    saveShopeeSettings();
+  }
+
+  function onShopeeDurationChange() {
+    const dur = document.getElementById("sp_duration").value;
+    const promptSel = document.getElementById("sp_ai_prompt");
+    if (dur === "16s") {
+      promptSel.innerHTML = '<option value="Prompt A + B" selected>Prompt A + B</option>';
+      promptSel.disabled = true;
+      promptSel.title = "Độ dài 16s chỉ sử dụng kịch bản Prompt A + B (nối 2 clip)";
+    } else {
+      promptSel.disabled = false;
+      promptSel.title = "";
+      const cur = promptSel.value;
+      promptSel.innerHTML = `
+        <option value="Template (mặc định)">Template (mặc định)</option>
+        <option value="Prompt A + B">Prompt A + B</option>
+        <option value="Gemini">Gemini</option>
+        <option value="Groq">Groq</option>
+      `;
+      if (cur && ["Template (mặc định)", "Prompt A + B", "Gemini", "Groq"].includes(cur)) {
+        promptSel.value = cur;
+      } else {
+        promptSel.value = "Template (mặc định)";
+      }
+    }
+    saveShopeeSettings();
+  }
+
+  function renderShopeeProductsConsole() {
+    const consoleEl = document.getElementById("shopeeProductsConsole");
+    const countEl = document.getElementById("shopeeProductCount");
+    if (!shopeeClaimedProducts || shopeeClaimedProducts.length === 0) {
+      consoleEl.innerHTML = "Chưa có sản phẩm nào. Bấm [📥 Nhận SP] để nhận lô sản phẩm từ Database!";
+      countEl.innerText = "0 SP";
+      return;
+    }
+    const m = (document.getElementById("sp_market") ? document.getElementById("sp_market").value : "PH");
+    const symMap = { "VN": "₫", "ID": "Rp", "TH": "฿", "MY": "RM", "TW": "NT$", "SG": "S$", "PH": "₱" };
+    const sym = symMap[m] || "₱";
+    countEl.innerText = `${shopeeClaimedProducts.length} SP`;
+    consoleEl.innerHTML = shopeeClaimedProducts.map((p, idx) => {
+      const statusIcon = p._status === "completed" ? "✅" : (p._status === "processing" ? "🔄" : (p._status === "failed" ? "❌" : "⏳"));
+      const sold = p.historical_sold ?? p.sold ?? 0;
+      const comm = p.commission_rate ? (p.commission_rate * 100).toFixed(0) : (p.commission ?? "0");
+      const price = p.price_min ?? p.price ?? 0;
+      const line = `${statusIcon} [${idx + 1}] ID: ${p.item_id} | ${p.name || ''} | ${sym}${price} | Sold: ${sold} | Comm: ${comm}%`;
+      return `<div style="margin-bottom:3px;${p._status === 'completed' ? 'color:#34d399;' : (p._status === 'failed' ? 'color:#f87171;' : '')}">${line}</div>`;
+    }).join("");
+  }
+
+  async function claimShopeeProducts() {
+    const btn = document.getElementById("btnClaimShopee");
+    btn.disabled = true;
+    btn.innerText = "⏳ Đang nhận SP...";
+    appendShopeeLog("Đang gửi yêu cầu nhận lô sản phẩm từ Database Shopee (PostgreSQL)...");
+
+    try {
+      await saveShopeeSettings();
+      const form = getShopeeFormData();
+      const res = await fetch("/api/shopee/claim", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify(form)
+      });
+
+      if (!res.ok) {
+        let err = `Lỗi (${res.status})`;
+        try { const ej = await res.json(); err = ej.detail || err; } catch (_) {}
+        throw new Error(err);
+      }
+
+      const data = await res.json();
+      shopeeClaimedProducts = data.products || [];
+      renderShopeeProductsConsole();
+      appendShopeeLog(`✓ Đã nhận thành công ${shopeeClaimedProducts.length} sản phẩm từ Database!`);
+      if (data.blacklisted_count > 0) {
+        appendShopeeLog(`🛡️ Blacklist: Đã tự động phát hiện và loại bỏ ${data.blacklisted_count} sản phẩm vi phạm chính sách / từ khóa cấm!`);
+      }
+      showToast(`Đã nhận ${shopeeClaimedProducts.length} sản phẩm từ Database!${data.blacklisted_count ? ` (Đã chặn ${data.blacklisted_count} SP vi phạm)` : ''}`, "success");
+    } catch (e) {
+      appendShopeeLog(`❌ Lỗi nhận sản phẩm: ${e.message}`);
+      showToast(`Không thể nhận SP: ${e.message}`, "danger");
+    } finally {
+      btn.disabled = false;
+      btn.innerText = "📥 Nhận SP";
+    }
+  }
+
+  async function releaseStuckShopeeJobs() {
+    if (!confirm("Bạn có chắc muốn giải phóng tất cả các job đang ở trạng thái 'processing' của máy này trên Database?")) return;
+    appendShopeeLog("Đang gửi lệnh giải phóng sản phẩm kẹt về Database...");
+    try {
+      const res = await fetch("/api/shopee/release", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      appendShopeeLog(`✓ Đã giải phóng ${data.released || 0} sản phẩm kẹt.`);
+      showToast(`Đã giải phóng ${data.released || 0} sản phẩm!`, "success");
+      shopeeClaimedProducts = [];
+      renderShopeeProductsConsole();
+    } catch (e) {
+      appendShopeeLog(`❌ Lỗi giải phóng: ${e.message}`);
+      showToast(`Lỗi giải phóng: ${e.message}`, "danger");
+    }
+  }
+
+  function clearPolicyViolations() {
+    if (!shopeeClaimedProducts.length) {
+      showToast("Chưa có danh sách sản phẩm để lọc vi phạm", "info");
+      return;
+    }
+    const beforeCount = shopeeClaimedProducts.length;
+    const blockList = ["disney", "marvel", "nike", "adidas", "gucci", "chanel", "louis vuitton", "apple", "iphone", "samsung", "doraemon", "hello kitty", "pokemon", "naruto", "one piece", "rolex", "zara", "h&m", "dior", "prada", "versace", "balenciaga"];
+    shopeeClaimedProducts = shopeeClaimedProducts.filter(p => {
+      const name = (p.name || "").toLowerCase();
+      return !blockList.some(word => name.includes(word));
+    });
+    const removed = beforeCount - shopeeClaimedProducts.length;
+    renderShopeeProductsConsole();
+    appendShopeeLog(`Đã lọc và xóa ${removed} sản phẩm có từ khóa thương hiệu / vi phạm bản quyền.`);
+    showToast(`Đã loại bỏ ${removed} sản phẩm vi phạm chính sách!`, "success");
+  }
+
+  async function testShopeePrompt() {
+    let pName = "Tecno Pova 6 Neo Phone Case Shockproof Armor";
+    if (shopeeClaimedProducts.length > 0) {
+      pName = shopeeClaimedProducts[0].name || pName;
+    }
+    const lang = document.getElementById("sp_lang").value;
+    const market = document.getElementById("sp_market").value;
+    const style = document.getElementById("sp_review_style").value;
+    const dur = document.getElementById("sp_duration").value;
+    const ai = document.getElementById("sp_ai_prompt").value;
+    const scene = document.getElementById("sp_scene").value;
+
+    appendShopeeLog(`Đang test sinh Prompt TVC cho sản phẩm: "${pName}" (Thị trường: ${market} - ${lang})...`);
+    try {
+      const res = await fetch("/api/shopee/test-prompt", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ product_name: pName, lang: lang, market: market, review_style: style, duration: dur, ai_prompt: ai, scene: scene })
+      });
+      const data = await res.json();
+      appendShopeeLog(`[Prompt Test - ${data.label}]:\n${data.prompt}`);
+      alert(`[Kịch bản TVC Review ${data.label}]\n\nThị trường: ${market} (${lang})\nSản phẩm sạch: ${data.clean_title}\n\nPrompt:\n${data.prompt}`);
+    } catch (e) {
+      showToast(`Lỗi test prompt: ${e.message}`, "danger");
+    }
+  }
+
+  function openAiKeysDialog() {
+    showToast("Chế độ Template mặc định không yêu cầu thêm AI Key. Bạn có thể chạy ngay!", "info");
+  }
+
+  async function pickShopeeFolder() {
+    const cur = document.getElementById("sp_out_dir").value;
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_folder_dialog) {
+      try {
+        const res = await window.pywebview.api.pick_folder_dialog(cur);
+        if (res && res.success && res.folder_path) {
+          document.getElementById("sp_out_dir").value = res.folder_path;
+          saveShopeeSettings();
+          showToast(`Đã chọn thư mục: ${res.folder_path}`, "success");
+          return;
+        }
+      } catch (e) {
+        console.warn("pick folder error:", e);
+      }
+    }
+    const manual = prompt("Nhập đường dẫn thư mục lưu video:", cur);
+    if (manual) {
+      document.getElementById("sp_out_dir").value = manual.trim();
+      saveShopeeSettings();
+    }
+  }
+
+  async function openShopeeOutDir() {
+    const cur = document.getElementById("sp_out_dir").value.trim();
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.open_folder_path) {
+      try {
+        await window.pywebview.api.open_folder_path(cur);
+        return;
+      } catch (_) {}
+    }
+    openMediaFolder();
+  }
+
+  async function renderSingleVideoClip(promptText, refImageDataUrl, ar, durationSec, workerId, label) {
+    const videoPayload = {
+      prompt: promptText,
+      duration: durationSec,
+      aspect_ratio: ar,
+      size: ar,
+      model: "muse-video"
+    };
+    if (refImageDataUrl) {
+      videoPayload.reference_image = refImageDataUrl;
+    }
+    appendShopeeLog(`> [Luồng ${workerId}] Gửi yêu cầu render (${label || 'Clip'}, ${durationSec}s) tới Muse.ai...`);
+    const vRes = await fetch("/v1/videos", {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify(videoPayload)
+    });
+    if (!vRes.ok) {
+      const errText = await vRes.text();
+      throw new Error(errText || "Lỗi tạo video từ Muse.ai");
+    }
+    const vData = await vRes.json();
+    const taskId = vData.id || vData.task_id;
+    appendShopeeLog(`> [Luồng ${workerId}] Task ID: ${taskId}. Đang đợi Muse.ai render...`);
+
+    const startPoll = Date.now();
+    while (Date.now() - startPoll < 300000) {
+      if (shopeeForceStopRequested) break;
+      await new Promise(r => setTimeout(r, 3000));
+      const pollRes = await fetch(`/v1/videos/${taskId}`, { headers: getHeaders() });
+      if (!pollRes.ok) continue;
+      const pData = await pollRes.json();
+      if (pData.status === "completed" || pData.status === "succeeded") {
+        return pData.result?.filename || `clip_${taskId}.mp4`;
+      } else if (pData.status === "failed") {
+        throw new Error(pData.error || "Muse.ai báo lỗi render video");
+      }
+    }
+    if (shopeeForceStopRequested) throw new Error("Tiến trình bị buộc dừng khẩn cấp bởi người dùng");
+    throw new Error("Hết thời gian chờ render clip video");
+  }
+
+  async function renderShopeeProductItem(prod, idx, form, outDir, workerId) {
+    appendShopeeLog(`----------------------------------------`);
+    appendShopeeLog(`[Luồng ${workerId}] [${idx + 1}/${shopeeClaimedProducts.length}] Bắt đầu xử lý SP ${prod.item_id}: ${prod.name || ''}...`);
+
+    let refImageDataUrl = null;
+    const imgUrl = prod.image || (prod.images && prod.images[0]) || "";
+    if (imgUrl) {
+      appendShopeeLog(`> [Luồng ${workerId}] Đang tải ảnh SP từ Shopee CDN...`);
+      try {
+        const imgRes = await fetch("/api/shopee/download-image", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({ image_url: imgUrl })
+        });
+        if (imgRes.ok) {
+          const imgData = await imgRes.json();
+          refImageDataUrl = imgData.data_url;
+          appendShopeeLog(`✓ [Luồng ${workerId}] Tải ảnh thành công.`);
+        }
+      } catch (ie) {
+        appendShopeeLog(`⚠️ [Luồng ${workerId}] Lỗi tải ảnh: ${ie.message}`);
+      }
+    }
+
+    const promptRes = await fetch("/api/shopee/test-prompt", {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify({
+        product_name: prod.name || "Product",
+        lang: form.lang,
+        market: form.market,
+        review_style: form.review_style,
+        duration: form.duration,
+        ai_prompt: form.ai_prompt,
+        scene: form.scene
+      })
+    });
+    const promptData = await promptRes.json();
+    const is16s = promptData.is_16s && promptData.prompts && promptData.prompts.length === 2;
+
+    let ar = "9:16";
+    if (form.aspect.includes("16:9")) ar = "16:9";
+    else if (form.aspect.includes("1:1")) ar = "1:1";
+
+    let finishedVideoFilename = null;
+
+    if (is16s) {
+      appendShopeeLog(`> [Luồng ${workerId}] Chế độ 16s (Prompt A + B): Kiểm tra tiến độ clip A / B...`);
+
+      let clipAFile = null;
+      let clipBFile = null;
+
+      // 1. Kiểm tra xem file clip thô đã có sẵn trong folder outDir/temp chưa
+      try {
+        const checkRes = await fetch(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}`, { headers: getHeaders() });
+        if (checkRes.ok) {
+          const chk = await checkRes.json();
+          clipAFile = chk.clip_a;
+          clipBFile = chk.clip_b;
+        }
+      } catch (_) {}
+
+      // 2. Nếu chưa tìm thấy, kiểm tra cache tiến độ của item_id
+      if (!clipAFile || !clipBFile) {
+        try {
+          const cacheRes = await fetch(`/api/shopee/clip-cache/${prod.item_id}`, { headers: getHeaders() });
+          if (cacheRes.ok) {
+            const cachedClips = await cacheRes.json();
+            if (!clipAFile) clipAFile = cachedClips.clip_a || prod._clipA;
+            if (!clipBFile) clipBFile = cachedClips.clip_b || prod._clipB;
+          }
+        } catch (_) {}
+      }
+
+      if (clipAFile) {
+        appendShopeeLog(`⚡ [Luồng ${workerId}] ĐÃ CÓ SẴN CLIP A: temp/${prod.item_id}-a.mp4 -> Bỏ qua, không cần tạo lại!`);
+      } else {
+        appendShopeeLog(`> [Luồng ${workerId}] Đang tạo Clip A (0-8s)...`);
+        const rawA = await renderSingleVideoClip(promptData.prompts[0], refImageDataUrl, ar, 8, workerId, "Clip A (0-8s)");
+        prod._clipA = rawA;
+        try {
+          const saveResA = await fetch("/api/shopee/save-temp-clip", {
+            method: "POST",
+            headers: getHeaders(),
+            body: JSON.stringify({ filename: rawA, out_dir: outDir, item_id: String(prod.item_id), part: "a" })
+          });
+          if (saveResA.ok) {
+            const sDataA = await saveResA.json();
+            clipAFile = sDataA.path || rawA;
+            appendShopeeLog(`✓ [Luồng ${workerId}] Clip A hoàn tất: ${prod.item_id}-a.mp4 (Lưu tại: temp/${prod.item_id}-a.mp4)`);
+          } else {
+            const errA = await saveResA.text();
+            clipAFile = rawA;
+            appendShopeeLog(`✓ [Luồng ${workerId}] Clip A hoàn tất: ${prod.item_id}-a.mp4 (Cảnh báo lưu temp: ${errA})`);
+          }
+        } catch (eA) {
+          clipAFile = rawA;
+          appendShopeeLog(`✓ [Luồng ${workerId}] Clip A hoàn tất: ${prod.item_id}-a.mp4 (Lỗi kết nối lưu temp: ${eA.message})`);
+        }
+      }
+
+      if (clipBFile) {
+        appendShopeeLog(`⚡ [Luồng ${workerId}] ĐÃ CÓ SẴN CLIP B: temp/${prod.item_id}-b.mp4 -> Bỏ qua, không cần tạo lại!`);
+      } else {
+        appendShopeeLog(`> [Luồng ${workerId}] Đang tạo Clip B (8-16s)...`);
+        const rawB = await renderSingleVideoClip(promptData.prompts[1], refImageDataUrl, ar, 8, workerId, "Clip B (8-16s)");
+        prod._clipB = rawB;
+        try {
+          const saveResB = await fetch("/api/shopee/save-temp-clip", {
+            method: "POST",
+            headers: getHeaders(),
+            body: JSON.stringify({ filename: rawB, out_dir: outDir, item_id: String(prod.item_id), part: "b" })
+          });
+          if (saveResB.ok) {
+            const sDataB = await saveResB.json();
+            clipBFile = sDataB.path || rawB;
+            appendShopeeLog(`✓ [Luồng ${workerId}] Clip B hoàn tất: ${prod.item_id}-b.mp4 (Lưu tại: temp/${prod.item_id}-b.mp4)`);
+          } else {
+            const errB = await saveResB.text();
+            clipBFile = rawB;
+            appendShopeeLog(`✓ [Luồng ${workerId}] Clip B hoàn tất: ${prod.item_id}-b.mp4 (Cảnh báo lưu temp: ${errB})`);
+          }
+        } catch (eB) {
+          clipBFile = rawB;
+          appendShopeeLog(`✓ [Luồng ${workerId}] Clip B hoàn tất: ${prod.item_id}-b.mp4 (Lỗi kết nối lưu temp: ${eB.message})`);
+        }
+      }
+
+      appendShopeeLog(`> [Luồng ${workerId}] Đang ghép Clip A + Clip B thành video 16s qua FFmpeg...`);
+      const concatRes = await fetch("/api/shopee/concat-videos", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({
+          clip_filenames: [clipAFile, clipBFile],
+          out_filename: `shopee_16s_${prod.item_id}_${Date.now()}.mp4`
+        })
+      });
+      if (!concatRes.ok) {
+        const cErr = await concatRes.text();
+        throw new Error(cErr || "Lỗi ghép Clip A + Clip B bằng FFmpeg");
+      }
+      const concatData = await concatRes.json();
+      finishedVideoFilename = concatData.filename;
+      appendShopeeLog(`✓ [Luồng ${workerId}] Ghép video 16s thành công!`);
+    } else {
+      const dur = parseInt(form.duration) || 8;
+      finishedVideoFilename = await renderSingleVideoClip(promptData.prompt, refImageDataUrl, ar, dur, workerId, `${dur}s`);
+      appendShopeeLog(`✓ [Luồng ${workerId}] Muse.ai đã render xong: ${finishedVideoFilename}`);
+      try {
+        await fetch("/api/shopee/save-temp-clip", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({ filename: finishedVideoFilename, out_dir: outDir, item_id: prod.item_id, part: "raw" })
+        });
+      } catch (_) {}
+    }
+
+    let targetFileName = `${prod.item_id}.mp4`;
+    if (form.naming.includes("15 ký tự")) {
+      const safeName = (prod.name || "video").slice(0, 15).replace(/[^a-zA-Z0-9_-]/g, "_");
+      targetFileName = `${safeName}_${prod.item_id}.mp4`;
+    } else if (form.naming.includes("Số thứ tự")) {
+      targetFileName = `${String(idx + 1).padStart(4, "0")}_${prod.item_id}.mp4`;
+    }
+
+    if (form.ghep_anh) {
+      appendShopeeLog(`> [Luồng ${workerId}] Đang ghép ảnh Outro sản phẩm để tạo video 12s bằng FFmpeg...`);
+    }
+
+    const saveRes = await fetch("/api/shopee/save-rendered-video", {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify({
+        filename: finishedVideoFilename,
+        out_dir: outDir,
+        target_name: targetFileName,
+        ghep_anh: form.ghep_anh,
+        del_img: form.del_img,
+        image_url: imgUrl,
+        image_data_url: refImageDataUrl,
+        duration: form.duration
+      })
+    });
+    const saveData = await saveRes.json();
+    const finalSavedPath = saveData.saved_path || `${outDir}/${targetFileName}`;
+    if (saveData.stitched) {
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã ghép ảnh Outro thành công vào: ${finalSavedPath}`);
+    } else {
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video vào: ${finalSavedPath}`);
+    }
+
+    await fetch("/api/shopee/complete", {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify({
+        item_id: prod.item_id,
+        status: "completed",
+        video_path: finalSavedPath
+      })
+    });
+    appendShopeeLog(`✓ [Luồng ${workerId}] Đã báo cáo hoàn tất Job ID: ${prod.item_id} về Database Shopee.`);
+  }
+
+  async function startShopeeBatch() {
+    if (!shopeeClaimedProducts || shopeeClaimedProducts.length === 0) {
+      showToast("Chưa có sản phẩm nào trong hàng đợi. Vui lòng bấm [📥 Nhận SP] trước!", "warning");
+      return;
+    }
+
+    if (isShopeeBatchRunning) return;
+    isShopeeBatchRunning = true;
+    shopeeStopRequested = false;
+    shopeeForceStopRequested = false;
+
+    document.getElementById("btnStartBatch").disabled = true;
+    const btnStop = document.getElementById("btnStopBatch");
+    btnStop.disabled = false;
+    btnStop.innerText = "⏹ Dừng";
+    btnStop.style.background = "";
+    btnStop.style.borderColor = "";
+    document.getElementById("btnClaimShopee").disabled = true;
+
+    const speedEl = document.getElementById("shopeeSpeedText");
+    if (speedEl) {
+      speedEl.style.display = "inline-block";
+      speedEl.innerText = "⚡ 0.0 video/phút";
+    }
+    shopeeCompletionTimes = [];
+
+    shopeeBatchStartTime = Date.now();
+    if (shopeeBatchTimer) clearInterval(shopeeBatchTimer);
+    shopeeBatchTimer = setInterval(() => {
+      const sec = Math.round((Date.now() - shopeeBatchStartTime) / 1000);
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      document.getElementById("shopeeElapsedTimer").innerText = `Thời gian: ${m}m ${s}s`;
+      updateShopeeSpeedLabel();
+    }, 1000);
+
+    const form = getShopeeFormData();
+    const outDir = form.out_dir || "F:/Video AI/PH/shopapi";
+    const requestedWorkers = Math.max(1, parseInt(document.getElementById("sp_threads").value) || 2);
+
+    // Truy vấn trạng thái tài khoản mới nhất để biết chính xác số tài khoản còn sống
+    let aliveAccounts = cachedAliveCount;
+    try {
+      const accRes = await fetch("/admin/accounts", { headers: getHeaders() });
+      if (accRes.ok) {
+        const ad = await accRes.json();
+        const accList = Array.isArray(ad) ? ad : (ad.accounts || []);
+        cachedAccounts = accList;
+        const nowTs = Date.now() / 1000;
+        cachedAliveCount = typeof ad.alive_count === "number"
+          ? ad.alive_count
+          : accList.filter(a => a.is_alive !== false && a.ok !== false && a.enabled !== false && (!a.expires_at || a.expires_at > nowTs)).length;
+        aliveAccounts = cachedAliveCount;
+        updateShopeeThreadsHint();
+      }
+    } catch (_) {}
+
+    if (aliveAccounts <= 0) {
+      showToast("❌ Không có tài khoản nào còn sống hoặc khả dụng trong hệ thống! Vui lòng vào Tab [Tài Khoản] để nạp Cookie.", "danger");
+      appendShopeeLog("❌ BẮT ĐẦU THẤT BẠI: Toàn bộ tài khoản đã hết hạn hoặc bị lỗi. Vui lòng vào Tab [Tài Khoản] kiểm tra lại.");
+      clearInterval(shopeeBatchTimer);
+      isShopeeBatchRunning = false;
+      document.getElementById("btnStartBatch").disabled = false;
+      document.getElementById("btnStopBatch").disabled = true;
+      document.getElementById("btnClaimShopee").disabled = false;
+      return;
+    }
+
+    // NGUYÊN TẮC: Số luồng chạy luôn <= số tài khoản đang còn sống (mỗi tài khoản 1 luồng cùng lúc, không bao giờ chạy quá)
+    const maxWorkers = Math.min(requestedWorkers, aliveAccounts);
+
+    if (requestedWorkers > aliveAccounts) {
+      appendShopeeLog(`⚡ ĐIỀU PHỐI TỐC ĐỘ: Bạn chọn ${requestedWorkers} luồng, nhưng hiện có ${aliveAccounts} tài khoản còn sống -> Hệ thống tự động giới hạn chạy ${maxWorkers} luồng song song (đảm bảo mỗi tài khoản 1 luồng độc lập, tránh xung đột/treo tác vụ).`);
+    } else {
+      appendShopeeLog(`🚀 BẮT ĐẦU CHẠY BATCH RENDER CHO ${shopeeClaimedProducts.length} SẢN PHẨM VỚI ${maxWorkers} LUỒNG SONG SONG (${aliveAccounts} TÀI KHOẢN KHẢ DỤNG)...`);
+    }
+
+    let nextIndex = 0;
+    let completedCount = shopeeClaimedProducts.filter(p => p._status === "completed").length;
+    let failedCount = 0;
+
+    function updateProgressText() {
+      const inProgress = shopeeClaimedProducts.filter(p => p._status === "processing").length;
+      document.getElementById("batchProgressText").innerText = 
+        `Đang chạy (${inProgress} luồng) | Xong: ${completedCount}/${shopeeClaimedProducts.length} | Lỗi: ${failedCount}`;
+    }
+
+    updateProgressText();
+
+    async function workerLoop(workerId) {
+      while (!shopeeStopRequested && !shopeeForceStopRequested) {
+        if (nextIndex >= shopeeClaimedProducts.length) break;
+        const currentIdx = nextIndex++;
+        const prod = shopeeClaimedProducts[currentIdx];
+        if (!prod || prod._status === "completed") continue;
+
+        prod._status = "processing";
+        renderShopeeProductsConsole();
+        updateProgressText();
+
+        try {
+          await renderShopeeProductItem(prod, currentIdx, form, outDir, workerId);
+          prod._status = "completed";
+          completedCount++;
+          recordShopeeCompletion();
+        } catch (err) {
+          prod._status = "failed";
+          failedCount++;
+          appendShopeeLog(`❌ [Luồng ${workerId}] Lỗi SP ${prod.item_id}: ${err.message}`);
+
+          // Tự động kiểm tra và thêm vào Blacklist nếu vi phạm chính sách an toàn
+          const msgLow = (err.message || "").toLowerCase();
+          if (msgLow.includes("safety") || msgLow.includes("policy") || msgLow.includes("vi phạm") || msgLow.includes("nsfw") || msgLow.includes("prohibited")) {
+            try {
+              await fetch("/api/shopee/add-to-blacklist", {
+                method: "POST",
+                headers: getHeaders(),
+                body: JSON.stringify({ item_id: prod.item_id, reason: err.message })
+              });
+              appendShopeeLog(`🛡️ [Luồng ${workerId}] Đã tự động thêm SP ${prod.item_id} vào Blacklist (vi phạm chính sách Muse.ai)!`);
+            } catch (_) {}
+          }
+
+          try {
+            await fetch("/api/shopee/complete", {
+              method: "POST",
+              headers: getHeaders(),
+              body: JSON.stringify({ item_id: prod.item_id, status: "failed" })
+            });
+          } catch (_) {}
+        }
+        renderShopeeProductsConsole();
+        updateProgressText();
+      }
+    }
+
+    const workerPromises = [];
+    for (let w = 1; w <= maxWorkers; w++) {
+      workerPromises.push(workerLoop(w));
+    }
+    await Promise.all(workerPromises);
+
+    clearInterval(shopeeBatchTimer);
+    isShopeeBatchRunning = false;
+    document.getElementById("btnStartBatch").disabled = false;
+    const btnStopFinal = document.getElementById("btnStopBatch");
+    btnStopFinal.disabled = true;
+    btnStopFinal.innerText = "⏹ Dừng";
+    btnStopFinal.style.background = "";
+    btnStopFinal.style.borderColor = "";
+    document.getElementById("btnClaimShopee").disabled = false;
+    document.getElementById("batchProgressText").innerText = `Hoàn tất batch: ${completedCount} thành công, ${failedCount} lỗi`;
+    appendShopeeLog(`🎉 KẾT THÚC BATCH: ${completedCount} thành công, ${failedCount} lỗi.`);
+    showToast(`Đã hoàn tất tiến trình Batch! (${completedCount} thành công, ${failedCount} lỗi)`, "success");
+    loadGallery();
+  }
+
+  function stopShopeeBatch() {
+    if (!isShopeeBatchRunning) return;
+    const btn = document.getElementById("btnStopBatch");
+    if (!shopeeStopRequested) {
+      // Bấm lần 1: Dừng lịch sự (Graceful stop - hoàn thành các job dở dang)
+      shopeeStopRequested = true;
+      btn.innerText = "🛑 Dừng Ngay Lập Tức (Lần 2)";
+      btn.style.background = "#b91c1c";
+      btn.style.borderColor = "#f87171";
+      appendShopeeLog("⚠️ ĐÃ BẤM DỪNG (LẦN 1): Đang đợi hoàn thành các video đang render dở và dừng nhận sản phẩm mới. (Nếu muốn hủy khẩn cấp ngay lập tức, bấm nút Dừng thêm 1 lần nữa!)");
+      showToast("Đang dừng lịch sự: Chờ xong các video đang dở... (Bấm lần 2 để dừng ngay)", "warning");
+    } else {
+      // Bấm lần 2: Buộc dừng ngay lập tức (Force stop)
+      shopeeForceStopRequested = true;
+      btn.disabled = true;
+      btn.innerText = "⚡ Đang buộc dừng ngay...";
+      appendShopeeLog("🛑 ĐÃ BẤM DỪNG LẦN 2: DỪNG KHẨN CẤP TOÀN BỘ TIẾN TRÌNH VÀ CÁC LUỒNG ĐANG CHẠY!");
+      showToast("Đã dừng khẩn cấp toàn bộ luồng!", "danger");
+    }
+  }
+
+  // Toasts
+  function showToast(msg, type = "info") {
+    const box = document.getElementById("toastBox");
+    const t = document.createElement("div");
+    t.className = "toast";
+
+    let icon = "ℹ️";
+    if (type === "success") icon = "✅";
+    if (type === "warning") icon = "⚠️";
+    if (type === "danger") icon = "❌";
+
+    t.innerHTML = `<span>${icon}</span> <span>${msg}</span>`;
+    box.appendChild(t);
+
+    setTimeout(() => {
+      t.style.opacity = "0";
+      t.style.transform = "translateX(100%)";
+      t.style.transition = "all 0.3s";
+      setTimeout(() => t.remove(), 300);
+    }, 4000);
+  }
+
+  // ==================== BLACKLIST MANAGEMENT ====================
+  async function openBlacklistModal() {
+    const modal = document.getElementById("blacklistModal");
+    if (!modal) return;
+    modal.classList.add("active");
+    try {
+      const res = await fetch("/api/shopee/blacklist", { headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        document.getElementById("bl_enabled").checked = data.enabled !== false;
+        document.getElementById("bl_auto_block").checked = data.auto_block_safety_errors !== false;
+        document.getElementById("bl_keywords").value = (data.keywords || []).join("\n");
+        document.getElementById("bl_item_ids").value = (data.item_ids || []).join("\n");
+        document.getElementById("bl_status_text").innerText = `Đang có ${(data.keywords || []).length} từ khóa, ${(data.item_ids || []).length} ID`;
+      }
+    } catch (e) {
+      console.warn("Lỗi tải blacklist:", e);
+    }
+  }
+
+  function closeBlacklistModal(e) {
+    if (e && e.target !== e.currentTarget) return;
+    const modal = document.getElementById("blacklistModal");
+    if (modal) modal.classList.remove("active");
+  }
+
+  async function saveBlacklistData() {
+    const enabled = document.getElementById("bl_enabled").checked;
+    const autoBlock = document.getElementById("bl_auto_block").checked;
+    const kwText = document.getElementById("bl_keywords").value;
+    const idText = document.getElementById("bl_item_ids").value;
+
+    const keywords = kwText.split("\n").map(s => s.trim()).filter(Boolean);
+    const item_ids = idText.split("\n").map(s => s.trim()).filter(Boolean);
+
+    try {
+      const res = await fetch("/api/shopee/save-blacklist", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({
+          enabled: enabled,
+          auto_block_safety_errors: autoBlock,
+          keywords: keywords,
+          item_ids: item_ids
+        })
+      });
+      if (res.ok) {
+        showToast("Đã lưu Blacklist thành công!", "success");
+        document.getElementById("bl_status_text").innerText = `✓ Đã lưu: ${keywords.length} từ khóa, ${item_ids.length} ID`;
+        setTimeout(() => {
+          closeBlacklistModal();
+        }, 500);
+      } else {
+        throw new Error("Không thể lưu cấu hình");
+      }
+    } catch (e) {
+      showToast(`Lỗi lưu Blacklist: ${e.message}`, "danger");
+    }
+  }
+
+  // ==================== HOMEPROXY MANAGEMENT ====================
+  async function syncThinAptmProxy() {
+    const btn = event?.target;
+    if (btn) {
+      btn.disabled = true;
+      btn.innerText = "⏳ Đang nạp proxy...";
+    }
+    showToast("Đang đồng bộ proxy từ E:\\ThinAptm0707...", "info");
+    try {
+      const res = await fetch("/api/proxy/sync-thinaptm", { method: "POST", headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        showToast(`Đồng bộ thành công! Pool: ${data.pool_size || data.total_proxies} proxy, Gán: ${data.assigned_count || data.newly_assigned || 0} tài khoản.`, "success");
+        await loadAccounts();
+        await fetchBrowserTtlStatus();
+      } else {
+        const err = await res.text();
+        throw new Error(err);
+      }
+    } catch (e) {
+      showToast(`Lỗi đồng bộ proxy: ${e.message}`, "danger");
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerText = "🌐 Nạp Proxy ThinAptm";
+      }
+    }
+  }
+
+  async function testAccountProxy(accId) {
+    showToast(`Đang kiểm tra kết nối proxy của tài khoản ${accId}...`, "info");
+    try {
+      const res = await fetch(`/api/proxy/test/${accId}`, { method: "POST", headers: getHeaders() });
+      const data = await res.json();
+      if (data.success) {
+        showToast(`Proxy sống! IP công khai: ${data.ip}`, "success");
+      } else {
+        showToast(`Proxy lỗi hoặc chết: ${data.error || 'Timeout'}`, "danger");
+      }
+      await loadAccounts();
+    } catch (e) {
+      showToast(`Lỗi kiểm tra proxy: ${e.message}`, "danger");
+    }
+  }
+
+  async function rotateAccountProxy(accId) {
+    if (!confirm(`Bạn có chắc muốn đổi sang proxy mới cho tài khoản ${accId}?`)) return;
+    showToast(`Đang tìm và gán proxy mới cho tài khoản ${accId}...`, "info");
+    try {
+      const res = await fetch(`/api/proxy/rotate/${accId}`, { method: "POST", headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        showToast(`Đã gán proxy mới thành công! IP: ${data.ip || data.proxy}`, "success");
+        await loadAccounts();
+      } else {
+        const ej = await res.json();
+        throw new Error(ej.detail || "Không thể đổi proxy");
+      }
+    } catch (e) {
+      showToast(`Lỗi đổi proxy: ${e.message}`, "danger");
+    }
+  }
+
+  // ==================== BROWSER TTL & RECYCLE ====================
+  async function fetchBrowserTtlStatus() {
+    try {
+      const res = await fetch("/api/browser/ttl", { headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        const ttlMins = data.ttl_minutes || 30;
+        const maxTasks = data.max_tasks || 5;
+        const totalSessions = data.total_active_sessions || 0;
+        const ttlEl = document.getElementById("spBrowserTtlStatus");
+        if (ttlEl) ttlEl.innerText = `${ttlMins} phút / ${maxTasks} tác vụ (${totalSessions} phiên active)`;
+        const ttlSel = document.getElementById("sp_browser_ttl");
+        if (ttlSel && data.ttl_seconds) ttlSel.value = String(data.ttl_seconds);
+        const taskSel = document.getElementById("sp_browser_max_tasks");
+        if (taskSel && data.max_tasks) taskSel.value = String(data.max_tasks);
+      }
+    } catch (_) {}
+
+    // Cập nhật trạng thái HomeProxy
+    try {
+      const aRes = await fetch("/admin/accounts", { headers: getHeaders() });
+      if (aRes.ok) {
+        const aData = await aRes.json();
+        const accs = aData.accounts || [];
+        const withProxy = accs.filter(a => a.proxy).length;
+        const pEl = document.getElementById("spHomeProxyStatus");
+        if (pEl) {
+          if (withProxy === 0) {
+            pEl.innerHTML = `<span style="color:#ef4444;font-weight:700;">Chưa gán proxy (Bấm Nạp)</span>`;
+          } else {
+            pEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;">Đã gắn ${withProxy}/${accs.length} TK (Sticky)</span>`;
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  async function changeBrowserTtl(val) {
+    try {
+      await fetch("/api/browser/ttl", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ ttl_seconds: parseInt(val) })
+      });
+      showToast(`Đã lưu TTL Trình duyệt: ${parseInt(val) / 60} phút`, "success");
+      fetchBrowserTtlStatus();
+    } catch (e) {
+      showToast(`Lỗi cập nhật TTL: ${e.message}`, "danger");
+    }
+  }
+
+  async function changeBrowserMaxTasks(val) {
+    try {
+      await fetch("/api/browser/ttl", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ max_tasks: parseInt(val) })
+      });
+      showToast(`Đã lưu giới hạn task: ${val} task / phiên`, "success");
+      fetchBrowserTtlStatus();
+    } catch (e) {
+      showToast(`Lỗi cập nhật Max Tasks: ${e.message}`, "danger");
+    }
+  }
+
+  async function recycleBrowserSessions() {
+    if (!confirm("Bạn có muốn giải phóng toàn bộ phiên Chromium và làm sạch cache/RAM để tái sinh trình duyệt không?")) return;
+    showToast("Đang làm sạch và giải phóng phiên trình duyệt...", "info");
+    try {
+      const res = await fetch("/api/browser/recycle", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ restart_chrome: true })
+      });
+      if (res.ok) {
+        showToast("Đã giải phóng RAM và làm sạch toàn bộ phiên trình duyệt!", "success");
+        fetchBrowserTtlStatus();
+      }
+    } catch (e) {
+      showToast(`Lỗi giải phóng trình duyệt: ${e.message}`, "danger");
+    }
+  }
+
+  function refreshAll() {
+    checkServerStatus();
+    loadAccounts();
+    loadGallery();
+    fetchBrowserTtlStatus();
+    showToast("Đã làm mới dữ liệu!", "info");
+  }
+</script>
+</body>
+</html>

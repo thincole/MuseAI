@@ -88,66 +88,144 @@ def _write(path: str, obj):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(obj, f, ensure_ascii=False, indent=1)
+                    break
+                time.sleep(0.05 * (attempt + 1))
     finally:
         if os.path.exists(tmp):
-            os.unlink(tmp)
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
 
 
 class Store:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.accounts: list[dict] = _read(cfg.accounts_file, [])
-        for a in self.accounts:
-            ce = a.get("cookies_exp") or {}
-            if _is_pos(ce.get("hatch_vml")):
-                a["expires_at"] = int(ce["hatch_vml"])
+        self._accounts_mtime = 0
+        self.accounts: list[dict] = []
+        self._sync_from_disk()
         self.tasks: dict[str, dict] = _read(cfg.tasks_file, {})
+
+    def _sync_from_disk(self):
+        try:
+            if not os.path.isfile(self.cfg.accounts_file):
+                return
+            mtime = os.path.getmtime(self.cfg.accounts_file)
+            if mtime == getattr(self, "_accounts_mtime", 0):
+                return
+            disk_accs = _read(self.cfg.accounts_file, [])
+            for a in disk_accs:
+                ce = a.get("cookies_exp") or {}
+                if _is_pos(ce.get("hatch_vml")):
+                    a["expires_at"] = int(ce["hatch_vml"])
+            self.accounts = disk_accs
+            self._accounts_mtime = mtime
+        except Exception:
+            pass
+
+    def _save_accounts(self):
+        _write(self.cfg.accounts_file, self.accounts)
+        try:
+            self._accounts_mtime = os.path.getmtime(self.cfg.accounts_file)
+        except Exception:
+            pass
 
     # ---------- 账号 ----------
     def add_account(self, cookies: dict, label: str = "",
                     cookies_exp: dict | None = None) -> dict:
         with _LOCK:
-            aid = uuid.uuid4().hex[:12]
+            self._sync_from_disk()
             exp = {k: int(v) for k, v in (cookies_exp or {}).items()
                    if _is_pos(v)}
             now = int(time.time())
-            acc = {"id": aid, "label": label or aid, "cookies": cookies,
+            clean_label = (label or "").strip()
+
+            # Nếu trong Studio đã có tài khoản (trùng email/label) thì ghi đè chứ không ghi mới
+            matched = [
+                a for a in self.accounts
+                if clean_label and a.get("label", "").strip().lower() == clean_label.lower()
+            ]
+            if matched:
+                target = matched[0]
+                # Nếu trước đó có bản sao trùng lặp thì loại bỏ các bản sao thừa
+                if len(matched) > 1:
+                    extra_ids = {a["id"] for a in matched[1:]}
+                    self.accounts = [a for a in self.accounts if a["id"] not in extra_ids]
+                target["cookies"] = cookies
+                target["cookies_exp"] = exp
+                target["expires_at"] = account_expiry(exp, now)
+                target["expiry_anchor"] = None
+                target["enabled"] = True
+                target["ok"] = None
+                target["note"] = "Đã cập nhật cookie (ghi đè)"
+                target["synced_at"] = now
+                self._save_accounts()
+                return target
+
+            aid = uuid.uuid4().hex[:12]
+            acc = {"id": aid, "label": clean_label or aid, "cookies": cookies,
                    "cookies_exp": exp, "expires_at": account_expiry(exp, now),
                    "expiry_anchor": None,
                    "enabled": True, "created_at": now,
                    "last_used": None, "last_keepalive": None, "use_count": 0,
                    "ok": None, "note": "", "synced_at": None}
             self.accounts.append(acc)
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts()
             return acc
 
     def list_accounts(self) -> list[dict]:
-        out = []
-        for a in self.accounts:
-            item = {k: v for k, v in a.items() if k != "cookies"}
-            ce = a.get("cookies_exp") or {}
-            if _is_pos(ce.get("hatch_vml")):
-                item["expires_at"] = int(ce["hatch_vml"])
-            item["cookie_count"] = len(a.get("cookies", {}))
-            item["essential_ok"] = all(
-                a.get("cookies", {}).get(n) for n in ESSENTIAL_COOKIES)
-            # 有效期是 hatch_vml 的实测 expires，还是按「2 天寿命」推算的
-            item["expires_estimated"] = not _is_pos(ce.get("hatch_vml"))
-            out.append(item)
-        return out
+        with _LOCK:
+            self._sync_from_disk()
+            out = []
+            for a in self.accounts:
+                item = {k: v for k, v in a.items() if k != "cookies"}
+                ce = a.get("cookies_exp") or {}
+                if _is_pos(ce.get("hatch_vml")):
+                    item["expires_at"] = int(ce["hatch_vml"])
+                item["cookie_count"] = len(a.get("cookies", {}))
+                item["essential_ok"] = all(
+                    a.get("cookies", {}).get(n) for n in ESSENTIAL_COOKIES)
+                # 有效期是 hatch_vml 的实测 expires，还是按「2 天寿命」推算的
+                item["expires_estimated"] = not _is_pos(ce.get("hatch_vml"))
+                now_ts = int(time.time())
+                item["is_alive"] = bool(
+                    a.get("enabled", True) and a.get("cookies")
+                    and a.get("ok") is not False
+                    and (not a.get("expires_at") or a["expires_at"] > now_ts)
+                )
+                out.append(item)
+            return out
+
+    def get_alive_accounts_count(self) -> int:
+        now_ts = int(time.time())
+        with _LOCK:
+            self._sync_from_disk()
+            return sum(1 for a in self.accounts
+                       if a.get("enabled", True) and a.get("cookies")
+                       and a.get("ok") is not False
+                       and (not a.get("expires_at") or a["expires_at"] > now_ts))
 
     def delete_account(self, aid: str) -> bool:
         with _LOCK:
+            self._sync_from_disk()
             n = len(self.accounts)
             self.accounts = [a for a in self.accounts if a["id"] != aid]
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts()
             return len(self.accounts) != n
 
     def pick_account(self, preferred_id: str | None = None, rotate: bool = True,
                      force_rotate: bool = False, exclude_id: str | None = None) -> dict | None:
         """选择可用账号：优先复用当前已预热的健康账号（减少切号重连耗时），每满 15 次或遇错自动轮转。"""
         with _LOCK:
+            self._sync_from_disk()
             live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
             if not live:
                 return None
@@ -162,7 +240,7 @@ class Store:
                             self._sticky_count = sticky_n + 1
                             a["last_used"] = time.time()
                             a["use_count"] = a.get("use_count", 0) + 1
-                            _write(self.cfg.accounts_file, self.accounts)
+                            self._save_accounts()
                             return a
             healthy = [a for a in live if a.get("ok") is not False]
             candidates = healthy if healthy else live
@@ -172,12 +250,54 @@ class Store:
             self._sticky_count = 1
             acc["last_used"] = time.time()
             acc["use_count"] = acc.get("use_count", 0) + 1
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts()
             return acc
+
+    _BUSY_ACCOUNTS = set()
+    _COND = threading.Condition(_LOCK)
+
+    def acquire_account(self, preferred_id: str | None = None, exclude_id: str | None = None,
+                        timeout: float = 60.0) -> dict | None:
+        """Thuê tài khoản cho luồng render worker. Đảm bảo mỗi tài khoản chỉ phục vụ tối đa 1 luồng cùng lúc."""
+        deadline = time.monotonic() + timeout
+        with self._COND:
+            while True:
+                self._sync_from_disk()
+                live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
+                available = [a for a in live if a["id"] not in self._BUSY_ACCOUNTS]
+                if exclude_id and len(available) > 1:
+                    available = [a for a in available if a["id"] != exclude_id] or available
+
+                if available:
+                    healthy = [a for a in available if a.get("ok") is not False]
+                    candidates = healthy if healthy else available
+                    if preferred_id:
+                        pref = next((a for a in candidates if a["id"] == preferred_id), None)
+                        acc = pref if pref else min(candidates, key=lambda a: (a.get("last_used") or 0.0, a.get("use_count") or 0))
+                    else:
+                        acc = min(candidates, key=lambda a: (a.get("last_used") or 0.0, a.get("use_count") or 0))
+
+                    self._BUSY_ACCOUNTS.add(acc["id"])
+                    acc["last_used"] = time.time()
+                    acc["use_count"] = acc.get("use_count", 0) + 1
+                    self._save_accounts()
+                    return acc
+
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    return None
+                self._COND.wait(timeout=min(2.0, rem))
+
+    def release_account(self, aid: str):
+        """Trả tài khoản lại cho Pool sau khi worker hoàn thành tác vụ."""
+        with self._COND:
+            self._BUSY_ACCOUNTS.discard(aid)
+            self._COND.notify_all()
 
     def touch_keepalive(self, aid: str, ok: bool | None = True, note: str = ""):
         """ok=None 仅记录未确认的检测；保留上次账号状态、成功保活时间和有效期。"""
         with _LOCK:
+            self._sync_from_disk()
             now_ts = int(time.time())
             for a in self.accounts:
                 if a["id"] == aid:
@@ -191,22 +311,25 @@ class Store:
                     if note:
                         a["note"] = note[:300]
                     a["checked_at"] = now_ts
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts()
 
     def mark(self, aid: str, ok: bool, note: str = ""):
         with _LOCK:
+            self._sync_from_disk()
             for a in self.accounts:
                 if a["id"] == aid:
                     a["ok"] = ok
                     a["note"] = note[:300]
                     a["checked_at"] = int(time.time())
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts()
 
     def get_account(self, aid: str) -> dict | None:
-        for a in self.accounts:
-            if a["id"] == aid:
-                return a
-        return None
+        with _LOCK:
+            self._sync_from_disk()
+            for a in self.accounts:
+                if a["id"] == aid:
+                    return a
+            return None
 
     def update_account(self, aid: str, **kw) -> dict | None:
         """更新标签 / 启用状态 / cookies / 有效期等；值为 None 的字段跳过。
@@ -218,6 +341,7 @@ class Store:
           - 补入全新会话 cookie（重登）      -> 调用方显式传 expiry_anchor=now 重置。
         """
         with _LOCK:
+            self._sync_from_disk()
             for a in self.accounts:
                 if a["id"] == aid:
                     for k, v in kw.items():
@@ -231,22 +355,24 @@ class Store:
                             a["expiry_anchor"] = int(time.time())
                         a["expires_at"] = account_expiry(
                             ce, a.get("expiry_anchor") or a.get("created_at"))
-                    _write(self.cfg.accounts_file, self.accounts)
+                    self._save_accounts()
                     return a
         return None
 
     def stats(self) -> dict:
-        now = int(time.time())
-        total = len(self.accounts)
-        enabled = sum(1 for a in self.accounts if a.get("enabled", True))
-        bad = sum(1 for a in self.accounts
-                  if a.get("enabled", True) and a.get("ok") is False)
-        healthy = sum(1 for a in self.accounts
-                      if a.get("enabled", True) and a.get("ok") is True)
-        expiring = sum(1 for a in self.accounts
-                       if a.get("enabled", True)
-                       and a.get("expires_at")
-                       and a["expires_at"] - now < 3 * 86400)
+        with _LOCK:
+            self._sync_from_disk()
+            now = int(time.time())
+            total = len(self.accounts)
+            enabled = sum(1 for a in self.accounts if a.get("enabled", True))
+            bad = sum(1 for a in self.accounts
+                      if a.get("enabled", True) and a.get("ok") is False)
+            healthy = sum(1 for a in self.accounts
+                          if a.get("enabled", True) and a.get("ok") is True)
+            expiring = sum(1 for a in self.accounts
+                           if a.get("enabled", True)
+                           and a.get("expires_at")
+                           and a["expires_at"] - now < 3 * 86400)
         expired = sum(1 for a in self.accounts
                       if a.get("enabled", True)
                       and a.get("expires_at") and a["expires_at"] <= now)

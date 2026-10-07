@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 
@@ -26,9 +27,90 @@ log = logging.getLogger("muse2api")
 
 ATT_SEL = '[data-testid^="hatch-chat-attachment-presentation-"]'
 
+# 远程参考图大小上限
+MAX_REFERENCE_IMAGE_BYTES = 20 << 20
+
 # 决定账号生死的核心 cookie（缺失或过期 = 会话失效）
 ESSENTIAL_COOKIES = ("hatch_sess", "hatch_gw", "hatch_vml",
                      "hatch_native_auth_device")
+
+STEALTH_JS = """
+(function() {
+    try {
+        // 1. Gỡ bỏ dấu hiệu tự động hóa (WebDriver)
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+        // 2. Giả lập đối tượng window.chrome chuẩn trình duyệt người dùng thật
+        window.chrome = {
+            runtime: {},
+            loadTimes: function() {},
+            csi: function() {},
+            app: {}
+        };
+
+        // 3. Giả lập danh sách plugin tiêu chuẩn của Google Chrome Windows
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [
+                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+                { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+            ]
+        });
+
+        // 4. Cấu hình ngôn ngữ chuẩn người dùng
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['vi-VN', 'vi', 'en-US', 'en']
+        });
+
+        // 5. Cấu hình phần cứng chuẩn máy tính người dùng thật (8 CPU cores)
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+        // 6. Giả lập Card đồ họa rời (NVIDIA RTX 3060) thay vì SwiftShader / Mesa của máy chủ ảo / Headless
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(param) {
+            // UNMASKED_VENDOR_WEBGL
+            if (param === 37445) return 'Google Inc. (NVIDIA)';
+            // UNMASKED_RENDERER_WEBGL
+            if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParameter.apply(this, arguments);
+        };
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+            const getParam2 = WebGL2RenderingContext.prototype.getParameter;
+            WebGL2RenderingContext.prototype.getParameter = function(param) {
+                if (param === 37445) return 'Google Inc. (NVIDIA)';
+                if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                return getParam2.apply(this, arguments);
+            };
+        }
+
+        // 7. Khóa rò rỉ IP qua WebRTC (WebRTC IP Leak Guard)
+        if (window.RTCPeerConnection) {
+            const OrigRTC = window.RTCPeerConnection;
+            window.RTCPeerConnection = function(cfg, ...rest) {
+                if (cfg && cfg.iceServers) {
+                    // Xóa các STUN công khai có thể làm lộ IP gốc thật ra ngoài proxy
+                    cfg.iceServers = [];
+                }
+                const pc = new OrigRTC(cfg, ...rest);
+                return pc;
+            };
+            window.RTCPeerConnection.prototype = OrigRTC.prototype;
+        }
+
+        // 8. Quyền thông báo
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+    } catch(e) {}
+})();
+"""
 
 
 class MuseAuthError(RuntimeError):
@@ -48,6 +130,12 @@ class MuseEngine:
         self.current_acc_id: str | None = None
         self._last_http_renew: dict[str, float] = {}
         self._log = None
+        self._browser_lock = threading.Lock()
+        self._session_pool: dict[str, "MuseWorkerSession"] = {}
+        self._pool_lock = threading.Lock()
+        self.proc_started_at = time.time()
+        self.browser_ttl_seconds = int(getattr(cfg, "browser_ttl_seconds", 1800))
+        self.browser_max_tasks = int(getattr(cfg, "browser_max_tasks", 5))
         os.makedirs(cfg.profile_dir, exist_ok=True)
 
     # ---------------- 浏览器生命周期 ----------------
@@ -70,6 +158,12 @@ class MuseEngine:
             f"--remote-debugging-port={self.cfg.cdp_port}",
             "--remote-allow-origins=*",
             f"--user-data-dir={self.cfg.profile_dir}",
+            "--disable-blink-features=AutomationControlled",
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--force-webrtc-ip-handling-policy",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--lang=vi-VN,vi,en-US,en",
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "about:blank",
         ]
         # 尝试复用已有健康 CDP
@@ -81,6 +175,8 @@ class MuseEngine:
                     return
             except Exception:
                 pass
+            # Quét và dọn dẹp chrome mồ côi nếu không thể kết nối tới CDP cũ
+            self.kill_orphaned_chromes()
 
         # 清理残留锁
         for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
@@ -107,18 +203,49 @@ class MuseEngine:
                 time.sleep(1)
         raise MuseGenerationError(f"Chromium 启动失败: {last}")
 
+    def kill_orphaned_chromes(self):
+        """Quét và tiêu diệt triệt để tất cả tiến trình Chrome mồ côi (zombie) thuộc về MuseAI để không chiếm RAM."""
+        import sys
+        if sys.platform == "win32":
+            try:
+                cmd = (
+                    f"Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" | "
+                    f"Where-Object {{ $_.CommandLine -like '*muse2api-profiles*' -or $_.CommandLine -like '*{self.cfg.cdp_port}*' }} | "
+                    f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
+                )
+                subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                               capture_output=True, timeout=8)
+            except Exception as e:
+                log.warning("Dọn dẹp chrome mồ côi thất bại: %s", e)
+
     def stop(self):
+        """Dừng toàn bộ phiên làm việc và đóng sạch sẽ toàn bộ cây tiến trình Chromium."""
+        import sys
+        self.close_all_sessions()
         for c in (self.page, self.browser):
             if c:
-                c.close()
+                try:
+                    c.close()
+                except Exception:
+                    pass
         self.page = self.browser = None
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        if self.proc:
+            pid = self.proc.pid
             try:
-                self.proc.wait(timeout=10)
-            except Exception:  # noqa: BLE001
-                self.proc.kill()
-        self.proc = None
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                   capture_output=True, timeout=5)
+                else:
+                    self.proc.terminate()
+                    self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+        # Dọn dẹp dứt điểm các tiến trình con còn sót lại
+        self.kill_orphaned_chromes()
 
     # ---------------- 页面 ----------------
     def _open_page(self):
@@ -140,20 +267,20 @@ class MuseEngine:
         page.send("Network.enable")
         page.send("Page.enable")
         page.send("Runtime.enable")
+        page.send("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
         page.send("Browser.setDownloadBehavior",
                   {"behavior": "allow", "downloadPath": self.cfg.download_dir})
         return page
 
     @staticmethod
     def renew_session_http(cookies: dict, expires: dict | None = None,
-                           wake_vm: bool = True) -> dict:
-        """直接调用 muse.ai/api/session 续签 hatch_vml (+48h) / hatch_sess (+30d) / hatch_gw (+1y)，
-        并按需调用 /api/hatch/vm/wake 唤醒云端工作区 VM。"""
+                           wake_vm: bool = True, proxy_url: str | None = None) -> dict:
+        """Trực tiếp gọi muse.ai/api/session để gia hạn cookie và đánh thức VM."""
         import requests
         cur_cookies = dict(cookies or {})
         cur_exp = dict(expires or {})
         headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Origin": "https://muse.ai",
             "Referer": "https://muse.ai/thread/new",
             "Sec-Fetch-Site": "same-origin",
@@ -161,9 +288,10 @@ class MuseEngine:
             "Sec-Fetch-Dest": "empty",
             "Cookie": "; ".join(f"{k}={v}" for k, v in cur_cookies.items() if v),
         }
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
         try:
             r = requests.get("https://muse.ai/api/session", headers=headers,
-                             timeout=12, allow_redirects=False)
+                             timeout=15, allow_redirects=False, proxies=proxies)
         except requests.RequestException as exc:
             # 不回显请求内容：异常可能包含带凭据的代理 URL。
             raise MuseGenerationError(
@@ -195,7 +323,7 @@ class MuseEngine:
                     "vm_id": vm_id,
                     "retry_count": 0,
                     "connect_attempt_id": str(uuid.uuid4()),
-                }, timeout=8)
+                }, timeout=10, proxies=proxies)
                 wake_ok = rw.status_code == 200
             except Exception:
                 pass
@@ -271,6 +399,12 @@ class MuseEngine:
             try:
                 st = page.js("""(function(){
                     if (document.readyState !== 'complete') return 'loading';
+                    var btns = Array.from(document.querySelectorAll('button'));
+                    var cont = btns.find(function(b){
+                        var t = (b.innerText || '').trim().toLowerCase();
+                        return t === 'continue' || t === 'tiếp tục' || t === 'get started';
+                    });
+                    if (cont) cont.click();
                     if (!document.querySelector('textarea')) return 'no-ta';
                     var h = document.querySelector('[data-hatch-shell-hydration-state]');
                     if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
@@ -292,6 +426,13 @@ class MuseEngine:
             return
         try:
             needs_nav = self.page.js("""(function(forChat){
+                var btns = Array.from(document.querySelectorAll('button'));
+                var cont = btns.find(function(b){
+                    var t = (b.innerText || '').trim().toLowerCase();
+                    return t === 'continue' || t === 'tiếp tục' || t === 'get started';
+                });
+                if (cont) cont.click();
+
                 var d = document.querySelector('[role="dialog"]');
                 if (d) {
                     var b = d.querySelector('button[aria-label*="close" i], button');
@@ -779,13 +920,17 @@ class MuseEngine:
         var r = await fetch(u);
         if(!r.ok) return JSON.stringify({ok:false,err:'media-http-'+r.status});
         var b = await r.blob();
-        var ab = await b.arrayBuffer();
-        var bytes = new Uint8Array(ab);
-        var s = '';
-        for(var i=0; i<bytes.length; i+=65536){
-          s += String.fromCharCode.apply(null, bytes.subarray(i, i+65536));
-        }
-        return JSON.stringify({ok:true, mime:b.type||'', size:b.size, url:u, b64:btoa(s)});
+        var b64 = await new Promise(function(resolve, reject){
+          var reader = new FileReader();
+          reader.onloadend = function(){
+            var res = reader.result || '';
+            var comma = res.indexOf(',');
+            resolve(comma >= 0 ? res.slice(comma + 1) : res);
+          };
+          reader.onerror = function(e){ reject(e); };
+          reader.readAsDataURL(b);
+        });
+        return JSON.stringify({ok:true, mime:b.type||'', size:b.size, url:u, b64:b64});
       }catch(e){
         return JSON.stringify({ok:false, err:String(e)});
       }
@@ -957,21 +1102,68 @@ class MuseEngine:
             time.sleep(2)
         raise MuseGenerationError(f"未能取回生成结果: {last}")
 
+    def _direct_python_download(self, url: str) -> tuple[bytes | None, str, str]:
+        """Tải trực tiếp byte media từ URL qua Python requests (bỏ qua CORS trình duyệt)."""
+        if not url or not url.startswith(("http://", "https://")):
+            return None, "", ""
+        import requests
+        proxies = None
+        forwarder_port = getattr(self, "forwarder_port", None)
+        if forwarder_port:
+            proxies = {
+                "http": f"http://127.0.0.1:{forwarder_port}",
+                "https": f"http://127.0.0.1:{forwarder_port}",
+            }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Referer": "https://muse.ai/",
+            "Accept": "*/*",
+        }
+        try:
+            resp = requests.get(url, headers=headers, proxies=proxies, timeout=60, stream=True)
+            if resp.status_code == 200:
+                content = resp.content
+                if len(content) > 1024:
+                    mime = resp.headers.get("content-type") or ""
+                    log.info("📥 [Direct Python Download] Đã tải %d bytes thành công từ %s", len(content), url[:80])
+                    return content, mime, url
+        except Exception as e:
+            log.warning("Direct python download error for %s: %s", url[:80], e)
+        return None, "", ""
+
     # ---------------- 下载兜底 ----------------
     def _download_fallback(self, src: str, timeout: int = 180) -> str | None:
         before = set(os.listdir(self.cfg.download_dir))
-        # ponytail: fail closed when the selected result has no local download;
-        # never click an unrelated/global button that can return the upload.
         clicked = self.page.js("""(function(src){
-            var media=[...document.querySelectorAll('img,video')]
-                .find(m=>(m.currentSrc||m.src||'')===src);
-            var node=media && media.closest('[data-testid^="hatch-chat-attachment-presentation-"]');
-            if(!node) return 'none';
-            node=node.closest('[class*="group/widget-presentation"]')||node;
-            var b=[...node.querySelectorAll('button,[role=button]')]
-                .find(x=>/下载|保存|download/i.test(x.getAttribute('aria-label')||''));
-            if(!b) return 'none';
-            b.click();return 'ok';
+            var media = [...document.querySelectorAll('img,video')]
+                .find(m => {
+                    var s = m.currentSrc || m.src || '';
+                    return s === src || (src && s && (s.includes(src) || src.includes(s)));
+                });
+            var node = media && media.closest('[data-testid^="hatch-chat-attachment-presentation-"]');
+            if (!node && media) {
+                node = media.closest('[class*="group/widget-presentation"]') || media.parentElement;
+            }
+            if (!node) {
+                var atts = document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]');
+                if (atts.length) node = atts[atts.length - 1];
+            }
+            if (!node) return 'none';
+            var b = [...node.querySelectorAll('button,[role=button]')]
+                .find(x => {
+                    var al = (x.getAttribute('aria-label') || '').toLowerCase();
+                    var tit = (x.getAttribute('title') || '').toLowerCase();
+                    var txt = (x.innerText || '').toLowerCase();
+                    var tid = (x.getAttribute('data-testid') || '').toLowerCase();
+                    return /下载|保存|download|save/.test(al) || /download|save/.test(tit) || /download|save/.test(txt) || /download/.test(tid);
+                });
+            if (!b) {
+                b = [...node.querySelectorAll('button,[role=button]')].find(x => {
+                    return x.querySelector('svg path[d*="M"], svg') && /down|save|arrow/i.test(x.innerHTML);
+                });
+            }
+            if (!b) return 'none';
+            b.click(); return 'ok';
         })(%s)""" % json.dumps(src))
         if clicked == "none":
             return None
@@ -1003,21 +1195,24 @@ class MuseEngine:
             try:
                 req = urllib.request.Request(img, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=20) as resp:
-                    data = resp.read()
                     mime = resp.headers.get_content_type() or "image/png"
+                    if not mime.startswith("image/"):
+                        log.warning("参考图 URL 返回的不是图片 (%s)，已忽略", mime)
+                        return "", "image/png"
+                    # 多读 1 字节用来判断是否超限，避免把超大文件整个读进内存
+                    data = resp.read(MAX_REFERENCE_IMAGE_BYTES + 1)
+                    if len(data) > MAX_REFERENCE_IMAGE_BYTES:
+                        log.warning("参考图超过 %d MB，已忽略", MAX_REFERENCE_IMAGE_BYTES >> 20)
+                        return "", "image/png"
                     return base64.b64encode(data).decode("ascii"), mime
             except Exception as e:
                 log.warning("下载远程参考图失败: %s", e)
                 return "", "image/png"
-        if os.path.isfile(img):
-            try:
-                with open(img, "rb") as f:
-                    data = f.read()
-                    mime = mimetypes.guess_type(img)[0] or "image/png"
-                    return base64.b64encode(data).decode("ascii"), mime
-            except Exception as e:
-                log.warning("读取本地参考图失败: %s", e)
-                return "", "image/png"
+        # 不再接受服务器本地文件路径：任何持有 API key 的调用方都能借此读取本机任意文件
+        # （.env、accounts.json…）并上传到 muse.ai。本地图片请由客户端转成 data URL 再提交。
+        if len(img) < 4096 and os.path.exists(img):
+            log.warning("拒绝使用服务器本地文件作为参考图: %s", os.path.basename(img))
+            return "", "image/png"
         return img, "image/png"
 
     def _clear_attachments(self):
@@ -1154,11 +1349,31 @@ class MuseEngine:
 
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         data = mime = url = None
-        selected_src = (att.get("vSrc") if expect == "video" else None) or att.get("src") or ""
-        try:
-            data, mime, url = self.extract_bytes(selected_src, expect=expect)
-        except Exception:  # noqa: BLE001
+        candidates = []
+        if expect == "video" and att.get("vSrc"):
+            candidates.append(att["vSrc"])
+        if att.get("src") and att.get("src") not in candidates:
+            candidates.append(att["src"])
+        if att.get("iSrc") and att.get("iSrc") not in candidates:
+            candidates.append(att["iSrc"])
+
+        selected_src = candidates[0] if candidates else ""
+        for candidate_src in candidates:
+            try:
+                data, mime, url = self.extract_bytes(candidate_src, expect=expect)
+                if data:
+                    selected_src = candidate_src
+                    break
+            except Exception:
+                pass
+
+        if not data:
             self._debug_dump("extract-fail")
+            for candidate_src in candidates:
+                data, mime, url = self._direct_python_download(candidate_src)
+                if data:
+                    selected_src = candidate_src
+                    break
 
         if data:
             ext = self._pick_ext(mime, url, expect)
@@ -1173,7 +1388,7 @@ class MuseEngine:
 
         path = self._download_fallback(selected_src)
         if not path:
-            raise MuseGenerationError("已生成但未能取回文件")
+            raise MuseGenerationError("Video đã render xong trên Muse.ai nhưng không thể tải file về bộ nhớ")
         ext = os.path.splitext(path)[1].lower() or ".bin"
         name = f"{uuid.uuid4().hex}{ext}"
         dst = os.path.join(self.cfg.media_dir, name)
@@ -1213,3 +1428,701 @@ class MuseEngine:
                 f.write(str(info))
         except Exception:  # noqa: BLE001
             pass
+
+    def create_worker_session(self, cookies: dict, expires: dict | None = None,
+                              account_id: str | None = None, timeout: int = 40,
+                              ttl_seconds: int = 1800, max_tasks: int = 5) -> "MuseWorkerSession":
+        """Khởi tạo một phiên làm việc độc lập (Isolated Browser Context) cho 1 worker thread qua HomeProxy.
+        Mỗi worker có Cookie riêng, WebSocket riêng, Proxy riêng và Anti-Detect Stealth Script."""
+        self.start()
+        now_ts = time.time()
+
+        forwarder_port = None
+        proxy_str = None
+        if account_id:
+            try:
+                import proxy_manager
+                proxy_str = proxy_manager.ensure_alive_proxy_for_account(account_id)
+                if proxy_str:
+                    forwarder_port = proxy_manager.start_local_forwarder(proxy_str)
+                    log.info("🌐 [Worker/HomeProxy] Tài khoản %s gắn Proxy cố định: %s (Forwarder 127.0.0.1:%d)", account_id, proxy_str, forwarder_port)
+            except Exception as pe:
+                log.warning("Không thể cấu hình proxy cho TK %s: %s", account_id, pe)
+
+        if not account_id or (now_ts - self._last_http_renew.get(account_id, 0) > 600):
+            try:
+                renew_proxy = f"http://127.0.0.1:{forwarder_port}" if forwarder_port else None
+                renewed = self.renew_session_http(cookies, expires, wake_vm=True, proxy_url=renew_proxy)
+                if renewed.get("cookies"):
+                    cookies = renewed["cookies"]
+                if renewed.get("cookies_exp"):
+                    expires = renewed["cookies_exp"]
+                if account_id:
+                    self._last_http_renew[account_id] = now_ts
+            except Exception as e:
+                log.warning("Lỗi làm mới session http (%s): %s", account_id, e)
+
+        with self._browser_lock:
+            bc_params = {}
+            if forwarder_port:
+                bc_params = {
+                    "proxyServer": f"http://127.0.0.1:{forwarder_port}",
+                    "proxyBypassList": "localhost;127.0.0.1"
+                }
+            res_bc = self.browser.send('Target.createBrowserContext', bc_params)
+            bc_id = res_bc['result']['browserContextId']
+            res_tgt = self.browser.send('Target.createTarget', {'url': 'about:blank', 'browserContextId': bc_id})
+            target_id = res_tgt['result']['targetId']
+            log.info("🛡️ [Worker/Session] Đã tạo Browser Context #%s cho TK %s (Proxy: %s, Forwarder: %s, TTL: %ds, Max Tasks: %d)",
+                     bc_id, account_id, proxy_str or "Direct", forwarder_port or "None", ttl_seconds, max_tasks)
+
+        ws_url = f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}"
+        page = CDP(ws_url, timeout=180)
+        page.send("Network.enable")
+        page.send("Page.enable")
+        page.send("Runtime.enable")
+        page.send("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
+        page.send("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.cfg.download_dir})
+
+        self._apply_cookies(page, cookies, expires)
+        page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+
+        ready = False
+        t_deadline = time.time() + timeout
+        while time.time() < t_deadline:
+            time.sleep(0.3)
+            try:
+                if page.js("!!document.querySelector('textarea')"):
+                    ready = True
+                    break
+            except Exception:
+                pass
+
+        if not ready:
+            try:
+                page.close()
+                with self._browser_lock:
+                    self.browser.send('Target.disposeBrowserContext', {'browserContextId': bc_id})
+            except Exception:
+                pass
+            raise MuseGenerationError("Khởi tạo trang muse.ai cho worker thất bại hoặc timeout")
+
+        return MuseWorkerSession(self, bc_id, target_id, page, account_id,
+                                 proxy_str=proxy_str, forwarder_port=forwarder_port,
+                                 ttl_seconds=ttl_seconds, max_tasks=max_tasks)
+
+    def acquire_session(self, account_id: str, cookies: dict, expires: dict | None = None, timeout: int = 40) -> "MuseWorkerSession":
+        """Lấy Browser Session còn hạn TTL từ pool hoặc tạo phiên mới toanh qua HomeProxy."""
+        with self._pool_lock:
+            existing = self._session_pool.get(account_id)
+            if existing:
+                if not existing.is_expired() and existing.is_alive():
+                    age = int(time.time() - existing.created_at)
+                    log.info("⚡ [Session Pool] Tái sử dụng session còn hạn TTL cho TK %s (Tuổi: %ds/%ds, Task: %d/%d)",
+                             account_id, age, existing.ttl_seconds, existing.task_count, existing.max_tasks)
+                    existing.reset_thread(for_chat=False)
+                    existing.last_used_at = time.time()
+                    existing.task_count += 1
+                    return existing
+                else:
+                    age = int(time.time() - existing.created_at)
+                    log.info("♻️ [TTL Expiry] Session của TK %s đã hết hạn TTL (Tuổi: %ds/%ds, Tasks: %d/%d) -> Tự động hủy và tạo phiên sạch mới qua HomeProxy để tránh bị phát hiện!",
+                             account_id, age, existing.ttl_seconds, existing.task_count, existing.max_tasks)
+                    existing.close()
+                    self._session_pool.pop(account_id, None)
+
+        session = self.create_worker_session(
+            cookies=cookies,
+            expires=expires,
+            account_id=account_id,
+            timeout=timeout,
+            ttl_seconds=self.browser_ttl_seconds,
+            max_tasks=self.browser_max_tasks
+        )
+        session.task_count += 1
+        with self._pool_lock:
+            self._session_pool[account_id] = session
+        return session
+
+    def release_session(self, session: "MuseWorkerSession", error: bool = False):
+        """Trả session về Pool hoặc giải phóng ngay nếu có lỗi / hết TTL."""
+        if not session or not session.account_id:
+            if session:
+                session.close()
+            return
+        with self._pool_lock:
+            if error or session.is_expired() or not session.is_alive():
+                log.info("♻️ [TTL/Release] Giải phóng phiên của TK %s (Lỗi: %s, Hết hạn: %s, Tasks: %d)",
+                         session.account_id, error, session.is_expired(), session.task_count)
+                session.close()
+                self._session_pool.pop(session.account_id, None)
+            else:
+                self._session_pool[session.account_id] = session
+
+    def close_session_for_account(self, account_id: str):
+        """Hủy phiên trình duyệt đang chạy của tài khoản (dùng khi xoay proxy hoặc đổi cookie)."""
+        with self._pool_lock:
+            s = self._session_pool.pop(account_id, None)
+            if s:
+                s.close()
+
+    def close_all_sessions(self):
+        """Hủy tất cả các phiên trình duyệt đang chạy trong pool."""
+        with self._pool_lock:
+            for s in list(self._session_pool.values()):
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            self._session_pool.clear()
+
+    def get_pool_status(self) -> list[dict]:
+        """Trả về thông tin chi tiết các session và thời gian TTL còn lại."""
+        now = time.time()
+        out = []
+        with self._pool_lock:
+            for aid, s in self._session_pool.items():
+                age = int(now - s.created_at)
+                ttl_left = max(0, s.ttl_seconds - age)
+                out.append({
+                    "account_id": aid,
+                    "age_seconds": age,
+                    "ttl_seconds": s.ttl_seconds,
+                    "ttl_remaining_seconds": ttl_left,
+                    "tasks_completed": s.task_count,
+                    "max_tasks": s.max_tasks,
+                    "proxy": s.proxy_str,
+                    "is_expired": s.is_expired(),
+                    "is_alive": s.is_alive()
+                })
+        return out
+
+
+class MuseWorkerSession:
+    """Phiên chạy độc lập của một Worker Thread trên Browser Context riêng biệt qua HomeProxy,
+    hỗ trợ quản lý vòng đời TTL (Time-To-Live) và số lượng task tối đa để tránh bị phát hiện."""
+    def __init__(self, engine: MuseEngine, bc_id: str, target_id: str, page: CDP,
+                 account_id: str | None, proxy_str: str | None = None, forwarder_port: int | None = None,
+                 ttl_seconds: int = 1800, max_tasks: int = 5):
+        self.engine = engine
+        self.cfg = engine.cfg
+        self.bc_id = bc_id
+        self.target_id = target_id
+        self.page = page
+        self.account_id = account_id
+        self.proxy_str = proxy_str
+        self.forwarder_port = forwarder_port
+        self.created_at = time.time()
+        self.last_used_at = time.time()
+        self.task_count = 0
+        self.ttl_seconds = ttl_seconds
+        self.max_tasks = max_tasks
+        self.is_closed = False
+
+    def is_expired(self) -> bool:
+        """Kiểm tra session đã quá hạn TTL (thời gian sống) hoặc vượt quá số task cho phép chưa."""
+        if self.is_closed:
+            return True
+        now = time.time()
+        if (now - self.created_at) >= self.ttl_seconds:
+            return True
+        if self.task_count >= self.max_tasks:
+            return True
+        if self.account_id:
+            try:
+                import proxy_manager
+                p = proxy_manager.ensure_alive_proxy_for_account(self.account_id)
+                if p and self.proxy_str and p != self.proxy_str:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def is_alive(self) -> bool:
+        if self.is_closed:
+            return False
+        try:
+            return bool(self.page.js("!!document.querySelector('textarea')"))
+        except Exception:
+            return False
+
+    def reset_thread(self, for_chat: bool = False):
+        """Làm sạch trang và đảm bảo quay về trạng thái sẵn sàng cho tác vụ tiếp theo."""
+        try:
+            self._clear_attachments()
+            self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+            t_end = time.time() + 10.0
+            while time.time() < t_end:
+                time.sleep(0.15)
+                if self.page.js("!!document.querySelector('textarea')"):
+                    break
+        except Exception:
+            pass
+
+    def close(self):
+        """Đóng trang và hủy hoàn toàn Browser Context để giải phóng bộ nhớ RAM triệt để."""
+        if self.is_closed:
+            return
+        self.is_closed = True
+        try:
+            self.page.close()
+        except Exception:
+            pass
+        try:
+            with self.engine._browser_lock:
+                self.engine.browser.send('Target.disposeBrowserContext', {'browserContextId': self.bc_id})
+        except Exception:
+            pass
+
+
+    def attachments(self) -> list[dict]:
+        try:
+            raw = self.page.js(self.engine._ATT_JS)
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def _scroll_bottom(self):
+        try:
+            self.page.js(
+                "(function(){"
+                "var els=[...document.querySelectorAll('*')].filter(function(e){"
+                "var s=getComputedStyle(e);"
+                "return (s.overflowY==='auto'||s.overflowY==='scroll')"
+                "&&e.scrollHeight>e.clientHeight+100;});"
+                "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
+                "if(els[0])els[0].scrollTop=els[0].scrollHeight;"
+                "var s=document.scrollingElement||document.body;"
+                "s.scrollTop=s.scrollHeight;"
+                "var el=document.querySelector('textarea');"
+                "if(el)el.scrollIntoView({block:'end'});return 1;})()")
+        except Exception:
+            pass
+
+    def _agent_count(self) -> int:
+        try:
+            return int(self.page.js(self.engine._AGENT_COUNT_JS) or 0)
+        except Exception:
+            return 0
+
+    def _clear_attachments(self):
+        try:
+            self.page.js(
+                "(function(){"
+                "var btns=Array.from(document.querySelectorAll('button[aria-label]')).filter(function(b){"
+                "var al=b.getAttribute('aria-label')||'';"
+                "return /remove\\s*attachment|移除附件|删除附件|移除|删除/i.test(al);"
+                "});"
+                "btns.forEach(function(b){b.click();});"
+                "Array.from(document.querySelectorAll('input[type=\"file\"]')).forEach(function(inp){inp.value='';});"
+                "return btns.length;"
+                "})()")
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    def _attach_image(self, image_data: str):
+        b64, mime = self.engine._normalize_image(image_data)
+        if not b64:
+            return
+        _INJECT_JS = """
+        (function(b64, mime) {
+            try {
+                var byteChars = atob(b64);
+                var byteNumbers = new Array(byteChars.length);
+                for (var i = 0; i < byteChars.length; i++) {
+                    byteNumbers[i] = byteChars.charCodeAt(i);
+                }
+                var byteArray = new Uint8Array(byteNumbers);
+                var blob = new Blob([byteArray], {type: mime});
+                var ext = mime.split('/')[1] || 'png';
+                if (ext === 'jpeg') ext = 'jpg';
+                var file = new File([blob], 'reference_image.' + ext, {type: mime});
+                var inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+                if (!inputs.length) return JSON.stringify({ok: false, err: 'no-file-input'});
+                var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+                var composer = ov ? ov.closest('form') : null;
+                var input = null;
+                if (composer) {
+                    input = inputs.find(function(x){ return composer.contains(x); }) || null;
+                }
+                if (!input) {
+                    input = inputs.find(function(x){
+                        return !x.closest('[class*=chat-user-bubble], [class*="group/msg"]');
+                    }) || inputs[0];
+                }
+                if (!input.getAttribute('accept')) input.setAttribute('accept', 'image/*');
+                var dt = new DataTransfer();
+                dt.items.add(file);
+                input.files = dt.files;
+                input.dispatchEvent(new Event('change', {bubbles: true}));
+                input.dispatchEvent(new Event('input', {bubbles: true}));
+                return JSON.stringify({ok: true});
+            } catch(e) {
+                return JSON.stringify({ok: false, err: String(e)});
+            }
+        })(%s, %s)
+        """
+        try:
+            raw_res = self.page.js(_INJECT_JS % (json.dumps(b64), json.dumps(mime)))
+            res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
+            if not res_obj.get("ok"):
+                raise MuseGenerationError("附加参考图失败，已停止生成")
+        except Exception as e:
+            raise MuseGenerationError("附加参考图失败，已停止生成") from e
+
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            has_attached = self.page.js(
+                """(function(){
+                var btns = Array.from(document.querySelectorAll('button[aria-label]'));
+                var hasRemove = btns.some(function(b){
+                    return /remove\\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label') || '');
+                });
+                if (hasRemove) return 'remove';
+                var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+                var composer = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
+                if (composer) {
+                    var media = composer.querySelectorAll('img, video');
+                    if (media.length > 0) return 'thumb';
+                }
+                return '';
+                })()"""
+            )
+            if has_attached:
+                break
+            time.sleep(0.3)
+        time.sleep(0.5)
+
+    def _send(self, prompt: str):
+        try:
+            self.page.js("""(function(){
+                var ta = document.querySelector('textarea');
+                if (ta) {
+                    ta.scrollIntoView({block: 'center', inline: 'nearest'});
+                    ta.focus();
+                }
+            })()""")
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+        rect = self.page.js(
+            "(function(){var t=document.querySelector('textarea');if(!t)return null;"
+            "var r=t.getBoundingClientRect();"
+            "return JSON.stringify({x:Math.round(r.left+r.width/2),"
+            "y:Math.round(r.top+r.height/2)});})()")
+        if not rect:
+            raise MuseGenerationError("找不到聊天输入框")
+        c = json.loads(rect)
+        for t in ("mousePressed", "mouseReleased"):
+            self.page.send("Input.dispatchMouseEvent",
+                           {"type": t, "x": c["x"], "y": c["y"],
+                            "button": "left", "clickCount": 1})
+        time.sleep(0.1)
+
+        _SETTER_JS = (
+            "(function(t){var ta=document.querySelector('textarea');"
+            "if(!ta) return 0;"
+            "ta.focus();"
+            "var s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
+            "s.call(ta,t);"
+            "ta.dispatchEvent(new Event('input',{bubbles:true}));"
+            "ta.dispatchEvent(new Event('change',{bubbles:true}));"
+            "return (ta.value||'').length;})(%s)")
+        val_len = self.page.js(_SETTER_JS % json.dumps(prompt)) or 0
+        if not val_len and len(prompt) < 500:
+            self.page.send("Input.insertText", {"text": prompt})
+            self.page.js(_SETTER_JS % json.dumps(prompt))
+
+        clicked = "no-button"
+        t_deadline = time.time() + 3.0
+        while time.time() < t_deadline:
+            res = self.page.js(
+                "(function(){var b=[...document.querySelectorAll('button,[role=button]')]"
+                ".filter(function(x){return x.offsetParent!==null;})"
+                ".find(function(x){return /发送|send/i.test(x.getAttribute('aria-label')||'')"
+                "||/发送|send/i.test(x.getAttribute('data-testid')||'')"
+                "||/send/i.test(x.innerText||'');});"
+                "if(!b)return 'no-button';"
+                "if(b.disabled)return 'disabled';"
+                "b.click();return 'clicked';})()")
+            if res == "clicked":
+                clicked = "clicked"
+                break
+            time.sleep(0.08)
+
+        if clicked != "clicked":
+            for combo in ({"modifiers": 1}, {}):
+                for t in ("keyDown", "char", "keyUp"):
+                    params = {"type": t, "key": "Enter", "code": "Enter",
+                              "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
+                              "modifiers": combo.get("modifiers", 0)}
+                    if t == "char":
+                        params["text"] = "\r"
+                        params["unmodifiedText"] = "\r"
+                    self.page.send("Input.dispatchKeyEvent", params)
+                time.sleep(1.0)
+                try:
+                    if self.page.js("!(document.querySelector('textarea')||{value:''}).value"):
+                        clicked = "enter-sent"
+                        break
+                except Exception:
+                    pass
+        time.sleep(0.3)
+        return clicked
+
+    def _wait_attachment(self, baseline_src: str, timeout: int, expect: str,
+                         on_progress=None, base_agent_cnt: int = 0,
+                         base_att_cnt: int = 0, stop_event=None, baseline_sources=None) -> dict | None:
+        baseline_sources = set(baseline_sources or ()) | {baseline_src}
+        deadline = time.time() + timeout
+        t_start = time.time()
+        stable_src, stable_n = "", 0
+        fallback_since = 0.0
+        while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise MuseGenerationError("客户端已断开连接，终止生成任务")
+            time.sleep(0.6)
+            self._scroll_bottom()
+            atts = self.attachments()
+            att = None
+            fallback_att = None
+            if atts:
+                def _score(a):
+                    tid = (a.get("tid") or "").lower()
+                    has_video = bool(a.get("hasVideo"))
+                    if expect == "video":
+                        return 2 if (has_video or "video" in tid) else 1
+                    return 2 if (("image" in tid) or (not has_video)) else 1
+                best = max(atts, key=_score)
+                if _score(best) >= 2:
+                    att = best
+                else:
+                    fallback_att = atts[-1]
+            if att is None and fallback_att is not None and expect == "video":
+                if fallback_since == 0.0:
+                    fallback_since = time.time()
+                if time.time() - fallback_since >= 15.0:
+                    att = fallback_att
+            if att:
+                src = att.get("src") or ""
+                v_src = att.get("vSrc") or ""
+                tid = att.get("tid") or ""
+                w = att.get("w", 0) or 0
+                h = att.get("h", 0) or 0
+                has_video = att.get("hasVideo", False)
+                is_fallback = att is fallback_att and att is not None and not (
+                    has_video or "video" in (tid or "").lower()
+                ) and expect == "video"
+                if is_fallback:
+                    want = True
+                elif expect == "video":
+                    want = has_video or ("video" in tid) or ("video" in src) or ("video" in v_src) or src.endswith((".mp4", ".webm", ".mov"))
+                else:
+                    want = ("image" in tid) or (not has_video)
+                check_src = v_src if (expect == "video" and v_src) else src
+                if check_src and check_src not in baseline_sources and want:
+                    if w > 0 and h > 0:
+                        return att
+                    if check_src == stable_src:
+                        stable_n += 1
+                    else:
+                        stable_src, stable_n = check_src, 0
+                    if stable_n >= 1:
+                        return att
+            elapsed = time.time() - t_start
+            if on_progress:
+                prog = min(92, int(25 + elapsed * 1.0))
+                try:
+                    on_progress(prog)
+                except Exception:
+                    pass
+            try:
+                st_raw = self.page.js("""(function(){
+                    var bs=[].slice.call(document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]'))
+                        .filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});
+                    var lastTxt = bs.length ? (bs[bs.length-1].innerText||'').trim() : '';
+                    var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
+                        || document.querySelector('button[aria-label*="Stop" i]')
+                        || document.querySelector('button[aria-label*="停止"]'));
+                    var tail = document.body ? (document.body.innerText||'').slice(-700) : '';
+                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail});
+                })()""")
+                st = json.loads(st_raw) if st_raw else {}
+            except Exception:
+                st = {}
+            tail = st.get("tail") or ""
+            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail):
+                raise MuseGenerationError("账号额度不足")
+        return None
+
+    def extract_bytes(self, src: str, expect: str = "image", retries: int = 4):
+        for _ in range(retries):
+            raw = self.page.js(self.engine._EXTRACT_JS % (json.dumps(src), json.dumps(expect)),
+                               await_promise=True, timeout=600)
+            try:
+                res = json.loads(raw) if raw else {}
+                if res.get("ok"):
+                    b64_str = res.get("b64") or res.get("data")
+                    if b64_str:
+                        return base64.b64decode(b64_str), res.get("mime", ""), res.get("url", "")
+                elif res.get("err"):
+                    log.warning("Worker extract_bytes JS error: %s", res.get("err"))
+            except Exception as e:
+                log.warning("Worker extract_bytes parse error: %s", e)
+            time.sleep(1.0)
+        return None, None, None
+
+    def _direct_python_download(self, url: str) -> tuple[bytes | None, str, str]:
+        """Tải trực tiếp byte media từ URL qua Python requests (bỏ qua CORS trình duyệt)."""
+        if not url or not url.startswith(("http://", "https://")):
+            return None, "", ""
+        import requests
+        proxies = None
+        if self.forwarder_port:
+            proxies = {
+                "http": f"http://127.0.0.1:{self.forwarder_port}",
+                "https": f"http://127.0.0.1:{self.forwarder_port}",
+            }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Referer": "https://muse.ai/",
+            "Accept": "*/*",
+        }
+        try:
+            resp = requests.get(url, headers=headers, proxies=proxies, timeout=60, stream=True)
+            if resp.status_code == 200:
+                content = resp.content
+                if len(content) > 1024:
+                    mime = resp.headers.get("content-type") or ""
+                    log.info("📥 [Worker Direct Python Download] Đã tải %d bytes thành công từ %s (Proxy Forwarder: %s)",
+                             len(content), url[:80], self.forwarder_port)
+                    return content, mime, url
+        except Exception as e:
+            log.warning("Worker direct python download error for %s: %s", url[:80], e)
+        return None, "", ""
+
+    def _download_fallback(self, src: str, timeout: int = 180) -> str | None:
+        before = set(os.listdir(self.cfg.download_dir))
+        clicked = self.page.js("""(function(src){
+            var media = [...document.querySelectorAll('img,video')]
+                .find(m => {
+                    var s = m.currentSrc || m.src || '';
+                    return s === src || (src && s && (s.includes(src) || src.includes(s)));
+                });
+            var node = media && media.closest('[data-testid^="hatch-chat-attachment-presentation-"]');
+            if (!node && media) {
+                node = media.closest('[class*="group/widget-presentation"]') || media.parentElement;
+            }
+            if (!node) {
+                var atts = document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]');
+                if (atts.length) node = atts[atts.length - 1];
+            }
+            if (!node) return 'none';
+            var b = [...node.querySelectorAll('button,[role=button]')]
+                .find(x => {
+                    var al = (x.getAttribute('aria-label') || '').toLowerCase();
+                    var tit = (x.getAttribute('title') || '').toLowerCase();
+                    var txt = (x.innerText || '').toLowerCase();
+                    var tid = (x.getAttribute('data-testid') || '').toLowerCase();
+                    return /下载|保存|download|save/.test(al) || /download|save/.test(tit) || /download|save/.test(txt) || /download/.test(tid);
+                });
+            if (!b) {
+                b = [...node.querySelectorAll('button,[role=button]')].find(x => {
+                    return x.querySelector('svg path[d*="M"], svg') && /down|save|arrow/i.test(x.innerHTML);
+                });
+            }
+            if (!b) return 'none';
+            b.click(); return 'ok';
+        })(%s)""" % json.dumps(src))
+        if clicked == "none":
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1.5)
+            new = [f for f in (set(os.listdir(self.cfg.download_dir)) - before)
+                   if not f.endswith(".crdownload")]
+            if new:
+                p = os.path.join(self.cfg.download_dir, max(
+                    new, key=lambda f: os.path.getmtime(os.path.join(self.cfg.download_dir, f))))
+                if os.path.getsize(p) > 0:
+                    return p
+        return None
+
+    def generate(self, prompt: str, expect: str = "video", timeout: int = 240,
+                 on_progress=None, reference_image: str | None = None, stop_event=None) -> dict:
+        self._scroll_bottom()
+        if reference_image:
+            self._attach_image(reference_image)
+        else:
+            self._clear_attachments()
+        atts_before = self.attachments()
+        baseline_sources = {a.get(k) for a in atts_before for k in ("src", "vSrc", "iSrc") if a.get(k)}
+        base = atts_before[-1] if atts_before else {}
+        baseline_src = base.get("src") or ""
+        base_agent_cnt = self._agent_count()
+
+        if self._send(prompt) not in ("clicked", "enter-sent"):
+            raise MuseGenerationError("提示词发送未确认，已停止生成")
+
+        att = self._wait_attachment(
+            baseline_src, timeout, expect, on_progress=on_progress,
+            base_agent_cnt=base_agent_cnt, base_att_cnt=len(atts_before),
+            stop_event=stop_event, baseline_sources=baseline_sources
+        )
+        if not att:
+            raise MuseGenerationError("等待生成超时，未出现新的生成结果")
+
+        os.makedirs(self.cfg.media_dir, exist_ok=True)
+        candidates = []
+        if expect == "video" and att.get("vSrc"):
+            candidates.append(att["vSrc"])
+        if att.get("src") and att.get("src") not in candidates:
+            candidates.append(att["src"])
+        if att.get("iSrc") and att.get("iSrc") not in candidates:
+            candidates.append(att["iSrc"])
+
+        data = mime = url = None
+        selected_src = candidates[0] if candidates else ""
+        for candidate_src in candidates:
+            try:
+                data, mime, url = self.extract_bytes(candidate_src, expect=expect)
+                if data:
+                    selected_src = candidate_src
+                    break
+            except Exception:
+                pass
+
+        if not data:
+            for candidate_src in candidates:
+                data, mime, url = self._direct_python_download(candidate_src)
+                if data:
+                    selected_src = candidate_src
+                    break
+
+        if data:
+            ext = self.engine._pick_ext(mime, url, expect)
+            name = f"{uuid.uuid4().hex}{ext}"
+            dst = os.path.join(self.cfg.media_dir, name)
+            with open(dst, "wb") as f:
+                f.write(data)
+            return {"path": dst, "filename": name, "size": len(data), "ext": ext, "mime": mime,
+                    "kind": "video" if ext in (".mp4", ".webm", ".mov") else "image",
+                    "via": "blob", "attachment": att.get("tid"),
+                    "w": att.get("w"), "h": att.get("h")}
+
+        path = self._download_fallback(selected_src)
+        if not path and len(candidates) > 1:
+            path = self._download_fallback(candidates[1])
+        if not path:
+            raise MuseGenerationError("Video đã render xong trên Muse.ai nhưng không thể tải file về bộ nhớ")
+        ext = os.path.splitext(path)[1].lower() or ".bin"
+        name = f"{uuid.uuid4().hex}{ext}"
+        dst = os.path.join(self.cfg.media_dir, name)
+        shutil.move(path, dst)
+        return {"path": dst, "filename": name, "size": os.path.getsize(dst), "ext": ext, "mime": "",
+                "kind": "video" if ext in (".mp4", ".webm", ".mov") else "image",
+                "via": "download", "attachment": att.get("tid"),
+                "w": att.get("w"), "h": att.get("h")}
+

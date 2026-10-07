@@ -86,7 +86,7 @@ class Config:
                                      os.path.join(os.path.expanduser("~"),
                                                   "muse2api-profiles")))
 
-    # 鉴权
+    # 鉴权（留空时 app 启动会自动生成随机 key 并写入 .env）
     api_key: str = field(default_factory=lambda: _env("MUSE2API_KEY", ""))
 
     # 对外地址（管理页面显示「接入地址」用；留空则页面用当前域名兜底）
@@ -116,6 +116,17 @@ class Config:
     # 保持会话活性不失效，但依然不会参与正常业务生图、生视频与对话轮转调度。
     keepalive_disabled_accounts: bool = field(
         default_factory=lambda: _env("MUSE2API_KEEPALIVE_DISABLED_ACCOUNTS", "0").strip() != "0")
+
+    # Dọn thư mục data/media tự động (mặc định TẮT = 0 -> không xóa gì).
+    # media_retention_days: xóa file cũ hơn N ngày. media_max_files: giữ tối đa N file mới nhất.
+    media_retention_days: int = field(default_factory=lambda: int(_env("MUSE2API_MEDIA_RETENTION_DAYS", "0")))
+    media_max_files: int = field(default_factory=lambda: int(_env("MUSE2API_MEDIA_MAX_FILES", "0")))
+
+    # Trình duyệt Anti-Detect & TTL (Tránh phát hiện bot & rò rỉ IP)
+    browser_ttl_seconds: int = field(default_factory=lambda: int(_env("MUSE2API_BROWSER_TTL", "1800")))
+    browser_max_tasks: int = field(default_factory=lambda: int(_env("MUSE2API_BROWSER_MAX_TASKS", "5")))
+    browser_process_ttl_seconds: int = field(default_factory=lambda: int(_env("MUSE2API_PROCESS_TTL", "7200")))
+    anti_detect: bool = field(default_factory=lambda: _env("MUSE2API_ANTI_DETECT", "1").strip() != "0")
 
     @property
     def data_dir(self) -> str:

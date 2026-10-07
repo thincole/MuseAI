@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="vi">
 <head>
 <meta charset="utf-8">
 <style>
@@ -25,9 +25,11 @@
     width:100%;margin-top:16px;padding:11px;border:0;border-radius:8px;
     background:linear-gradient(180deg,#4f8cff,#3d7bf0);color:#fff;
     font-size:13.5px;font-weight:600;cursor:pointer;
+    box-shadow: 0 4px 14px rgba(79, 140, 255, 0.35);
+    transition: all 0.2s;
   }
-  button:hover{filter:brightness(1.08)}
-  button:disabled{opacity:.55;cursor:default;filter:none}
+  button:hover{filter:brightness(1.08);transform:translateY(-1px)}
+  button:disabled{opacity:.55;cursor:default;filter:none;transform:none}
   .steps{background:#161b22;border:1px solid #30363d;border-radius:8px;
     padding:10px 12px;margin-top:14px;font-size:11.5px;color:#8b949e;line-height:1.75}
   .steps b{color:#e6edf3}
@@ -41,33 +43,31 @@
 </style>
 </head>
 <body>
-  <h1><span class="dot"></span>Muse2API Cookie 导入</h1>
-  <p class="sub">把当前浏览器里 muse.ai 的登录态，一键同步到你的 muse2api 服务。</p>
+  <h1><span class="dot"></span>MuseAI Cookie Importer</h1>
+  <p class="sub">Đồng bộ phiên đăng nhập từ muse.ai vào ứng dụng MuseAI Video Studio chỉ với 1 click.</p>
 
-  <label>服务地址（BASE URL）</label>
-  <input id="base" placeholder="http://your-server-ip:18610" spellcheck="false">
+  <label>Địa chỉ máy chủ (BASE URL)</label>
+  <input id="base" value="http://127.0.0.1:18610" placeholder="http://127.0.0.1:18610" spellcheck="false">
 
-  <label>API Key</label>
-  <input id="key" placeholder="m2a_..." spellcheck="false">
+  <label>API Key bảo mật</label>
+  <input id="key" value="" placeholder="Dán API key (MUSE2API_KEY trong file .env)" spellcheck="false">
 
-  <label>账号标签（可留空）</label>
-  <input id="label" placeholder="例如 muse-main" spellcheck="false">
+  <label>Tên / Ghi chú tài khoản (Không bắt buộc)</label>
+  <input id="label" placeholder="Ví dụ: Tài khoản Muse 1" spellcheck="false">
 
-  <button id="go">读取并导入</button>
+  <button id="go">🚀 ĐỌC COOKIE VÀ NHẬP VÀO STUDIO</button>
 
   <div class="steps">
-    <b>用之前先确认两件事：</b><br>
-    1. 你已经在<b>这个浏览器</b>里登录了 <a href="https://muse.ai/" target="_blank"
-       style="color:#4f8cff">muse.ai</a>（能看到聊天界面）。<br>
-    2. 上面的服务地址和 API Key 已填好（在 muse2api 管理页「账号池」页顶部可以复制）。
+    <b>Lưu ý trước khi bấm:</b><br>
+    1. Bạn đã đăng nhập vào <a href="https://muse.ai/" target="_blank"
+       style="color:#4f8cff">muse.ai</a> trên <b>trình duyệt này</b> (đã thấy giao diện tạo video/ảnh).<br>
+    2. Địa chỉ máy chủ và API Key đã được điền sẵn hoặc sao chép từ tab Cài đặt của phần mềm MuseAI.
   </div>
 
   <div id="log"></div>
 
   <div class="foot">
-    本扩展只做一件事：用浏览器的 <code>chrome.cookies</code> 接口读取 muse.ai 的
-    Cookie（能读到 httpOnly 的那些），POST 到你填的服务地址。
-    不收集、不上传到任何第三方服务器。
+    Tiện ích sử dụng API nội bộ <code>chrome.cookies</code> để trích xuất cookie xác thực của muse.ai (bao gồm các cookie HttpOnly bảo mật) và gửi trực tiếp về máy chủ của bạn. Tuyệt đối không thu thập hay chia sẻ dữ liệu ra bên ngoài.
   </div>
 
   <script src="popup.js"></script>

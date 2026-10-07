@@ -33,6 +33,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import shutil
 import threading
 import time
 import uuid
@@ -49,6 +51,9 @@ from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationE
 from store import Store, account_expiry, min_expiry
 
 import sys
+import logger_setup
+logger_setup.setup_logging()
+
 log = logging.getLogger("muse2api")
 log.setLevel(logging.INFO)
 if not log.handlers:
@@ -74,6 +79,21 @@ app.add_middleware(CORSMiddleware,
                    allow_headers=["*"],
                    expose_headers=["*"],
                    max_age=600)
+
+# Các API nội bộ của Studio (Shopee / proxy / trình duyệt) đọc-ghi file và cấu hình trên máy,
+# nên bắt buộc Bearer key giống /admin/*. Đặt ở middleware để endpoint mới thêm sau cũng được bảo vệ.
+_PROTECTED_PREFIXES = ("/api/shopee/", "/api/proxy/", "/api/browser/")
+
+
+@app.middleware("http")
+async def _require_key_for_internal_api(request: Request, call_next):
+    if request.method != "OPTIONS" and request.url.path.startswith(_PROTECTED_PREFIXES):
+        try:
+            auth(request.headers.get("authorization"))
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
+
 
 store = Store(CFG)
 engine = MuseEngine(CFG)
@@ -173,7 +193,7 @@ def auth(authorization: str | None = Header(default=None)):
         raise HTTPException(401, "缺少 Authorization: Bearer <key>")
     parts = authorization.split(None, 1)
     token = parts[1].strip() if len(parts) > 1 else ""
-    if not token or token != CFG.api_key:
+    if not token or not secrets.compare_digest(token, CFG.api_key):
         raise HTTPException(401, "API key 无效")
     return True
 
@@ -196,14 +216,20 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
         engine._last_http_renew[acc_id] = last_sync
         return acc
     try:
-        res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=wake_vm)
+        p_url = None
+        try:
+            import proxy_manager
+            p_url = proxy_manager.get_forwarder_url_for_account(acc_id)
+        except Exception:
+            pass
+        res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=wake_vm, proxy_url=p_url)
         engine._last_http_renew[acc_id] = now
         if res.get("cookies"):
             store.update_account(acc_id, cookies=res["cookies"],
                                  cookies_exp=res.get("cookies_exp"),
                                  ok=True if res.get("ok") else acc.get("ok"),
                                  synced_at=int(now))
-            store.touch_keepalive(acc_id, True, f"会话正常 (VM: {res.get('vm_state') or 'RUNNING'})")
+            store.touch_keepalive(acc_id, True, f"Phiên hợp lệ (VM: {res.get('vm_state') or 'RUNNING'})")
     except MuseAuthError as exc:
         store.mark(acc_id, False, str(exc))
         raise
@@ -608,7 +634,7 @@ def build_video_prompt(r: VideoRequest) -> str:
     user_prompt = r.prompt.strip()
     ar = (r.aspect_ratio or "").strip().lower()
     sz = (r.size or "").strip().lower()
-    dur = r.duration or 6
+    dur = r.duration or 8
     has_ref = bool(r.reference_image or r.image or r.image_url)
 
     is_vertical = any(k in ar or k in sz for k in ("9:16", "9/16", "portrait", "竖屏", "720x1280", "1080x1920"))
@@ -650,27 +676,45 @@ def media_url(name: str) -> str:
 
 # ------------------------- cookie 解析 -------------------------
 def parse_cookie_text(text: str) -> dict[str, str]:
-    """把 `a=1; b=2` / JSON / Set-Cookie 行解析成 dict。"""
+    """把 `a=1; b=2` / JSON / JSON Array / Set-Cookie 行解析成 dict。"""
     text = (text or "").strip()
     if not text:
         return {}
-    if text.startswith("{"):
+    if text.lower().startswith("cookie:"):
+        text = text[7:].strip()
+    stripped = text.strip()
+    if stripped.startswith(("{", "[")):
         import json
         try:
-            obj = json.loads(text)
+            obj = json.loads(stripped)
             if isinstance(obj, dict):
-                return {str(k): str(v) for k, v in obj.items()}
+                if "cookies" in obj and isinstance(obj["cookies"], dict):
+                    return {str(k).strip(): str(v).strip().strip('"').strip("'") for k, v in obj["cookies"].items() if str(k).strip()}
+                return {str(k).strip(): str(v).strip().strip('"').strip("'") for k, v in obj.items() if str(k).strip()}
+            elif isinstance(obj, list):
+                out = {}
+                for item in obj:
+                    if isinstance(item, dict):
+                        k = item.get("name") or item.get("key")
+                        v = item.get("value") or item.get("content")
+                        if k and v is not None:
+                            out[str(k).strip()] = str(v).strip().strip('"').strip("'")
+                if out:
+                    return out
         except Exception:  # noqa: BLE001
             pass
     out: dict[str, str] = {}
-    for part in re.split(r"[;\n]+", text):
+    for part in re.split(r"[;\r\n]+", text):
         part = part.strip()
         if not part or "=" not in part:
             continue
+        if part.lower().startswith("cookie:"):
+            part = part[7:].strip()
         k, v = part.split("=", 1)
         k = k.strip()
+        v = v.strip().strip('"').strip("'")
         if k:
-            out[k] = v.strip()
+            out[k] = v
     return out
 
 
@@ -739,71 +783,74 @@ def _pos(v) -> bool:
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None) -> tuple[dict, str | None]:
-    # Browser ownership covers account selection, retry and cleanup, not just generate().
+    """Tạo video/ảnh song song đa luồng bằng Isolated Worker Session.
+    Mỗi luồng thuê 1 tài khoản từ Account Pool, chạy hoàn toàn độc lập, không bị khóa chặn lẫn nhau."""
     deadline = time.monotonic() + max(1, timeout)
-    if not GEN_LOCK.acquire(timeout=max(1, timeout)):
-        raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
-    try:
-        return _run_generation_locked(prompt, kind, timeout, account_id,
-                                      on_progress, reference_image, deadline=deadline)
-    finally:
-        GEN_LOCK.release()
-
-
-def _run_generation_locked(prompt: str, kind: str, timeout: int,
-                    account_id: str | None = None, on_progress=None,
-                    reference_image: str | None = None, deadline=None) -> tuple[dict, str | None]:
-    acc = store.get_account(account_id) if account_id else None
-    if acc and not acc.get("enabled", True):
-        acc = None
-    if not acc:
-        acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
-    if not acc:
-        raise MuseAuthError("没有可用账号，请先在管理页面导入 cookie")
+    cur_acc = store.acquire_account(preferred_id=account_id, timeout=max(1, timeout))
+    if not cur_acc:
+        raise MuseAuthError("Không có tài khoản nào khả dụng hoặc tất cả tài khoản đang bận xử lý")
 
     last_exc = None
-    cur_acc = acc
-    for attempt in range(2):
-        if deadline is not None and time.monotonic() >= deadline:
-            raise MuseGenerationError("任务总等待时限已到，停止重试")
-        if attempt > 0:
-            if last_exc and "未产出媒体附件，仅返回了文本回复" in str(last_exc):
-                break
-            alt = store.pick_account(rotate=True, force_rotate=True, exclude_id=cur_acc["id"])
-            if not alt or alt["id"] == cur_acc["id"]:
-                break
-            cur_acc = alt
-            log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
-        try:
-            refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
-            if refreshed:
-                cur_acc = refreshed
-            engine.start()
-            remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
-            if remaining <= 0:
-                raise MuseGenerationError("任务总等待时限已到，停止重试")
-            res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
-                                  timeout=remaining, expires=cur_acc.get("cookies_exp"),
-                                  account_id=cur_acc["id"], on_progress=on_progress,
-                                  reference_image=reference_image)
-            store.mark(cur_acc["id"], True, "")
-            _sync_cookies(cur_acc["id"])
-            return res, cur_acc["id"]
-        except MuseAuthError as exc:
-            last_exc = exc
-            store.mark(cur_acc["id"], False, str(exc))
-            engine.stop()
-        except MuseGenerationError as exc:
-            last_exc = exc
-            store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
+    try:
+        for attempt in range(2):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise MuseGenerationError("Đã hết thời gian chờ tác vụ")
+            if attempt > 0:
+                alt = store.acquire_account(exclude_id=cur_acc["id"], timeout=10)
+                if not alt:
+                    break
+                store.release_account(cur_acc["id"])
+                cur_acc = alt
+                log.info("Chuyển sang tài khoản dự phòng: %s (%s)", cur_acc.get("label"), cur_acc["id"])
+
+            session = None
             try:
-                engine.reset_thread()
-            except Exception:
-                pass
-        except Exception as exc:  # noqa: BLE001
-            engine.stop()
-            last_exc = MuseGenerationError(f"生成失败: {exc}")
-    raise last_exc
+                remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
+                if remaining <= 0:
+                    raise MuseGenerationError("Đã hết thời gian chờ tác vụ")
+
+                session = engine.acquire_session(
+                    account_id=cur_acc["id"],
+                    cookies=cur_acc["cookies"],
+                    expires=cur_acc.get("cookies_exp"),
+                    timeout=40
+                )
+                res = session.generate(
+                    prompt=prompt,
+                    expect=kind,
+                    timeout=remaining,
+                    on_progress=on_progress,
+                    reference_image=reference_image
+                )
+                store.touch_keepalive(cur_acc["id"], True, "Phiên hợp lệ · Sẵn sàng")
+                engine.release_session(session, error=False)
+                session = None
+                return res, cur_acc["id"]
+            except MuseAuthError as exc:
+                last_exc = exc
+                store.mark(cur_acc["id"], False, str(exc))
+                if session:
+                    engine.release_session(session, error=True)
+                    session = None
+            except MuseGenerationError as exc:
+                last_exc = exc
+                store.mark(cur_acc["id"], True, f"Tác vụ gián đoạn: {str(exc)[:60]}")
+                if session:
+                    engine.release_session(session, error=True)
+                    session = None
+            except Exception as exc:
+                last_exc = MuseGenerationError(f"Tạo video thất bại: {exc}")
+                if session:
+                    engine.release_session(session, error=True)
+                    session = None
+            finally:
+                if session:
+                    engine.release_session(session, error=True)
+
+        raise last_exc or MuseGenerationError("Tạo video thất bại sau các lần thử")
+    finally:
+        if cur_acc:
+            store.release_account(cur_acc["id"])
 
 
 # ------------------------- 基础接口 -------------------------
@@ -1432,7 +1479,11 @@ def admin_status(_=Depends(auth)):
 # ------------------------- 管理：账号池 -------------------------
 @app.get("/admin/accounts")
 def list_accounts(_=Depends(auth)):
-    return {"accounts": store.list_accounts(), "stats": store.stats()}
+    return {
+        "accounts": store.list_accounts(),
+        "stats": store.stats(),
+        "alive_count": store.get_alive_accounts_count()
+    }
 
 
 @app.post("/admin/accounts")
@@ -1510,14 +1561,14 @@ async def test_account(aid: str, _=Depends(auth)):
                     store.update_account(aid, quota=quota)
                 except Exception:  # noqa: BLE001
                     quota = None
-                store.mark(aid, True, "会话有效")
-                return {"ok": True, "message": "会话有效，可正常生成",
+                store.mark(aid, True, "Phiên hợp lệ · Sẵn sàng")
+                return {"ok": True, "message": "Phiên hợp lệ, sẵn sàng tạo video",
                         "synced": synced, "quota": quota}
             except MuseAuthError as exc:
                 store.mark(aid, False, str(exc)[:200])
                 return {"ok": False, "message": str(exc)[:200]}
             except Exception as exc:  # noqa: BLE001
-                store.touch_keepalive(aid, None, f"测试未确认（保留账号状态）: {str(exc)[:200]}")
+                store.touch_keepalive(aid, None, f"Chưa xác nhận kiểm tra: {str(exc)[:200]}")
                 return {"ok": False, "message": str(exc)[:200]}
 
     res = await asyncio.to_thread(_probe)
@@ -1777,6 +1828,70 @@ def delete_single_media(name: str, _=Depends(auth)):
         raise HTTPException(500, f"删除失败: {e}")
 
 
+# ------------------------- Dọn media tự động (opt-in) -------------------------
+def cleanup_media(max_age_days: int = 0, max_files: int = 0, dry_run: bool = False) -> dict:
+    """Xóa bớt file trong data/media theo tuổi (ngày) và/hoặc số lượng tối đa.
+
+    Giữ lại file mới nhất. max_age_days<=0 và max_files<=0 -> không làm gì (an toàn mặc định).
+    Chỉ đụng file trong đúng thư mục media, bỏ qua .gitkeep. Không bao giờ làm hỏng tiến trình tạo video.
+    """
+    d = CFG.media_dir
+    if not os.path.isdir(d) or (max_age_days <= 0 and max_files <= 0):
+        return {"removed": 0, "removed_files": [], "kept": None, "dry_run": dry_run}
+    files = []
+    for name in os.listdir(d):
+        if name == ".gitkeep":
+            continue
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            try:
+                files.append((name, os.path.getmtime(p), os.path.getsize(p)))
+            except OSError:
+                pass
+    files.sort(key=lambda x: x[1], reverse=True)   # mới nhất trước
+
+    now = time.time()
+    to_remove = set()
+    if max_age_days > 0:
+        cutoff = now - max_age_days * 86400
+        to_remove |= {f[0] for f in files if f[1] < cutoff}
+    if max_files > 0 and len(files) > max_files:
+        to_remove |= {f[0] for f in files[max_files:]}   # phần dôi ra ngoài N file mới nhất
+
+    removed, errors, freed = [], [], 0
+    for name in to_remove:
+        p = os.path.join(d, name)
+        size = next((f[2] for f in files if f[0] == name), 0)
+        if dry_run:
+            removed.append(name)
+            freed += size
+            continue
+        try:
+            os.remove(p)
+            removed.append(name)
+            freed += size
+        except OSError as e:
+            errors.append(f"{name}: {e}")
+    if removed:
+        log.info("🧹 Dọn media: %s %d file (giải phóng ~%.1f MB), còn giữ %d file.",
+                 "sẽ xóa" if dry_run else "đã xóa", len(removed), freed / 1048576, len(files) - len(removed))
+    return {"removed": len(removed), "removed_files": sorted(removed), "errors": errors,
+            "freed_bytes": freed, "kept": len(files) - len(removed), "dry_run": dry_run}
+
+
+@app.post("/admin/media/cleanup")
+def admin_media_cleanup(payload: dict = Body(default={}), _=Depends(auth)):
+    """Dọn thủ công thư mục media. Body (tùy chọn): max_age_days, max_files, dry_run.
+    Không truyền thì dùng cấu hình MUSE2API_MEDIA_RETENTION_DAYS / MUSE2API_MEDIA_MAX_FILES."""
+    age = payload.get("max_age_days")
+    cnt = payload.get("max_files")
+    return cleanup_media(
+        max_age_days=int(age) if age is not None else CFG.media_retention_days,
+        max_files=int(cnt) if cnt is not None else CFG.media_max_files,
+        dry_run=bool(payload.get("dry_run", False)),
+    )
+
+
 # ------------------------- 前端页面 -------------------------
 def _admin_html() -> str:
     p = os.path.join(BASE_DIR, "admin.html")
@@ -1791,14 +1906,631 @@ def _admin_html() -> str:
                 "<code>/v1/videos</code></p></body>")
 
 
+def _studio_html() -> str:
+    p = os.path.join(BASE_DIR, "studio.html")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return _admin_html()
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return _admin_html()
+    return _studio_html()
+
+
+@app.get("/studio", response_class=HTMLResponse)
+def studio_page():
+    return _studio_html()
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
     return _admin_html()
+
+
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+# Các key từng được ghi cứng trong source / file mẫu -> coi như đã lộ.
+_PUBLIC_DEFAULT_KEYS = {"m2a_museai_video_studio_2026", "m2a_your_secret_admin_key_here"}
+
+
+def _is_local_same_origin(request: Request) -> bool:
+    """Chỉ trang Studio do chính server này phục vụ (truy cập qua loopback, cùng origin) mới được nhận API key.
+
+    CORS đang mở "*", nên nếu không chặn thì bất kỳ trang web nào bạn mở trong trình duyệt
+    cũng fetch được http://127.0.0.1:18610/api/studio/config và đọc trộm key.
+    """
+    client = request.client.host if request.client else ""
+    if client not in _LOOPBACK_HOSTS:
+        return False
+    host_header = (request.headers.get("host") or "").lower()
+    hostname = host_header.rsplit(":", 1)[0].strip("[]") if host_header else ""
+    if hostname not in _LOOPBACK_HOSTS:          # chặn DNS rebinding
+        return False
+    origin = request.headers.get("origin")
+    if origin and origin.rstrip("/").lower() != f"http://{host_header}":
+        return False
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site and fetch_site not in ("same-origin", "none"):
+        return False
+    return True
+
+
+@app.get("/api/studio/config")
+def get_studio_config(request: Request):
+    cfg = {
+        "media_dir": CFG.media_dir,
+        "chromium": CFG.chromium,
+        "host": CFG.host,
+        "port": CFG.port,
+        "version": "1.0.0"
+    }
+    if _is_local_same_origin(request):
+        cfg["api_key"] = CFG.api_key
+    return cfg
+
+
+# ------------------------- Shopee Database & Video Batch API -------------------------
+import shopee_engine
+
+SHOPEE_SETTINGS_FILE = os.path.join(CFG.data_dir, "shopee_settings.json")
+
+_VIDEO_EXTS = (".mp4", ".webm", ".mov")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _bare_filename(name, field: str) -> str:
+    """Chỉ nhận tên file trần (không thư mục, không ..) để không ghi/đọc ra ngoài thư mục chỉ định."""
+    s = str(name or "").strip()
+    if not s or s != os.path.basename(s) or s in (".", "..") or "/" in s or "\\" in s:
+        raise HTTPException(400, f"{field} không hợp lệ: {s!r}")
+    return s
+
+
+def _media_file(name, field: str = "filename") -> str:
+    """File nằm trong thư mục media của server."""
+    p = os.path.join(CFG.media_dir, _bare_filename(name, field))
+    if not os.path.isfile(p):
+        raise HTTPException(404, f"Không tìm thấy file {os.path.basename(p)}")
+    return p
+
+
+def _video_source(path_or_name, field: str = "filename") -> str:
+    """Nguồn video: tên file trong thư mục media, hoặc đường dẫn tuyệt đối tới file video
+    (clip tạm đã lưu ở <out_dir>/temp). Chặn đọc các loại file khác trên máy."""
+    s = str(path_or_name or "").strip()
+    if not os.path.isabs(s):
+        return _media_file(s, field)
+    if not s.lower().endswith(_VIDEO_EXTS):
+        raise HTTPException(400, f"{field} phải là file video: {os.path.basename(s)}")
+    if not os.path.isfile(s):
+        raise HTTPException(404, f"Không tìm thấy file {os.path.basename(s)}")
+    return s
+
+
+def _get_shopee_settings() -> dict:
+    default_settings = {
+        "sv_server_url": shopee_engine.DEFAULT_SERVER_URL,
+        "sv_api_key": shopee_engine.DEFAULT_API_KEY,
+        "sv_client_id": shopee_engine.DEFAULT_CLIENT_ID,
+        "aspect": "Dọc 9:16 (TikTok)",
+        "scene": "🎲 Random",
+        "duration": "8s",
+        "lang": "Tiếng Philippines",
+        "review_style": "Unboxing",
+        "ai_prompt": "Template (mặc định)",
+        "del_img": True,
+        "ghep_anh": True,
+        "naming": "Theo Item ID",
+        "out_dir": shopee_engine.DEFAULT_OUT_DIR,
+        "claim_limit": "2000",
+        "sort_by": "Số bán cao nhất",
+        "market": "PH",
+        "min_item_id": "40000000000",
+        "min_commission": "1",
+        "min_sold": "0",
+        "min_price": "0",
+        "max_price": ""
+    }
+    if os.path.isfile(SHOPEE_SETTINGS_FILE):
+        try:
+            with open(SHOPEE_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                default_settings.update(saved)
+        except Exception:
+            pass
+    return default_settings
+
+
+@app.get("/api/shopee/settings")
+def get_shopee_settings():
+    return _get_shopee_settings()
+
+
+@app.post("/api/shopee/save-settings")
+def save_shopee_settings(settings: dict):
+    os.makedirs(CFG.data_dir, exist_ok=True)
+    with open(SHOPEE_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+    return {"success": True}
+
+
+@app.post("/api/shopee/claim")
+def claim_shopee_jobs(req: dict):
+    cfg = _get_shopee_settings()
+    server_url = req.get("server_url") or cfg.get("sv_server_url") or shopee_engine.DEFAULT_SERVER_URL
+    api_key = req.get("api_key") or cfg.get("sv_api_key") or shopee_engine.DEFAULT_API_KEY
+    client_id = req.get("client_id") or cfg.get("sv_client_id") or shopee_engine.DEFAULT_CLIENT_ID
+    if not server_url or not api_key:
+        raise HTTPException(400, "Chưa cấu hình Database Novagate/Shopee. Hãy đặt SHOPEE_SERVER_URL và "
+                                 "SHOPEE_API_KEY trong file .env (hoặc nhập Server/API key ở tab Shopee) rồi thử lại.")
+    market = req.get("market") or "PH"
+    limit = int(req.get("limit") or 2000)
+    sort_by_ui = req.get("sort_by") or "Số bán cao nhất"
+    sort_by = "commission" if "Hoa hồng" in sort_by_ui else "sold"
+    min_item_id = int(req.get("min_item_id") or 40000000000)
+    min_commission = float(req.get("min_commission") or 1.0)
+    min_sold = int(req.get("min_sold") or 0)
+    min_price = float(req.get("min_price") or 0.0)
+    max_price = float(req.get("max_price")) if req.get("max_price") else None
+
+    try:
+        products, bl_count = shopee_engine.claim_jobs_from_server(
+            server_url=server_url,
+            api_key=api_key,
+            client_id=client_id,
+            market=market,
+            limit=limit,
+            sort_by=sort_by,
+            min_item_id=min_item_id,
+            min_commission=min_commission,
+            min_sold=min_sold,
+            min_price=min_price,
+            max_price=max_price,
+            return_stats=True
+        )
+        return {"success": True, "count": len(products), "products": products, "blacklisted_count": bl_count}
+    except Exception as e:
+        raise HTTPException(500, f"Lỗi lấy sản phẩm từ Database: {e}")
+
+
+@app.post("/api/shopee/release")
+def release_shopee_jobs(req: dict):
+    cfg = _get_shopee_settings()
+    server_url = req.get("server_url") or cfg.get("sv_server_url") or shopee_engine.DEFAULT_SERVER_URL
+    api_key = req.get("api_key") or cfg.get("sv_api_key") or shopee_engine.DEFAULT_API_KEY
+    client_id = req.get("client_id") or cfg.get("sv_client_id") or shopee_engine.DEFAULT_CLIENT_ID
+    try:
+        released = shopee_engine.release_stuck_jobs(server_url, api_key, client_id)
+        return {"success": True, "released": released}
+    except Exception as e:
+        raise HTTPException(500, f"Lỗi giải phóng SP: {e}")
+
+
+@app.post("/api/shopee/complete")
+def complete_shopee_job(req: dict):
+    cfg = _get_shopee_settings()
+    server_url = req.get("server_url") or cfg.get("sv_server_url") or shopee_engine.DEFAULT_SERVER_URL
+    api_key = req.get("api_key") or cfg.get("sv_api_key") or shopee_engine.DEFAULT_API_KEY
+    item_id = req.get("item_id", "")
+    status = req.get("status", "completed")
+    video_path = req.get("video_path")
+    res = shopee_engine.report_job_completion(server_url, api_key, item_id, status, video_path)
+    return {"success": res}
+
+
+def parse_shopee_lang_code(lang_val: str, market: str = "") -> str:
+    s = str(lang_val or "").strip().lower()
+    if "việt" in s or "viet" in s:
+        return "vi"
+    if "philippines" in s or "filipino" in s or "tagalog" in s:
+        return "ph"
+    if "thái" in s or "thai" in s:
+        return "th"
+    if "indonesia" in s or "indo" in s:
+        return "id"
+    if "malay" in s:
+        return "my"
+    if "trung" in s or "đài loan" in s or "taiwan" in s or "chinese" in s:
+        return "tw"
+    if "singapore" in s:
+        return "sg"
+    if "anh" in s or "english" in s:
+        return "sg" if str(market or "").upper() == "SG" else "en"
+    m = str(market or "").strip().upper()
+    if m == "VN": return "vi"
+    if m == "PH": return "ph"
+    if m == "TH": return "th"
+    if m == "ID": return "id"
+    if m == "MY": return "my"
+    if m == "TW": return "tw"
+    if m == "SG": return "sg"
+    return "ph"
+
+
+@app.post("/api/shopee/test-prompt")
+def test_shopee_prompt(req: dict):
+    product_name = req.get("product_name", "Tecno Pova 6 Neo Phone Case")
+    lang_val = req.get("lang", "Tiếng Philippines")
+    market = req.get("market", "")
+    lang_code = parse_shopee_lang_code(lang_val, market)
+    review_style = req.get("review_style", "Unboxing")
+    duration = str(req.get("duration", "8s")).strip().lower()
+    ai_prompt = str(req.get("ai_prompt", "")).strip()
+
+    is_16s = "16" in duration or "a + b" in ai_prompt.lower()
+    clean_title = shopee_engine.clean_product_title(product_name)
+
+    if is_16s:
+        scene = req.get("scene", "🎲 Random")
+        prompts, label = shopee_engine.build_video_prompts_16s(product_name, scene_choice=scene, lang=lang_code, review_style=review_style)
+        full_text = f"[Clip A (0-8s)]:\n{prompts[0]}\n\n[Clip B (8-16s)]:\n{prompts[1]}"
+        return {
+            "prompt": full_text,
+            "prompts": prompts,
+            "label": f"{label} (16s)",
+            "clean_title": clean_title,
+            "is_16s": True
+        }
+    else:
+        prompt, label = shopee_engine.build_tvc_prompt(product_name, lang=lang_code, review_style=review_style)
+        return {"prompt": prompt, "prompts": [prompt], "label": label, "clean_title": clean_title, "is_16s": False}
+
+
+@app.post("/api/shopee/concat-videos")
+def concat_shopee_videos(req: dict):
+    """Ghép danh sách các clip (ví dụ Clip A + Clip B) thành 1 video hoàn chỉnh."""
+    clip_filenames = req.get("clip_filenames") or []
+    out_filename = req.get("out_filename") or f"concat_{uuid.uuid4().hex}.mp4"
+    if not clip_filenames:
+        raise HTTPException(400, "Danh sách clip trống")
+
+    clip_paths = [_video_source(f, "clip_filenames") for f in clip_filenames]
+    out_filename = _bare_filename(out_filename, "out_filename")
+    if not out_filename.lower().endswith(".mp4"):
+        raise HTTPException(400, "out_filename phải có đuôi .mp4")
+
+    out_path = os.path.join(CFG.media_dir, out_filename)
+    ok = shopee_engine.concat_videos(clip_paths, out_path)
+    if not ok:
+        raise HTTPException(500, "Lỗi ghép video bằng FFmpeg")
+    return {"success": True, "filename": out_filename, "path": out_path}
+
+
+@app.get("/api/shopee/clip-cache/{item_id}")
+def get_shopee_clip_cache(item_id: str):
+    """Lấy danh sách các clip A / B đã render thành công của sản phẩm."""
+    return shopee_engine.get_cached_clips(item_id)
+
+
+@app.post("/api/shopee/clip-cache/{item_id}")
+def set_shopee_clip_cache(item_id: str, req: dict):
+    """Lưu lại tiến độ render clip A / B của sản phẩm để không phải tạo lại."""
+    clip_key = req.get("clip_key") or "clip_a"
+    filename = req.get("filename") or ""
+    if filename:
+        shopee_engine.set_cached_clip(item_id, clip_key, filename)
+    return {"success": True}
+
+
+@app.post("/api/shopee/save-temp-clip")
+def save_temp_clip(req: dict):
+    """Lưu clip video thô từ Muse.ai vào thư mục output_dir/temp/{item_id}-{part}.mp4."""
+    filename = str(req.get("filename", "")).strip()
+    out_dir = req.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    item_id = str(req.get("item_id", "")).strip()
+    part = str(req.get("part", "a")).lower().strip()  # "a", "b", "raw"
+    if not filename or not item_id:
+        raise HTTPException(400, "Thiếu thông tin filename hoặc item_id")
+    if not _SAFE_ID_RE.match(item_id):
+        raise HTTPException(400, f"item_id không hợp lệ: {item_id}")
+    if part not in ("a", "b", "raw"):
+        raise HTTPException(400, "part phải là a, b hoặc raw")
+
+    src_path = _video_source(filename)
+
+    temp_dir = os.path.join(out_dir, "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    target_filename = f"{item_id}-{part}.mp4"
+    target_path = os.path.join(temp_dir, target_filename)
+
+    # Chuyển trực tiếp file sang out_dir/temp/{item_id}-{part}.mp4 để không chiếm gấp đôi dung lượng ổ cứng
+    try:
+        shutil.move(src_path, target_path)
+    except Exception:
+        shutil.copy2(src_path, target_path)
+        try:
+            os.remove(src_path)
+        except Exception:
+            pass
+
+    shopee_engine.set_cached_clip(item_id, f"clip_{part}", target_path)
+    log.info("💾 [Temp Clip] Đã lưu clip thành phần: temp/%s (%s)", target_filename, target_path)
+    return {"success": True, "path": target_path, "filename": target_filename}
+
+
+@app.get("/api/shopee/check-temp-clips")
+def check_temp_clips(out_dir: str = "", item_id: str = ""):
+    """Kiểm tra xem các clip thô {item_id}-a.mp4 và {item_id}-b.mp4 đã có sẵn trong folder output/temp chưa."""
+    target_out = out_dir or shopee_engine.DEFAULT_OUT_DIR
+    temp_dir = os.path.join(target_out, "temp")
+    res = {"clip_a": None, "clip_b": None, "clip_raw": None}
+    if os.path.isdir(temp_dir) and item_id and _SAFE_ID_RE.match(item_id):
+        for part in ("a", "b", "raw"):
+            p = os.path.join(temp_dir, f"{item_id}-{part}.mp4")
+            if os.path.isfile(p) and os.path.getsize(p) > 10000:
+                res[f"clip_{part}"] = p
+    return res
+
+
+@app.get("/muse-logo.svg")
+def get_muse_logo_svg():
+    p = os.path.join(BASE_DIR, "muse-logo.svg")
+    if os.path.isfile(p):
+        return FileResponse(p, media_type="image/svg+xml")
+    raise HTTPException(404, "Logo không tồn tại")
+
+
+@app.get("/muse-logo.ico")
+def get_muse_logo_ico():
+    p = os.path.join(BASE_DIR, "muse-logo.ico")
+    if os.path.isfile(p):
+        return FileResponse(p, media_type="image/x-icon")
+    raise HTTPException(404, "Logo icon không tồn tại")
+
+
+@app.get("/muse-logo.png")
+def get_muse_logo_png():
+    p = os.path.join(BASE_DIR, "muse-logo.png")
+    if os.path.isfile(p):
+        return FileResponse(p, media_type="image/png")
+    raise HTTPException(404, "Logo png không tồn tại")
+
+
+@app.get("/api/version")
+def get_app_version():
+    ver_path = os.path.join(BASE_DIR, "version.txt")
+    if os.path.isfile(ver_path):
+        try:
+            with open(ver_path, "r", encoding="utf-8") as f:
+                v = f.read().strip()
+                if v:
+                    return {"version": v}
+        except Exception:
+            pass
+    return {"version": "1.2.1"}
+
+
+# ------------------------- Blacklist Sản Phẩm -------------------------
+@app.get("/api/shopee/blacklist")
+def get_shopee_blacklist():
+    return shopee_engine.get_blacklist()
+
+
+@app.post("/api/shopee/save-blacklist")
+def save_shopee_blacklist(req: dict):
+    ok = shopee_engine.save_blacklist(req)
+    return {"success": ok}
+
+
+@app.post("/api/shopee/add-to-blacklist")
+def add_to_shopee_blacklist(req: dict):
+    item_id = req.get("item_id")
+    keyword = req.get("keyword")
+    reason = req.get("reason", "")
+    res = shopee_engine.add_to_blacklist(item_id=item_id, keyword=keyword, reason=reason)
+    return {"success": True, "blacklist": res}
+
+
+# ------------------------- HomeProxy từ E:\ThinAptm0707 -------------------------
+@app.get("/api/proxy/status")
+def get_proxy_status():
+    import proxy_manager
+    pool = proxy_manager.get_cached_proxy_pool()
+    if not pool:
+        pool = proxy_manager.load_proxies_from_thinaptm()
+    accounts = store.list_accounts()
+    assigned = sum(1 for a in accounts if a.get("proxy"))
+    alive = sum(1 for a in accounts if a.get("proxy_status") == "alive")
+    return {
+        "success": True,
+        "total_proxies": len(pool),
+        "proxies": pool[:30],
+        "assigned_accounts": assigned,
+        "alive_proxies": alive,
+        "accounts": accounts
+    }
+
+
+@app.post("/api/proxy/sync-thinaptm")
+def sync_thinaptm_proxies():
+    import proxy_manager
+    return proxy_manager.sync_all_accounts_with_homeproxy()
+
+
+@app.post("/api/proxy/test/{acc_id}")
+def test_account_proxy(acc_id: str):
+    import proxy_manager
+    acc = store.get_account(acc_id)
+    if not acc:
+        raise HTTPException(404, "Tài khoản không tồn tại")
+    p = acc.get("proxy")
+    if not p:
+        p = proxy_manager.ensure_alive_proxy_for_account(acc_id)
+        if not p:
+            return {"success": False, "error": "Chưa có proxy nào trong Pool"}
+    ok, ip_or_err = proxy_manager.test_proxy(p)
+    if ok:
+        store.update_account(acc_id, proxy_status="alive", proxy_ip=ip_or_err)
+    else:
+        store.update_account(acc_id, proxy_status="dead", proxy_error=ip_or_err)
+    return {"success": ok, "proxy": p, "ip": ip_or_err if ok else None, "error": ip_or_err if not ok else None}
+
+
+@app.post("/api/proxy/rotate/{acc_id}")
+def rotate_account_proxy(acc_id: str):
+    import proxy_manager
+    engine.close_session_for_account(acc_id)
+    new_p = proxy_manager.ensure_alive_proxy_for_account(acc_id, force_check=True)
+    if not new_p:
+        raise HTTPException(500, "Không tìm thấy proxy khả dụng trong Pool")
+    acc = store.get_account(acc_id) or {}
+    return {"success": True, "proxy": new_p, "ip": acc.get("proxy_ip")}
+
+
+# ------------------------- Trình duyệt Anti-Detect & Quản lý TTL -------------------------
+@app.get("/api/browser/ttl")
+def get_browser_ttl():
+    return {
+        "ttl_seconds": engine.browser_ttl_seconds,
+        "ttl_minutes": round(engine.browser_ttl_seconds / 60, 1),
+        "max_tasks": engine.browser_max_tasks,
+        "anti_detect": getattr(CFG, "anti_detect", True),
+        "active_sessions": engine.get_pool_status(),
+        "total_active_sessions": len(engine._session_pool),
+    }
+
+
+@app.post("/api/browser/ttl")
+def update_browser_ttl(req: dict):
+    if "ttl_seconds" in req:
+        engine.browser_ttl_seconds = max(60, int(req["ttl_seconds"]))
+    elif "ttl_minutes" in req:
+        engine.browser_ttl_seconds = max(60, int(float(req["ttl_minutes"]) * 60))
+    if "max_tasks" in req:
+        engine.browser_max_tasks = max(1, int(req["max_tasks"]))
+    return {
+        "success": True,
+        "ttl_seconds": engine.browser_ttl_seconds,
+        "ttl_minutes": round(engine.browser_ttl_seconds / 60, 1),
+        "max_tasks": engine.browser_max_tasks,
+    }
+
+
+@app.post("/api/browser/recycle")
+def recycle_browser(req: dict = Body(default={})):
+    """Giải phóng toàn bộ browser contexts và làm sạch session pool để xóa sạch profile/cache chống phát hiện."""
+    engine.close_all_sessions()
+    restart_chrome = req.get("restart_chrome", False) if isinstance(req, dict) else False
+    if restart_chrome:
+        try:
+            engine.stop()
+            engine.start()
+        except Exception:
+            pass
+    return {"success": True, "message": "Đã giải phóng toàn bộ phiên trình duyệt và bộ đệm (Recycled)"}
+
+
+
+@app.post("/api/shopee/download-image")
+def download_shopee_image(req: dict):
+    image_url = req.get("image_url", "")
+    data_url = shopee_engine.download_image_as_data_url(image_url)
+    if not data_url:
+        raise HTTPException(400, "Không tải được ảnh từ Shopee")
+    return {"data_url": data_url}
+
+
+@app.post("/api/shopee/save-rendered-video")
+def save_rendered_video(req: dict):
+    """Lưu video đã render từ Muse media folder sang thư mục đầu ra chỉ định.
+    Nếu ghep_anh=True, thực hiện ghép ảnh sản phẩm làm Outro tạo video chuẩn 12s."""
+    filename = req.get("filename", "")
+    out_dir = req.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    target_name = req.get("target_name") or filename
+    ghep_anh = bool(req.get("ghep_anh", False))
+    del_img = bool(req.get("del_img", True))
+    image_url = req.get("image_url", "")
+    image_data_url = req.get("image_data_url", "")
+    duration_val = req.get("duration")
+
+    ai_dur = None
+    if duration_val:
+        try:
+            if isinstance(duration_val, (int, float)):
+                ai_dur = float(duration_val)
+            else:
+                m = re.search(r"(\d+)", str(duration_val))
+                if m:
+                    ai_dur = float(m.group(1))
+        except Exception:
+            ai_dur = None
+
+    src = _media_file(filename)
+    target_name = _bare_filename(target_name, "target_name")
+    if not target_name.lower().endswith(_VIDEO_EXTS):
+        raise HTTPException(400, "target_name phải là file video (.mp4)")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        dst = os.path.join(out_dir, target_name)
+
+        stitched = False
+        temp_img_path = None
+        if ghep_anh and (image_url or image_data_url):
+            try:
+                temp_img_path = os.path.join(CFG.data_dir, f"temp_outro_{int(time.time()*1000)}.jpg")
+                if image_data_url and ";base64," in image_data_url:
+                    b64_content = image_data_url.split(";base64,", 1)[1]
+                    with open(temp_img_path, "wb") as f:
+                        f.write(base64.b64decode(b64_content))
+                elif image_url:
+                    shopee_engine.download_image_to_file(image_url, temp_img_path)
+
+                if os.path.isfile(temp_img_path) and os.path.getsize(temp_img_path) > 100:
+                    log.info("[Ghep 12s] Dang ghep anh Outro (12s, AI: %ss) vao video %s...", ai_dur or "auto", target_name)
+                    ok = shopee_engine.ghep_anh_12s(src, temp_img_path, dst, ai_duration=ai_dur)
+                    if ok:
+                        stitched = True
+                        log.info("[Ghep 12s] Thanh cong: %s", dst)
+            except Exception as ge:
+                log.warning("Ghép ảnh 12s không thành công, dùng video gốc: %s", ge)
+            finally:
+                if temp_img_path and os.path.isfile(temp_img_path) and del_img:
+                    try:
+                        os.remove(temp_img_path)
+                    except Exception:
+                        pass
+
+        if not stitched:
+            import shutil
+            shutil.copy2(src, dst)
+
+        # Tự động dọn dẹp file trung gian trong CFG.media_dir sau khi đã lưu xong video hoàn chỉnh
+        if os.path.isfile(dst) and os.path.getsize(dst) > 1000:
+            media_dir_abs = os.path.abspath(CFG.media_dir)
+            if os.path.abspath(src).startswith(media_dir_abs):
+                try:
+                    os.remove(src)
+                except Exception:
+                    pass
+
+        return {"success": True, "saved_path": dst, "stitched": stitched}
+    except Exception as e:
+        raise HTTPException(500, f"Lỗi lưu file video: {e}")
+
+
+@app.post("/api/shopee/clean-media-cache")
+def clean_media_cache():
+    """Dọn dẹp sạch sẽ các file video tạm tích tụ trong thư mục data/media để giải phóng dung lượng đĩa."""
+    d = CFG.media_dir
+    removed_count = 0
+    freed_bytes = 0
+    if os.path.isdir(d):
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                try:
+                    sz = os.path.getsize(p)
+                    os.remove(p)
+                    removed_count += 1
+                    freed_bytes += sz
+                except Exception:
+                    pass
+    freed_mb = round(freed_bytes / (1024 * 1024), 2)
+    log.info("🧹 Đã dọn dẹp %d file tạm trong data/media (giải phóng %.2f MB)", removed_count, freed_mb)
+    return {"success": True, "removed_count": removed_count, "freed_mb": freed_mb}
+
 
 
 
@@ -1818,7 +2550,13 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
     if not acc or not acc.get("cookies"):
         return {"ok": False, "id": aid, "label": (acc or {}).get("label", aid), "error": "账号无有效 cookie"}
     try:
-        res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=True)
+        p_url = None
+        try:
+            import proxy_manager
+            p_url = proxy_manager.get_forwarder_url_for_account(aid)
+        except Exception:
+            pass
+        res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=True, proxy_url=p_url)
         store.update_account(
             aid,
             cookies=res["cookies"],
@@ -1827,7 +2565,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
             synced_at=int(time.time()),
         )
         vm_state = res.get("vm_state") or "RUNNING"
-        store.touch_keepalive(aid, True, f"会话有效 · 自动保活 (VM: {vm_state})")
+        store.touch_keepalive(aid, True, f"Phiên hợp lệ · Tự động duy trì (VM: {vm_state})")
         quota = acc.get("quota")
         if check_quota and GEN_LOCK.acquire(blocking=False):
             try:
@@ -1836,7 +2574,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
                 quota["checked_at"] = int(time.time())
                 store.update_account(aid, quota=quota)
             except Exception as qe:  # noqa: BLE001
-                log.warning("读取账号 %s 额度失败: %s", aid, qe)
+                log.warning("Đọc định mức tài khoản %s thất bại: %s", aid, qe)
             finally:
                 GEN_LOCK.release()
         updated = store.get_account(aid) or {}
@@ -1851,10 +2589,10 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
             "quota": quota,
         }
     except MuseAuthError as exc:
-        store.touch_keepalive(aid, False, f"保活认证失败: {str(exc)[:200]}")
+        store.touch_keepalive(aid, False, f"Xác thực thất bại khi duy trì: {str(exc)[:200]}")
         return {"ok": False, "id": aid, "label": acc.get("label", aid), "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
-        store.touch_keepalive(aid, None, f"保活未确认（保留账号状态）: {str(exc)[:200]}")
+        store.touch_keepalive(aid, None, f"Chưa xác nhận duy trì: {str(exc)[:200]}")
         return {"ok": False, "id": aid, "label": acc.get("label", aid), "error": str(exc)}
 
 
@@ -1943,6 +2681,12 @@ async def _keepalive_loop():
                 await asyncio.to_thread(_warmup_browser_sync)
         except Exception as e:  # noqa: BLE001
             log.error("【自动保活守护进程】轮询异常: %s", e)
+        # Dọn media tự động (chỉ chạy khi người dùng bật retention/max_files qua .env)
+        if CFG.media_retention_days > 0 or CFG.media_max_files > 0:
+            try:
+                await asyncio.to_thread(cleanup_media, CFG.media_retention_days, CFG.media_max_files, False)
+            except Exception as e:  # noqa: BLE001
+                log.warning("🧹 Dọn media tự động lỗi (bỏ qua): %s", e)
         await asyncio.sleep(900)
 
 
@@ -2229,13 +2973,35 @@ def _upgrade_from_github_sync() -> dict:
 @app.get("/admin/repo/status")
 async def admin_check_update(force: bool = False):
     """供所有已部署节点实时检测 GitHub 官方仓库是否有新版本更新。"""
-    return await asyncio.to_thread(_check_update_sync, force)
+    data = dict(await asyncio.to_thread(_check_update_sync, force))
+    if not _upstream_sync_enabled():
+        # Bản này đã sửa nhiều so với repo gốc -> không gợi ý "nâng cấp" vì nâng cấp sẽ ghi đè code local.
+        data.update(has_update=False, up_to_date=True, upgrade_disabled=True)
+    return data
+
+
+def _upstream_sync_enabled() -> bool:
+    return os.environ.get("MUSE2API_ALLOW_UPSTREAM_SYNC", "").strip() == "1"
+
+
+def _require_upstream_sync():
+    """Chặn pull/push với repo gốc czg86389-hub/muse2api.
+
+    Bản cài này có nhiều thay đổi local (Studio, Shopee, worker session...) chưa có trên repo gốc.
+    `git checkout -f origin/main -- .` hoặc tải tarball sẽ GHI ĐÈ toàn bộ các thay đổi đó,
+    còn push sẽ đẩy code lên repo của người khác. Chỉ bật lại khi biết rõ hậu quả:
+    đặt MUSE2API_ALLOW_UPSTREAM_SYNC=1 trong .env.
+    """
+    if not _upstream_sync_enabled():
+        raise HTTPException(403, "Đã tắt cập nhật/đẩy code với repo gốc vì sẽ ghi đè các thay đổi local. "
+                                 "Muốn bật lại: đặt MUSE2API_ALLOW_UPSTREAM_SYNC=1 trong .env và khởi động lại.")
 
 
 @app.post("/admin/update/upgrade")
 @app.post("/admin/repo/pull")
 async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
     """一键从 GitHub 官方仓库拉取最新更新并自动平滑重启服务。"""
+    _require_upstream_sync()
     res = await asyncio.to_thread(_upgrade_from_github_sync)
     restart = payload.get("restart", True) if isinstance(payload, dict) else True
     if restart:
@@ -2253,7 +3019,8 @@ async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
 @app.post("/admin/repo/push")
 async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     """维护者专用：将当前节点核心代码推送到 GitHub 仓库（自动过滤 .env 与 data 目录）。"""
-    msg = (payload.get("message") or "").strip() or f"chore: sync update ({time.strftime('%Y-%m-%d %H:%M:%S')})"
+    _require_upstream_sync()
+    msg =(payload.get("message") or "").strip() or f"chore: sync update ({time.strftime('%Y-%m-%d %H:%M:%S')})"
     new_token = (payload.get("github_token") or "").strip()
     if new_token:
         _persist_env("GITHUB_TOKEN", new_token)
@@ -2292,12 +3059,14 @@ async def _startup():
     for task in list(store.tasks.values()):
         if task.get("kind") == "image" and task.get("status") in ("queued", "processing"):
             store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
-    if not CFG.api_key:
-        import secrets
+    # Key rỗng hoặc trùng key mặc định công khai (ai đọc source cũng biết) -> tự sinh key ngẫu nhiên.
+    if not CFG.api_key or CFG.api_key in _PUBLIC_DEFAULT_KEYS:
         new_key = "m2a_" + secrets.token_hex(24)
         CFG.api_key = new_key
+        os.environ["MUSE2API_KEY"] = new_key
         _persist_env("MUSE2API_KEY", new_key)
-        log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
+        log.warning("🔑 API key cũ trống hoặc là key mặc định công khai -> đã tạo key ngẫu nhiên mới và ghi vào .env "
+                    "(MUSE2API_KEY). Cập nhật key này cho extension / userscript / client bên ngoài.")
     asyncio.create_task(_keepalive_loop())
 
 

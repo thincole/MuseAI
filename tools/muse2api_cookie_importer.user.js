@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Muse2API Cookie 导入助手
+// @name         MuseAI Video Studio - Trợ Lý Nhập Cookie
 // @namespace    https://github.com/czg86389-hub/muse2api
 // @version      1.1.0
-// @description  在 muse.ai 网页上一键导出并推送核心 Cookie 至 muse2api 账号池，支持现代化悬浮面板、状态指示与剪贴板备份
-// @author       MUSE2API Contributors
+// @description  Trích xuất và đồng bộ Cookie đăng nhập từ muse.ai vào ứng dụng MuseAI Video Studio chỉ với 1 click chuột, hỗ trợ bảng điều khiển nổi hiện đại.
+// @author       MuseAI Video Studio
 // @match        https://muse.ai/*
 // @match        https://*.muse.ai/*
 // @grant        GM_cookie
@@ -19,11 +19,11 @@
 (function () {
   'use strict';
 
-  const STORE_KEY = '***';
-  const ESSENTIAL = ['hatch_sess', 'hatch_gw', 'hatch_vml'];
+  const STORE_KEY = 'museai_cookie_cfg';
+  const ESSENTIAL = ['hatch_sess', 'hatch_gw', 'hatch_vml', 'hatch_native_auth_device'];
 
   function loadCfg() {
-    const fallback = { base: '', key: '', label: '' };
+    const fallback = { base: 'http://127.0.0.1:18610', key: '', label: '' };
     if (typeof GM_getValue === 'function') {
       return GM_getValue(STORE_KEY, fallback);
     }
@@ -44,7 +44,7 @@
 
   function normBase(v) {
     let s = (v || '').trim();
-    if (!s) return '';
+    if (!s) return 'http://127.0.0.1:18610';
     if (!/^https?:\/\//i.test(s)) {
       s = (/^(127\.|100\.|10\.|192\.168\.|localhost)/i.test(s) ? 'http://' : 'https://') + s;
     }
@@ -112,8 +112,8 @@
 
   async function checkSessionStatus() {
     const { cookies } = await getCookies();
-    const missing = ESSENTIAL.filter(n => !(n in cookies));
-    const hasCore = missing.length === 0;
+    const hasCore = !!cookies['hatch_sess'];
+    const missing = hasCore ? [] : ['hatch_sess'];
     return { hasCore, count: Object.keys(cookies).length, missing, cookies };
   }
 
@@ -125,21 +125,15 @@
 
     if (btnEl) {
       btnEl.disabled = true;
-      btnEl.innerHTML = '<span style="opacity:0.8">⏳ 提取中…</span>';
+      btnEl.innerHTML = '<span style="opacity:0.8">⏳ Đang đọc Cookie…</span>';
     }
 
     try {
       const { cookies, expires } = await getCookies();
       const names = Object.keys(cookies);
 
-      if (!names.length) {
-        showToast('未检测到 muse.ai Cookie，请确保已登录账号！', 'err');
-        return;
-      }
-
-      const missing = ESSENTIAL.filter(n => !(n in cookies));
-      if (missing.length) {
-        showToast(`读到 ${names.length} 条 Cookie，但缺核心项：${missing.join(', ')}。请刷新页面重试。`, 'err');
+      if (!names.length || !cookies['hatch_sess']) {
+        showToast('Chưa phát hiện Cookie đăng nhập (hatch_sess), vui lòng đăng nhập trước!', 'err');
         return;
       }
 
@@ -149,11 +143,11 @@
       }
 
       if (!base) {
-        showToast('✓ 完整 Cookie 已复制到剪贴板！请在上方配置服务地址以启用一键入库。', 'ok');
+        showToast('✓ Đã sao chép Cookie vào Clipboard! Hãy nhập địa chỉ máy chủ để đồng bộ tự động.', 'ok');
         return;
       }
 
-      if (btnEl) btnEl.innerHTML = '<span style="opacity:0.8">🚀 推送至服务…</span>';
+      if (btnEl) btnEl.innerHTML = '<span style="opacity:0.8">🚀 Đang gửi tới Studio…</span>';
 
       const headers = { 'Content-Type': 'application/json' };
       if (key) {
@@ -168,41 +162,42 @@
             GM_xmlhttpRequest({
               method: 'POST',
               url: base + '/admin/accounts',
-              headers: headers,
+              headers,
               data: payload,
-              onload: (res) => resolve({ ok: res.status >= 200 && res.status < 300, status: res.status, text: () => Promise.resolve(res.responseText) }),
-              onerror: reject,
-              ontimeout: reject,
+              onload: (res) => resolve(res),
+              onerror: (err) => reject(err),
+              ontimeout: () => reject(new Error('Hết thời gian chờ kết nối máy chủ')),
             });
           });
         }
-        return fetch(base + '/admin/accounts', { method: 'POST', headers, body: payload });
+        return fetch(base + '/admin/accounts', { method: 'POST', headers, body: payload })
+          .then(async (r) => ({ status: r.status, responseText: await r.text() }));
       };
 
-      const r = await doFetch();
-      const txt = await r.text();
-      let data = {};
-      try { data = JSON.parse(txt); } catch (_) {}
+      const res = await doFetch();
 
-      if (r.status === 401) {
-        showToast('推送失败：API Key 错误 (401)', 'err');
-        return;
+      if (res.status === 200 || res.status === 201) {
+        let respData = {};
+        try { respData = JSON.parse(res.responseText); } catch (_) {}
+        const warn = respData.warning ? ` (Lưu ý: ${respData.warning})` : '';
+        showToast(`✓ Đã nạp tài khoản vào MuseAI Studio thành công!${warn}`, 'ok');
+        updateStatusBadge();
+      } else if (res.status === 401) {
+        showToast('Mã bảo mật (API Key) không đúng! Vui lòng kiểm tra lại.', 'err');
+      } else {
+        let errDesc = `Lỗi HTTP ${res.status}`;
+        try {
+          const j = JSON.parse(res.responseText);
+          errDesc = j.detail || j.message || errDesc;
+        } catch (_) {}
+        showToast(`Đồng bộ thất bại: ${errDesc}`, 'err');
       }
-      if (!r.ok) {
-        showToast(`推送失败 (HTTP ${r.status})：${txt.slice(0, 80)}。已复制 Cookie 到剪贴板！`, 'err');
-        return;
-      }
-
-      const a = (data.added && data.added[0]) || {};
-      const expDate = a.expires_at ? new Date(a.expires_at * 1000).toLocaleDateString() : '有效';
-      showToast(`✓ 账号成功导入 muse2api！\nID: ${a.id || '?'}\n有效期至: ${expDate}`, 'ok');
-      updateStatusBadge();
     } catch (e) {
-      showToast(`请求异常：${e.message || e}。已自动复制 Cookie 到剪贴板！`, 'err');
+      showToast(`Lỗi kết nối: ${e.message || e}. Đã sao chép Cookie vào bộ nhớ đệm!`, 'err');
     } finally {
       if (btnEl) {
         btnEl.disabled = false;
-        btnEl.innerHTML = '⚡ 一键推送至账号池';
+        btnEl.innerHTML = '⚡ Đồng Bộ Vào MuseAI Studio';
       }
     }
   }
@@ -213,10 +208,10 @@
     const st = await checkSessionStatus();
     if (st.hasCore) {
       badge.style.color = '#22c55e';
-      badge.textContent = `✓ 登录态完整 (${st.count} 项)`;
+      badge.textContent = `✓ Đã sẵn sàng (${st.count} cookie)`;
     } else {
       badge.style.color = '#f59e0b';
-      badge.textContent = `⚠ 登录态未就绪`;
+      badge.textContent = `⚠ Chưa sẵn sàng`;
     }
   }
 
@@ -245,33 +240,33 @@
                   box-shadow:0 20px 50px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(96, 165, 250, 0.25);
                   backdrop-filter:blur(16px); font-size:13px; line-height:1.4;">
         
-        <!-- 头部 -->
+        <!-- Tiêu đề -->
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; padding-bottom:10px; border-bottom:1px solid #1e293b;">
           <div style="display:flex; align-items:center; gap:8px;">
             <span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#38bdf8; box-shadow:0 0 10px #38bdf8;"></span>
-            <b style="font-size:15px; color:#f1f5f9; letter-spacing:0.3px;">muse2api 导入面板</b>
+            <b style="font-size:15px; color:#f1f5f9; letter-spacing:0.3px;">MuseAI Studio - Đồng Bộ Cookie</b>
             <span style="font-size:11px; background:#1e293b; color:#94a3b8; padding:1px 6px; border-radius:6px;">v1.1</span>
           </div>
           <button id="muse-close-btn" style="background:transparent; border:none; color:#64748b; font-size:18px; cursor:pointer; padding:0 4px; line-height:1;">✕</button>
         </div>
 
-        <!-- 状态指示栏 -->
+        <!-- Trạng thái phiên -->
         <div style="background:#0f172a; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
-          <span style="font-size:12px; color:#94a3b8;">当前网页会话</span>
-          <span id="muse-status-tag" style="font-size:12px; font-weight:600; color:#94a3b8;">检测中…</span>
+          <span style="font-size:12px; color:#94a3b8;">Phiên đăng nhập hiện tại</span>
+          <span id="muse-status-tag" style="font-size:12px; font-weight:600; color:#94a3b8;">Đang kiểm tra…</span>
         </div>
 
-        <!-- 表单配置项（直接内嵌输入框，自动记忆） -->
+        <!-- Cấu hình nhập liệu -->
         <div style="margin-bottom:12px;">
-          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">服务地址 (Base URL)</div>
-          <input id="muse-cfg-base" type="text" placeholder="如 https://muse.yourdomain.com 或 http://localhost:18610"
-                 value="${cfg.base || ''}"
+          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">Địa chỉ máy chủ (Base URL)</div>
+          <input id="muse-cfg-base" type="text" placeholder="http://127.0.0.1:18610"
+                 value="${cfg.base || 'http://127.0.0.1:18610'}"
                  style="width:100%; box-sizing:border-box; padding:8px 11px; background:#0b1120; border:1px solid #334155;
                         border-radius:8px; color:#f1f5f9; font-size:12px; font-family:monospace; outline:none; transition:border-color 0.2s;">
         </div>
 
         <div style="margin-bottom:12px;">
-          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">API Key（若服务未开鉴权可留空）</div>
+          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">API Key bảo mật</div>
           <input id="muse-cfg-key" type="password" placeholder="m2a_..."
                  value="${cfg.key || ''}"
                  style="width:100%; box-sizing:border-box; padding:8px 11px; background:#0b1120; border:1px solid #334155;
@@ -279,38 +274,38 @@
         </div>
 
         <div style="margin-bottom:16px;">
-          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">账号标签 (可选显示名称)</div>
-          <input id="muse-cfg-label" type="text" placeholder="如 acc-01（留空自动生成）"
+          <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">Tên tài khoản (Ghi chú tùy chọn)</div>
+          <input id="muse-cfg-label" type="text" placeholder="Ví dụ: Tài khoản 1"
                  value="${cfg.label || ''}"
                  style="width:100%; box-sizing:border-box; padding:8px 11px; background:#0b1120; border:1px solid #334155;
                         border-radius:8px; color:#f1f5f9; font-size:12px; outline:none;">
         </div>
 
-        <!-- 动作操作区 -->
+        <!-- Các nút thao tác -->
         <div style="display:flex; flex-direction:column; gap:8px;">
           <button id="muse-action-push" style="width:100%; padding:10px 0; border:none; border-radius:10px;
                   background:linear-gradient(135deg, #0284c7, #2563eb); color:#fff;
                   font-weight:600; font-size:13px; cursor:pointer; box-shadow:0 4px 14px rgba(37, 99, 235, 0.4);
                   transition:all 0.2s;">
-            ⚡ 一键推送至账号池
+            ⚡ Đồng Bộ Vào MuseAI Studio
           </button>
 
           <div style="display:flex; gap:8px;">
             <button id="muse-action-copy" style="flex:1; padding:7px 0; border:1px solid #334155; border-radius:8px;
                     background:#0f172a; color:#cbd5e1; font-size:12px; cursor:pointer; transition:all 0.2s;">
-              📋 仅复制 Cookie
+              📋 Sao Chép Cookie
             </button>
             <button id="muse-action-save" style="flex:1; padding:7px 0; border:1px solid #334155; border-radius:8px;
                     background:#0f172a; color:#cbd5e1; font-size:12px; cursor:pointer; transition:all 0.2s;">
-              💾 保存配置
+              💾 Lưu Cấu Hình
             </button>
           </div>
         </div>
 
-        <!-- 底部提示 -->
+        <!-- Chân bảng điều khiển -->
         <div style="margin-top:14px; padding-top:10px; border-top:1px solid #1e293b; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#64748b;">
-          <span>配置将自动保存于浏览器本地</span>
-          <span>按 Esc 或右上角关闭</span>
+          <span>Cấu hình tự động lưu trên trình duyệt</span>
+          <span>Nhấn Esc hoặc dấu ✕ để đóng</span>
         </div>
       </div>
     `;
@@ -318,7 +313,6 @@
     document.body.appendChild(panel);
     updateStatusBadge();
 
-    // 绑定事件与自动保存
     const baseIn = document.getElementById('muse-cfg-base');
     const keyIn = document.getElementById('muse-cfg-key');
     const labelIn = document.getElementById('muse-cfg-label');
@@ -340,7 +334,7 @@
     document.getElementById('muse-close-btn').onclick = () => panel.remove();
     document.getElementById('muse-action-save').onclick = () => {
       saveInputs();
-      showToast('✓ 配置已保存！', 'ok');
+      showToast('✓ Cấu hình đã được lưu!', 'ok');
     };
 
     document.getElementById('muse-action-copy').onclick = async () => {
@@ -348,9 +342,9 @@
       const str = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ');
       if (str) {
         if (typeof GM_setClipboard === 'function') GM_setClipboard(str);
-        showToast('✓ 完整 Cookie 已复制到剪贴板！', 'ok');
+        showToast('✓ Đã sao chép toàn bộ Cookie vào Clipboard!', 'ok');
       } else {
-        showToast('未检测到任何 Cookie！', 'err');
+        showToast('Chưa phát hiện được Cookie nào!', 'err');
       }
     };
 
@@ -370,7 +364,7 @@
                   color:#fff; display:flex; align-items:center; justify-content:center;
                   cursor:pointer; box-shadow:0 8px 24px rgba(37, 99, 235, 0.45); font-size:18px;
                   user-select:none; transition:transform 0.2s, box-shadow 0.2s;"
-           title="点击展开 muse2api 导入面板"
+           title="Nhấn để mở bảng nhập Cookie MuseAI"
            onmouseover="this.style.transform='scale(1.08)'"
            onmouseout="this.style.transform='scale(1)'">
         ⚡
@@ -381,8 +375,8 @@
   }
 
   if (typeof GM_registerMenuCommand === 'function') {
-    GM_registerMenuCommand('🚀 打开 muse2api 导入面板', togglePanel);
-    GM_registerMenuCommand('⚡ 直接一键推送当前账号', () => executePush());
+    GM_registerMenuCommand('🚀 Mở bảng nhập Cookie MuseAI', togglePanel);
+    GM_registerMenuCommand('⚡ Đồng bộ ngay tài khoản hiện tại', () => executePush());
   }
 
   if (document.readyState === 'loading') {

@@ -1,15 +1,14 @@
-/* Muse2API Cookie 导入 —— 读取 muse.ai 的 cookie 并 POST 到 muse2api 服务。
+/* MuseAI Cookie Importer —— Trích xuất cookie từ muse.ai và đồng bộ về máy chủ MuseAI Studio.
  *
- * 关键点：用 chrome.cookies 而不是 document.cookie。
- * muse.ai 的 4 条核心 cookie（hatch_sess / hatch_gw / hatch_vml /
- * hatch_native_auth_device）都带 httpOnly，网页 JS 读不到，
- * 只有浏览器扩展的 cookies 接口能拿到。
+ * Sử dụng chrome.cookies API của trình duyệt để đọc được toàn bộ
+ * 4 cookie xác thực cốt lõi có cờ HttpOnly:
+ * (hatch_sess / hatch_gw / hatch_vml / hatch_native_auth_device).
  */
 
 const $ = (id) => document.getElementById(id);
 const STORE = 'muse2api_ext_cfg';
 
-const ESSENTIAL = ['hatch_sess', 'hatch_gw', 'hatch_vml', 'hatch_native_auth_device'];
+const AUTH_COOKIE = 'hatch_sess';
 
 function log(html, cls) {
   const el = $('log');
@@ -17,33 +16,41 @@ function log(html, cls) {
   el.innerHTML = cls ? `<span class="${cls}">${html}</span>` : html;
 }
 
-/* 规范化服务地址：去掉结尾斜杠和 /v1 后缀 */
+/* Chuẩn hóa địa chỉ máy chủ: loại bỏ dấu gạch chéo cuối và /v1 */
 function normBase(v) {
   let s = (v || '').trim();
   if (!s) return '';
-  if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+  if (!/^https?:\/\//i.test(s)) {
+    s = (/^(127\.|100\.|10\.|192\.168\.|localhost)/i.test(s) ? 'http://' : 'https://') + s;
+  }
   s = s.replace(/\/+$/, '');
   s = s.replace(/\/v1$/i, '');
   return s;
 }
 
+const DEFAULT_KEY = ''; // Không có key mặc định: dán key trong file .env (MUSE2API_KEY) của server
+const DEFAULT_BASE = 'http://127.0.0.1:18610';
+
 async function loadCfg() {
   const o = await chrome.storage.local.get(STORE);
   const c = o[STORE] || {};
-  if (c.base) $('base').value = c.base;
-  if (c.key) $('key').value = c.key;
+  $('base').value = c.base || DEFAULT_BASE;
+  $('key').value = c.key || DEFAULT_KEY;
   if (c.label) $('label').value = c.label;
-  // 没有配置过就尝试从当前标签页猜一个（用户在管理页上时）
+  
+  // Tự động nhận diện cấu hình nếu người dùng đang mở trang Studio hoặc Admin
   if (!c.base) {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const u = tab && tab.url ? new URL(tab.url) : null;
-      if (u && /\/admin/.test(u.pathname)) {
+      if (u && (/\/admin/.test(u.pathname) || /\/studio/.test(u.pathname) || u.port === '18610')) {
         $('base').value = u.origin;
         const k = new URLSearchParams(u.search).get('key');
         if (k) $('key').value = k;
       }
-    } catch (e) { /* 忽略 */ }
+    } catch (e) {
+      $('base').value = DEFAULT_BASE;
+    }
   }
 }
 
@@ -74,27 +81,30 @@ async function run() {
   const key = $('key').value.trim();
   const label = $('label').value.trim();
 
-  if (!base) return log('请先填服务地址', 'bad');
-  if (!key) return log('请先填 API Key', 'bad');
+  if (!base) return log('Vui lòng điền địa chỉ máy chủ (Base URL)', 'bad');
+  if (!key) return log('Vui lòng điền API Key bảo mật', 'bad');
 
   $('go').disabled = true;
-  log('正在读取 muse.ai 的 Cookie…');
+  log('Đang trích xuất Cookie từ muse.ai…');
 
   try {
     const { cookies, expires } = await grabCookies();
     const names = Object.keys(cookies);
     if (!names.length) {
-      return log('没读到 muse.ai 的 Cookie。\n请先在这个浏览器里打开并登录 '
-                 + 'https://muse.ai/ ，再回来点一次。', 'bad');
+      return log('Không tìm thấy Cookie của muse.ai.\n'
+                 + 'Vui lòng mở tab mới và đăng nhập https://muse.ai/ trên trình duyệt này trước khi thực hiện.', 'bad');
     }
-    const missing = ESSENTIAL.filter((n) => !(n in cookies));
-    if (missing.length) {
-      log(`读到 ${names.length} 条 Cookie，但缺核心项：${missing.join('、')}\n`
-          + '说明这个浏览器还没登录成功。请登录到能看到聊天界面再试。', 'warn');
-      return;
+    if (!cookies[AUTH_COOKIE]) {
+      return log('Chưa tìm thấy Cookie phiên đăng nhập (hatch_sess).\n'
+                 + 'Vui lòng mở tab https://muse.ai/ và đăng nhập tài khoản trước khi nhập.', 'bad');
     }
 
-    log(`读到 ${names.length} 条 Cookie，正在上传到 ${base} …`);
+    let warningNotice = '';
+    if (!cookies['hatch_vml']) {
+      warningNotice = '\n⚠️ Lưu ý: Tài khoản chưa có hatch_vml (tài khoản mới đang ở bước hỏi tên "What\'s your name?"). Hãy bấm nút [Continue] trên tab Muse.ai để kích hoạt đầy đủ.';
+    }
+
+    log(`Đã đọc ${names.length} cookie hợp lệ. Đang đồng bộ tới máy chủ ${base} …`);
 
     const r = await fetch(base + '/admin/accounts', {
       method: 'POST',
@@ -110,25 +120,29 @@ async function run() {
     try { data = JSON.parse(text); } catch (e) { data = { raw: text }; }
 
     if (r.status === 401) {
-      return log('API Key 不对（服务返回 401）。\n'
-                 + '请到管理页「账号池」页顶部复制正确的 API Key。', 'bad');
+      return log('API Key không hợp lệ (Máy chủ trả về 401).\n'
+                 + 'Vui lòng mở ứng dụng MuseAI Studio -> Tab Cài đặt để sao chép API Key chuẩn.', 'bad');
     }
     if (!r.ok) {
-      return log(`导入失败：HTTP ${r.status}\n${text.slice(0, 300)}`, 'bad');
+      return log(`Đồng bộ thất bại: Mã lỗi HTTP ${r.status}\n${text.slice(0, 300)}`, 'bad');
     }
 
     const a = (data.added && data.added[0]) || {};
     await saveCfg();
-    log(`✓ 导入成功\n账号标签：${a.label || label || '(自动)'}\n`
-        + `账号 ID：${a.id || '?'}\nCookie 条数：${a.cookie_count || names.length}\n`
-        + `有效期到：${a.expires_at ? new Date(a.expires_at * 1000).toLocaleString() : '未知'}\n`
-        + (data.warning ? `\n注意：${data.warning}` : ''), 'ok');
+    const expText = a.expires_at ? new Date(a.expires_at * 1000).toLocaleString('vi-VN') : 'Tự động tính toán (~48h)';
+    log(`✓ ĐỒNG BỘ THÀNH CÔNG!\n`
+        + `Tên tài khoản: ${a.label || label || '(Mặc định)'}\n`
+        + `Mã tài khoản (ID): ${a.id || '?'}\n`
+        + `Số lượng Cookie: ${a.cookie_count || names.length} cookies\n`
+        + `Hạn phiên làm việc: ${expText}\n`
+        + warningNotice
+        + (data.warning ? `\nLưu ý máy chủ: ${data.warning}` : ''), 'ok');
   } catch (e) {
-    log('出错了：' + (e && e.message ? e.message : String(e))
-        + '\n\n常见原因：\n'
-        + '· 服务地址填错或服务没启动\n'
-        + '· 这个地址不是 https（或证书不被信任）\n'
-        + '· 浏览器拦截了跨域请求', 'bad');
+    log('Đã xảy ra lỗi: ' + (e && e.message ? e.message : String(e))
+        + '\n\nCác nguyên nhân phổ biến:\n'
+        + '• Địa chỉ máy chủ điền sai hoặc ứng dụng MuseAI chưa được mở\n'
+        + '• Máy chủ chưa bật hoặc cổng 18610 bị chặn tường lửa\n'
+        + '• Trình duyệt chặn kết nối tới địa chỉ máy chủ nội bộ', 'bad');
   } finally {
     $('go').disabled = false;
   }
