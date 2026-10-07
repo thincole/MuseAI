@@ -56,6 +56,10 @@ data/shopee_clip_cache.json
 data/shopee_blacklist.json
 data/tmp*
 
+# Developer Admin Scripts (chỉ giữ trên máy chính, không đưa lên GitHub)
+upload-github.bat
+tools/upload_github.py
+
 # Logs & Backups
 log.txt
 *.log
