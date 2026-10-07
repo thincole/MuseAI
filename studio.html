@@ -1645,9 +1645,13 @@
           </div>
 
           <!-- Row 3: Buttons -->
-          <div class="shopee-row" style="margin-top:10px;">
+          <div class="shopee-row" style="margin-top:10px;flex-wrap:wrap;gap:8px;">
             <button type="button" class="shopee-btn shopee-btn-blue" id="btnClaimShopee" onclick="claimShopeeProducts()">
               📥 Nhận SP
+            </button>
+
+            <button type="button" class="shopee-btn" id="btnImportLinks" style="background:#ea580c;color:white;border:1px solid #f97316;font-weight:700;" onclick="openImportLinksModal()" title="Nhập danh sách link Shopee từ file .txt hoặc dán trực tiếp để tạo video">
+              🔗 Import URL (TXT)
             </button>
 
             <button type="button" class="shopee-btn shopee-btn-red" onclick="releaseStuckShopeeJobs()">
@@ -1660,6 +1664,10 @@
 
             <button type="button" class="shopee-btn" style="background:#475569;color:white;border:1px solid #64748b;" onclick="openBlacklistModal()" title="Cài đặt từ khóa và danh sách Item ID bị chặn">
               🚫 Quản Lý Blacklist
+            </button>
+
+            <button type="button" class="shopee-btn" style="background:#1e293b;color:#94a3b8;border:1px solid #334155;" onclick="clearShopeeProductsList()" title="Xóa toàn bộ sản phẩm trong hàng đợi hiện tại">
+              🗑 Xóa DS
             </button>
           </div>
         </div>
@@ -1796,6 +1804,71 @@
       <div style="display:flex;gap:10px;">
         <button class="btn-action primary" onclick="saveBlacklistData()" style="background:#ef4444;border-color:#f87171;">💾 Lưu Blacklist</button>
         <button class="btn-action" onclick="closeBlacklistModal()">Đóng</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Import Shopee Links Modal -->
+<div class="modal-overlay" id="importLinksModal" onclick="closeImportLinksModal(event)">
+  <div class="modal-content" onclick="event.stopPropagation()" style="max-width: 680px;">
+    <div style="padding:14px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);">
+      <div style="font-weight:700;font-size:16px;color:#fb923c;display:flex;align-items:center;gap:8px;">
+        <span>🔗</span> Import Link Shopee (TXT) — Tự Động Tải Ảnh & Tên SP
+      </div>
+      <button onclick="closeImportLinksModal()" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;">✕</button>
+    </div>
+    
+    <div style="padding:20px;display:flex;flex-direction:column;gap:14px;max-height:75vh;overflow-y:auto;">
+      <div style="font-size:12.5px;color:var(--text-muted);line-height:1.5;background:rgba(234,88,12,0.1);border:1px solid rgba(234,88,12,0.3);padding:10px 14px;border-radius:8px;">
+        Hệ thống sẽ đọc toàn bộ link sản phẩm Shopee từ file <b>.TXT</b> hoặc văn bản dán bên dưới. Tự động bóc tách <b>ItemID</b>, cào <b>tiêu đề</b> và <b>tải ảnh gốc HD</b> từ Shopee CDN để tạo video hàng loạt.
+      </div>
+
+      <!-- File picker button & file info -->
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+        <button type="button" class="shopee-btn" style="background:#ea580c;color:white;font-weight:700;border:1px solid #f97316;padding:8px 16px;cursor:pointer;" onclick="handlePickShopeeTxtFile()">
+          📂 Chọn File .TXT Từ Máy Tính
+        </button>
+        <input type="file" id="spTxtFileInput" accept=".txt" style="display:none;" onchange="onBrowserTxtFileSelected(event)">
+        <span id="importFileStatus" style="font-size:12px;color:#38bdf8;font-weight:600;"></span>
+      </div>
+
+      <!-- Textarea for direct link pasting or file preview -->
+      <div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <label style="font-size:12px;font-weight:700;color:#cbd5e1;">
+            Danh sách Link Shopee (Mỗi dòng 1 link Shopee hoặc link rút gọn shp.ee):
+          </label>
+          <span id="importLinksCountHint" style="font-size:11.5px;color:#94a3b8;font-weight:600;">0 link</span>
+        </div>
+        <textarea id="importLinksTextarea" rows="8" style="width:100%;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:8px;color:#fff;padding:10px 12px;font-family:monospace;font-size:12px;line-height:1.6;resize:vertical;" placeholder="https://shopee.vn/product/123456/789101112&#10;https://shopee.ph/T-Shirt-Korean-Style-i.123456.789101112&#10;https://vn.shp.ee/abcdef" oninput="updateImportLinksCount()"></textarea>
+      </div>
+
+      <!-- Import Options -->
+      <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;background:rgba(255,255,255,0.03);padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);">
+        <label class="shopee-chk" style="font-weight:600;color:#f1f5f9;" title="Tự động kết nối Shopee tải trước tiêu đề và ảnh gốc HD để hiển thị sẵn trong danh sách">
+          <input type="checkbox" id="import_prefetch" checked>
+          <span>Tải trước thông tin SP & Ảnh đại diện (Khuyên dùng)</span>
+        </label>
+
+        <label class="shopee-chk" style="font-weight:600;color:#f1f5f9;" title="Thêm tiếp vào danh sách hiện có thay vì xóa sạch">
+          <input type="checkbox" id="import_append" checked>
+          <span>Giữ lại các SP hiện có (Nạp thêm)</span>
+        </label>
+      </div>
+
+      <div id="importProgressBox" style="display:none;background:rgba(56,189,248,0.1);border:1px solid rgba(56,189,248,0.3);padding:10px 14px;border-radius:8px;color:#38bdf8;font-size:12.5px;">
+        <span id="importProgressText">⏳ Đang phân tích và cào dữ liệu từ Shopee...</span>
+      </div>
+    </div>
+
+    <div style="padding:14px 20px;display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--border);background:rgba(0,0,0,0.2);">
+      <span style="font-size:11.5px;color:var(--text-dim);">Hỗ trợ mọi link Shopee VN, PH, TH, ID, MY, SG, TW, Shp.ee</span>
+      <div style="display:flex;gap:10px;">
+        <button class="btn-action primary" id="btnSubmitImportLinks" onclick="submitImportLinks()" style="background:#ea580c;border-color:#f97316;font-weight:700;">
+          📥 Nạp Vào Danh Sách
+        </button>
+        <button class="btn-action" onclick="closeImportLinksModal()">Đóng</button>
       </div>
     </div>
   </div>
@@ -2818,22 +2891,22 @@
 
   function updateShopeeSpeedLabel() {
     const now = Date.now();
-    shopeeCompletionTimes = shopeeCompletionTimes.filter(t => (now - t) <= 300000);
+    // 10 phút gần nhất = 600.000 ms
+    const windowMs = 600000;
+    shopeeCompletionTimes = shopeeCompletionTimes.filter(t => (now - t) <= windowMs);
     const speedEl = document.getElementById("shopeeSpeedText");
     if (!speedEl) return;
     if (shopeeCompletionTimes.length === 0) {
       speedEl.innerText = "⚡ 0.0 video/phút";
       return;
     }
-    if (shopeeCompletionTimes.length === 1) {
-      const elapsedMin = Math.max((now - shopeeBatchStartTime) / 60000, 0.2);
-      const rate = (1 / elapsedMin).toFixed(1);
-      speedEl.innerText = `⚡ ${rate} video/phút`;
-      return;
-    }
-    const windowDurationSec = (now - shopeeCompletionTimes[0]) / 1000;
-    const minutes = Math.max(windowDurationSec / 60, 0.2);
-    const rate = (shopeeCompletionTimes.length / minutes).toFixed(1);
+
+    // Thời gian trôi qua thực tế trong cửa sổ 10 phút (tối đa 10 phút, tối thiểu 0.2 phút)
+    const elapsedSinceStartMin = Math.max((now - shopeeBatchStartTime) / 60000, 0.2);
+    const effectiveWindowMin = Math.min(elapsedSinceStartMin, 10.0);
+
+    // Trung bình số video tạo ra trong 1 phút của 10 phút gần nhất
+    const rate = (shopeeCompletionTimes.length / effectiveWindowMin).toFixed(1);
     speedEl.innerText = `⚡ ${rate} video/phút`;
   }
 
@@ -2896,7 +2969,7 @@
     const consoleEl = document.getElementById("shopeeProductsConsole");
     const countEl = document.getElementById("shopeeProductCount");
     if (!shopeeClaimedProducts || shopeeClaimedProducts.length === 0) {
-      consoleEl.innerHTML = "Chưa có sản phẩm nào. Bấm [📥 Nhận SP] để nhận lô sản phẩm từ Database!";
+      consoleEl.innerHTML = "Chưa có sản phẩm nào. Bấm [📥 Nhận SP] từ Database hoặc [🔗 Import URL (TXT)] từ file link để tạo video!";
       countEl.innerText = "0 SP";
       return;
     }
@@ -2909,7 +2982,8 @@
       const sold = p.historical_sold ?? p.sold ?? 0;
       const comm = p.commission_rate ? (p.commission_rate * 100).toFixed(0) : (p.commission ?? "0");
       const price = p.price_min ?? p.price ?? 0;
-      const line = `${statusIcon} [${idx + 1}] ID: ${p.item_id} | ${p.name || ''} | ${sym}${price} | Sold: ${sold} | Comm: ${comm}%`;
+      const isImportedBadge = p._is_imported ? `<span style="background:rgba(234,88,12,0.25);color:#fb923c;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(234,88,12,0.4);margin-right:4px;">TXT</span>` : '';
+      const line = `${statusIcon} [${idx + 1}] ${isImportedBadge}ID: ${p.item_id} | ${p.name || ''} | ${sym}${price} | Sold: ${sold} | Comm: ${comm}%`;
       return `<div style="margin-bottom:3px;${p._status === 'completed' ? 'color:#34d399;' : (p._status === 'failed' ? 'color:#f87171;' : '')}">${line}</div>`;
     }).join("");
   }
@@ -3097,6 +3171,33 @@
 
   async function renderShopeeProductItem(prod, idx, form, outDir, workerId) {
     appendShopeeLog(`----------------------------------------`);
+
+    // 0. Nếu là sản phẩm import từ TXT mà chưa có ảnh hoặc tên (chưa cào trước)
+    if (prod._need_fetch || (!prod.image && prod.url)) {
+      appendShopeeLog(`> [Luồng ${workerId}] Đang cào thông tin & ảnh từ Shopee URL: ${prod.url}...`);
+      try {
+        const fetchRes = await fetch("/api/shopee/fetch-single-link", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({ url: prod.url })
+        });
+        if (fetchRes.ok) {
+          const fd = await fetchRes.json();
+          if (fd.product) {
+            prod.name = fd.product.name || prod.name;
+            prod.image = fd.product.image || prod.image;
+            prod.images = fd.product.images || (prod.image ? [prod.image] : []);
+            prod.item_id = fd.product.item_id || prod.item_id;
+            delete prod._need_fetch;
+            renderShopeeProductsConsole();
+            appendShopeeLog(`✓ [Luồng ${workerId}] Lấy dữ liệu thành công: "${prod.name}" (ID: ${prod.item_id})`);
+          }
+        }
+      } catch (fe) {
+        appendShopeeLog(`⚠️ [Luồng ${workerId}] Lỗi cào dữ liệu Shopee: ${fe.message}`);
+      }
+    }
+
     appendShopeeLog(`[Luồng ${workerId}] [${idx + 1}/${shopeeClaimedProducts.length}] Bắt đầu xử lý SP ${prod.item_id}: ${prod.name || ''}...`);
 
     let refImageDataUrl = null;
@@ -3286,16 +3387,20 @@
       appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video vào: ${finalSavedPath}`);
     }
 
-    await fetch("/api/shopee/complete", {
-      method: "POST",
-      headers: getHeaders(),
-      body: JSON.stringify({
-        item_id: prod.item_id,
-        status: "completed",
-        video_path: finalSavedPath
-      })
-    });
-    appendShopeeLog(`✓ [Luồng ${workerId}] Đã báo cáo hoàn tất Job ID: ${prod.item_id} về Database Shopee.`);
+    if (!prod._is_imported) {
+      await fetch("/api/shopee/complete", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({
+          item_id: prod.item_id,
+          status: "completed",
+          video_path: finalSavedPath
+        })
+      });
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã báo cáo hoàn tất Job ID: ${prod.item_id} về Database Shopee.`);
+    } else {
+      appendShopeeLog(`✓ [Luồng ${workerId}] Hoàn tất xuất video cho Link Shopee: ${prod.item_id} (Lưu tại: ${finalSavedPath})`);
+    }
   }
 
   async function startShopeeBatch() {
@@ -3421,13 +3526,15 @@
             } catch (_) {}
           }
 
-          try {
-            await fetch("/api/shopee/complete", {
-              method: "POST",
-              headers: getHeaders(),
-              body: JSON.stringify({ item_id: prod.item_id, status: "failed" })
-            });
-          } catch (_) {}
+          if (!prod._is_imported) {
+            try {
+              await fetch("/api/shopee/complete", {
+                method: "POST",
+                headers: getHeaders(),
+                body: JSON.stringify({ item_id: prod.item_id, status: "failed" })
+              });
+            } catch (_) {}
+          }
         }
         renderShopeeProductsConsole();
         updateProgressText();
@@ -3556,6 +3663,137 @@
     } catch (e) {
       showToast(`Lỗi lưu Blacklist: ${e.message}`, "danger");
     }
+  }
+
+  // ==================== IMPORT LINKS (TXT) ====================
+  function openImportLinksModal() {
+    const modal = document.getElementById("importLinksModal");
+    if (!modal) return;
+    modal.classList.add("active");
+    updateImportLinksCount();
+  }
+
+  function closeImportLinksModal(e) {
+    if (e && e.target !== e.currentTarget) return;
+    const modal = document.getElementById("importLinksModal");
+    if (modal) modal.classList.remove("active");
+  }
+
+  async function handlePickShopeeTxtFile() {
+    const statusEl = document.getElementById("importFileStatus");
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_text_file_dialog) {
+      try {
+        const res = await window.pywebview.api.pick_text_file_dialog("Chọn file TXT chứa link Shopee");
+        if (res && res.success && res.content) {
+          document.getElementById("importLinksTextarea").value = res.content;
+          if (statusEl) statusEl.innerText = `✓ Đã nạp file: ${res.name || 'file.txt'}`;
+          updateImportLinksCount();
+          return;
+        }
+      } catch (err) {
+        console.warn("pick_text_file_dialog error:", err);
+      }
+    }
+    const fi = document.getElementById("spTxtFileInput");
+    if (fi) {
+      fi.value = "";
+      fi.click();
+    }
+  }
+
+  function onBrowserTxtFileSelected(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const statusEl = document.getElementById("importFileStatus");
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+      const text = evt.target.result;
+      document.getElementById("importLinksTextarea").value = text;
+      if (statusEl) statusEl.innerText = `✓ Đã đọc: ${file.name}`;
+      updateImportLinksCount();
+    };
+    reader.readAsText(file);
+  }
+
+  function updateImportLinksCount() {
+    const ta = document.getElementById("importLinksTextarea");
+    const hint = document.getElementById("importLinksCountHint");
+    if (!ta || !hint) return;
+    const text = ta.value || "";
+    const lines = text.split("\n").map(s => s.trim()).filter(s => s && !s.startsWith("#") && !s.startsWith("//"));
+    hint.innerText = `${lines.length} link hợp lệ`;
+  }
+
+  async function submitImportLinks() {
+    const ta = document.getElementById("importLinksTextarea");
+    const text = (ta ? ta.value : "").trim();
+    if (!text) {
+      showToast("Vui lòng nhập hoặc chọn file chứa link Shopee!", "warning");
+      return;
+    }
+
+    const prefetch = document.getElementById("import_prefetch") ? document.getElementById("import_prefetch").checked : true;
+    const appendMode = document.getElementById("import_append") ? document.getElementById("import_append").checked : true;
+    
+    const progressBox = document.getElementById("importProgressBox");
+    const progressText = document.getElementById("importProgressText");
+    const btn = document.getElementById("btnSubmitImportLinks");
+
+    if (progressBox) progressBox.style.display = "block";
+    if (progressText) progressText.innerText = "⏳ Đang kết nối Shopee và cào dữ liệu ảnh + tên sản phẩm...";
+    if (btn) btn.disabled = true;
+
+    try {
+      const res = await fetch("/api/shopee/import-links", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({
+          content: text,
+          prefetch: prefetch
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || "Lỗi khi cào link");
+      }
+
+      const newProducts = data.products || [];
+      if (newProducts.length === 0) {
+        showToast("Không tìm thấy link Shopee hợp lệ nào.", "warning");
+        return;
+      }
+
+      if (appendMode) {
+        shopeeClaimedProducts = (shopeeClaimedProducts || []).concat(newProducts);
+      } else {
+        shopeeClaimedProducts = newProducts;
+      }
+
+      renderShopeeProductsConsole();
+      appendShopeeLog(`✓ Đã nạp thành công ${newProducts.length} link sản phẩm Shopee từ file TXT!`);
+      showToast(`Đã nạp ${newProducts.length} sản phẩm Shopee! Tổng: ${shopeeClaimedProducts.length} SP`, "success");
+      
+      closeImportLinksModal();
+    } catch (err) {
+      appendShopeeLog(`❌ Lỗi Import Link: ${err.message}`);
+      showToast(`Lỗi Import Link: ${err.message}`, "danger");
+    } finally {
+      if (progressBox) progressBox.style.display = "none";
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function clearShopeeProductsList() {
+    if (!shopeeClaimedProducts || shopeeClaimedProducts.length === 0) {
+      showToast("Danh sách sản phẩm hiện đang trống!", "info");
+      return;
+    }
+    if (!confirm(`Bạn có chắc muốn xóa sạch toàn bộ ${shopeeClaimedProducts.length} sản phẩm trong hàng đợi?`)) return;
+    shopeeClaimedProducts = [];
+    renderShopeeProductsConsole();
+    appendShopeeLog("🗑 Đã làm sạch toàn bộ danh sách sản phẩm trong hàng đợi.");
+    showToast("Đã xóa sạch danh sách sản phẩm!", "info");
   }
 
   // ==================== HOMEPROXY MANAGEMENT ====================

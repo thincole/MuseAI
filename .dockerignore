@@ -1,0 +1,27 @@
+# Dữ liệu runtime, bí mật và file không cần trong image server
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+data/
+chrome-profile/
+muse2api-profiles/
+__pycache__/
+*.py[cod]
+*.log
+log.txt*
+*.bak*
+*-MUSE.txt
+*MUSE*.txt
+*khoa*.txt
+muse*lỗi*.txt
+dongvanfb.html
+tests/
+*.bat
+*.vbs
+*.ico
+# Công cụ desktop (DrissionPage / PyQt6 / pywebview) không chạy trong container
+desktop_app.py
+gui_auto_login.py
+auto_login_muse.py

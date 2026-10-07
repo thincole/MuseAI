@@ -2120,6 +2120,84 @@ def complete_shopee_job(req: dict):
     return {"success": res}
 
 
+@app.post("/api/shopee/import-links")
+def import_shopee_links(req: dict):
+    """Nhập danh sách link Shopee từ nội dung file text hoặc mảng link."""
+    import shopee_scraper
+
+    content = req.get("content", "")
+    file_path = req.get("file_path", "")
+    raw_links = req.get("links", [])
+    prefetch = req.get("prefetch", True)
+
+    if file_path and os.path.isfile(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception as e:
+            raise HTTPException(400, f"Không đọc được tệp: {e}")
+
+    all_links: list[str] = []
+    if content:
+        all_links.extend(shopee_scraper.parse_shopee_links(content))
+    if raw_links:
+        for u in raw_links:
+            all_links.extend(shopee_scraper.parse_shopee_links(str(u)))
+
+    # Loại bỏ trùng lặp giữ nguyên thứ tự
+    seen = set()
+    unique_links: list[str] = []
+    for u in all_links:
+        if u not in seen:
+            seen.add(u)
+            unique_links.append(u)
+
+    if not unique_links:
+        return {
+            "success": False,
+            "message": "Không tìm thấy link Shopee hợp lệ nào trong nội dung nhập vào.",
+            "count": 0,
+            "products": []
+        }
+
+    if prefetch:
+        products = shopee_scraper.scrape_multiple_shopee_links(unique_links, max_workers=6)
+    else:
+        products = []
+        for link in unique_links:
+            _, iid = shopee_scraper.extract_ids_from_url(link)
+            products.append({
+                "item_id": iid or str(abs(hash(link)) % 10000000000),
+                "name": f"Shopee Link ({link[-25:]})",
+                "image": "",
+                "images": [],
+                "url": link,
+                "_status": "waiting",
+                "_need_fetch": True,
+                "_is_imported": True
+            })
+
+    return {
+        "success": True,
+        "count": len(products),
+        "products": products,
+        "message": f"Đã nạp thành công {len(products)} link sản phẩm Shopee."
+    }
+
+
+@app.post("/api/shopee/fetch-single-link")
+def fetch_single_shopee_link(req: dict):
+    """Cào thông tin tiêu đề, ảnh từ 1 link Shopee đơn lẻ."""
+    import shopee_scraper
+    url = (req.get("url") or "").strip()
+    if not url:
+        raise HTTPException(400, "Thiếu URL sản phẩm Shopee")
+    info = shopee_scraper.fetch_shopee_product(url)
+    if not info:
+        raise HTTPException(500, f"Không thể lấy thông tin sản phẩm từ Shopee URL: {url}")
+    return {"success": True, "product": info}
+
+
 def parse_shopee_lang_code(lang_val: str, market: str = "") -> str:
     s = str(lang_val or "").strip().lower()
     if "việt" in s or "viet" in s:

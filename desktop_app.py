@@ -127,6 +127,33 @@ class DesktopAPI:
             return {"success": False, "error": str(e)}
         return {"success": False}
 
+    def pick_text_file_dialog(self, title: str = "Chọn file TXT chứa link Shopee") -> dict:
+        """Mở hộp thoại chọn file text chuẩn Windows (Native OpenFileDialog)."""
+        if not self._window:
+            return {"success": False, "error": "Cửa sổ chưa sẵn sàng"}
+        try:
+            res = self._window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=(
+                    "Tệp văn bản (*.txt)",
+                    "Tất cả tệp (*.*)",
+                ),
+            )
+            if res and len(res) > 0:
+                file_path = res[0]
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                return {
+                    "success": True,
+                    "file_path": file_path,
+                    "name": os.path.basename(file_path),
+                    "content": content
+                }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        return {"success": False}
+
     def open_folder_path(self, folder_path: str) -> dict:
         """Mở thư mục bất kỳ trên Windows Explorer."""
         try:

@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import base64
 import collections
+import copy
+import ipaddress
 import json
 import logging
 import os
 import random
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -23,10 +26,35 @@ from config import CFG
 
 log = logging.getLogger("shopee_engine")
 
-# Concurrency Limiter: Chỉ cho phép tối đa 1 tiến trình FFmpeg ghép/render video chạy tại 1 thời điểm.
-# Các luồng worker khác sẽ xếp hàng tuần tự. Vì mỗi tác vụ ghép chỉ mất 0.3s - 1.5s,
-# việc xếp hàng này giúp tránh nghẽn I/O ổ đĩa, giải phóng 100% tình trạng quá tải CPU và loại bỏ hoàn toàn hiện tượng đơ máy.
-FFMPEG_LOCK = threading.Semaphore(1)
+
+def _ffmpeg_concurrency() -> int:
+    try:
+        n = int(os.environ.get("MUSE2API_FFMPEG_CONCURRENCY", "2").strip() or "2")
+    except (TypeError, ValueError):
+        n = 2
+    return max(1, min(n, 16))
+
+
+# Concurrency Limiter: giới hạn số tiến trình FFmpeg encode/ghép video chạy đồng thời
+# (mặc định 2, chỉnh qua biến môi trường MUSE2API_FFMPEG_CONCURRENCY).
+# Các luồng worker vượt quá giới hạn sẽ xếp hàng chờ. Tác vụ stream-copy thường chỉ mất <1-2s, nhưng
+# re-encode / ghép Outro có thể mất hàng chục giây (timeout tới 240s), nên KHÔNG dùng 1 khóa toàn cục
+# (sẽ chặn mọi job khác tới vài phút). Giới hạn nhỏ vẫn giúp tránh nghẽn I/O ổ đĩa và quá tải CPU
+# (kết hợp với độ ưu tiên tiến trình thấp + "-threads 2" bên dưới). ffprobe (nhẹ, <1s) chạy ngoài semaphore.
+FFMPEG_CONCURRENCY = _ffmpeg_concurrency()
+FFMPEG_SEMAPHORE = threading.BoundedSemaphore(FFMPEG_CONCURRENCY)
+FFMPEG_LOCK = FFMPEG_SEMAPHORE  # Giữ tên cũ để tương thích ngược (nếu module khác import).
+
+
+def _safe_remove(path: str | None) -> None:
+    """Xóa file (output dở dang / file tạm) nếu tồn tại, bỏ qua lỗi."""
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError as e:
+        log.debug("Không xóa được file %s: %s", path, e)
 
 
 def _run_ffmpeg_cmd(cmd: list[str], timeout: int = 180, check: bool = False, text: bool = False) -> subprocess.CompletedProcess:

@@ -13,3 +13,6 @@ pythonnet>=3.0.0
 # Auto-Login & Cookie Harvest Tools
 DrissionPage>=4.0.0
 PyQt6>=6.6.0
+
+# Shopee Scraper
+curl_cffi>=0.7.0

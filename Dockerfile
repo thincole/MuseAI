@@ -26,8 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制代码与必要目录
-COPY admin.html app.py cdp.py config.py engine.py store.py version.json ./
+# 复制代码与必要目录（.dockerignore 排除数据、密钥与桌面端工具）
+COPY *.py *.html version.json ./
 COPY deploy/ ./deploy/
 COPY extension/ ./extension/
 COPY tools/ ./tools/
