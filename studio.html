@@ -1329,6 +1329,9 @@
               Danh Sách Tài Khoản Trong Hệ Thống
             </div>
             <div style="display:flex;gap:8px;">
+              <button class="btn-header" id="btnToggleProxyModeAcc" onclick="toggleProxyMode()" style="background:rgba(59,130,246,0.15);border:1px solid #3b82f6;color:#60a5fa;" title="Bật hoặc Tắt Fake Proxy / HomeProxy">
+                🌐 Proxy: BẬT
+              </button>
               <button class="btn-header" onclick="syncThinAptmProxy()" style="background:rgba(59,130,246,0.15);border:1px solid #3b82f6;color:#60a5fa;" title="Tự động nạp danh sách HomeProxy từ E:\ThinAptm0707 và gán cố định cho từng tài khoản">
                 🌐 Nạp Proxy ThinAptm
               </button>
@@ -1440,7 +1443,10 @@
               <span>🛡️ BẢO VỆ TRÌNH DUYỆT &amp; CHỐNG PHÁT HIỆN BOT (HOMEPROXY + TTL LIFECYCLE)</span>
             </div>
             <div style="display:flex; gap:8px; align-items:center;">
-              <button type="button" class="shopee-btn" onclick="event.stopPropagation(); syncThinAptmProxy();" style="background:#2563eb; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;">
+              <button type="button" class="shopee-btn" id="btnToggleProxyMode" onclick="event.stopPropagation(); toggleProxyMode();" style="background:#2563eb; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;" title="Bấm để bật hoặc tắt Fake Proxy / HomeProxy">
+                🌐 Proxy: BẬT
+              </button>
+              <button type="button" class="shopee-btn" onclick="event.stopPropagation(); syncThinAptmProxy();" style="background:#0f766e; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;">
                 🌐 Nạp Proxy ThinAptm
               </button>
               <button type="button" class="shopee-btn" onclick="event.stopPropagation(); recycleBrowserSessions();" style="background:#475569; color:#f8fafc; font-size:11px; padding:4px 10px; font-weight:600;" title="Giải phóng RAM và tái sinh phiên trình duyệt sạch">
@@ -1469,7 +1475,13 @@
             </div>
 
             <div class="shopee-row" style="margin-bottom:0; flex-wrap:wrap; gap:8px; align-items:center;">
-              <span class="shopee-lbl">Thời gian sống TTL:</span>
+              <span class="shopee-lbl">Chế độ Mạng / Proxy:</span>
+              <select class="shopee-select" id="sp_proxy_mode" onchange="changeProxyMode(this.value)" style="font-weight:700; color:#38bdf8;">
+                <option value="enabled" selected>🌐 Bật HomeProxy (Fake IP)</option>
+                <option value="disabled">⚡ Không Fake IP (Chạy Trực Tiếp - Tốc độ cao)</option>
+              </select>
+
+              <span class="shopee-lbl" style="margin-left:8px;">Thời gian sống TTL:</span>
               <select class="shopee-select" id="sp_browser_ttl" onchange="changeBrowserTtl(this.value)">
                 <option value="900">15 phút (900s)</option>
                 <option value="1800" selected>30 phút (1800s - Khuyên dùng)</option>
@@ -1477,7 +1489,7 @@
                 <option value="7200">120 phút (7200s)</option>
               </select>
 
-              <span class="shopee-lbl" style="margin-left:8px;">Giới hạn Task trước khi Reset:</span>
+              <span class="shopee-lbl" style="margin-left:8px;">Giới hạn Task / Phiên:</span>
               <select class="shopee-select" id="sp_browser_max_tasks" onchange="changeBrowserMaxTasks(this.value)">
                 <option value="3">3 task / phiên</option>
                 <option value="5" selected>5 task / phiên (Khuyên dùng)</option>
@@ -1485,7 +1497,7 @@
               </select>
 
               <span style="font-size:11px; color:var(--text-dim); margin-left:6px;">
-                💡 Tự động hủy và tạo mới Browser Context sạch sẽ sau khi đạt hạn TTL, chống tràn RAM và tránh bị Muse phát hiện bot.
+                💡 Khi chạy nhiều luồng (20-30 luồng), chọn <b>Không Fake IP</b> giúp kết nối cực nhanh, không lo nghẽn/chết proxy.
               </span>
             </div>
           </div>
@@ -2871,6 +2883,7 @@
       }
       if (data.del_img !== undefined) document.getElementById("sp_del_img").checked = !!data.del_img;
       if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
+      onShopeeDurationChange();
       updateTempStitchButtonStatus();
     } catch (e) {
       console.warn("Lỗi tải cài đặt Shopee:", e);
@@ -3023,13 +3036,28 @@
   function onShopeeDurationChange() {
     const dur = document.getElementById("sp_duration").value;
     const promptSel = document.getElementById("sp_ai_prompt");
+    const ghepAnhEl = document.getElementById("sp_ghep_anh");
     if (dur === "16s") {
       promptSel.innerHTML = '<option value="Prompt A + B" selected>Prompt A + B</option>';
       promptSel.disabled = true;
       promptSel.title = "Độ dài 16s chỉ sử dụng kịch bản Prompt A + B (nối 2 clip)";
+      if (ghepAnhEl) {
+        ghepAnhEl.disabled = true;
+        if (ghepAnhEl.parentElement) {
+          ghepAnhEl.parentElement.title = "Video 16s được nối từ 2 clip A + B thành 16s đầy đủ (không ghép ảnh 12s)";
+          ghepAnhEl.parentElement.style.opacity = "0.5";
+        }
+      }
     } else {
       promptSel.disabled = false;
       promptSel.title = "";
+      if (ghepAnhEl) {
+        ghepAnhEl.disabled = false;
+        if (ghepAnhEl.parentElement) {
+          ghepAnhEl.parentElement.title = "Ghép ảnh sản phẩm làm Outro 12s";
+          ghepAnhEl.parentElement.style.opacity = "1";
+        }
+      }
       const cur = promptSel.value;
       promptSel.innerHTML = `
         <option value="Template (mặc định)">Template (mặc định)</option>
@@ -3450,27 +3478,28 @@
       finishedVideoFilename = concatData.filename;
       appendShopeeLog(`✓ [Luồng ${workerId}] Ghép video 16s từ 2 clip có sẵn thành công!`);
 
-      if (form.ghep_anh) {
-        appendShopeeLog(`> [Luồng ${workerId}] Đang ghép ảnh Outro sản phẩm để tạo video 12s bằng FFmpeg...`);
-      }
-
       const saveRes = await fetch("/api/shopee/save-rendered-video", {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({
           filename: finishedVideoFilename,
+          item_id: prod.item_id,
           out_dir: outDir,
           target_name: targetFileName,
-          ghep_anh: form.ghep_anh,
+          ghep_anh: false,
           del_img: form.del_img,
           image_url: prod.image || (prod.images && prod.images[0]) || "",
           image_data_url: null,
           duration: form.duration
         })
       });
+      if (!saveRes.ok) {
+        const errText = await saveRes.text();
+        throw new Error(`Lỗi lưu video 16s (${saveRes.status}): ${errText}`);
+      }
       const saveData = await saveRes.json();
       const finalSavedPath = saveData.saved_path || `${outDir}/${targetFileName}`;
-      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video vào: ${finalSavedPath}`);
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video 16s hoàn chỉnh vào: ${finalSavedPath}`);
 
       if (!prod._is_imported) {
         await fetch("/api/shopee/complete", {
@@ -3602,15 +3631,21 @@
       finishedVideoFilename = await renderSingleVideoClip(promptData.prompt, refImageDataUrl, ar, dur, workerId, `${dur}s`);
       appendShopeeLog(`✓ [Luồng ${workerId}] Muse.ai đã render xong: ${finishedVideoFilename}`);
       try {
-        await fetch("/api/shopee/save-temp-clip", {
+        const sRes = await fetch("/api/shopee/save-temp-clip", {
           method: "POST",
           headers: getHeaders(),
-          body: JSON.stringify({ filename: finishedVideoFilename, out_dir: outDir, item_id: prod.item_id, part: "raw" })
+          body: JSON.stringify({ filename: finishedVideoFilename, out_dir: outDir, item_id: prod.item_id, part: "raw", image_url: imgUrl })
         });
+        if (sRes.ok) {
+          const sData = await sRes.json();
+          if (sData.path) finishedVideoFilename = sData.path;
+          else if (sData.filename) finishedVideoFilename = sData.filename;
+        }
       } catch (_) {}
     }
 
-    if (form.ghep_anh) {
+    const shouldGhepAnh = form.ghep_anh && !effectiveIs16s && !is16s;
+    if (shouldGhepAnh) {
       appendShopeeLog(`> [Luồng ${workerId}] Đang ghép ảnh Outro sản phẩm để tạo video 12s bằng FFmpeg...`);
     }
 
@@ -3619,19 +3654,26 @@
       headers: getHeaders(),
       body: JSON.stringify({
         filename: finishedVideoFilename,
+        item_id: prod.item_id,
         out_dir: outDir,
         target_name: targetFileName,
-        ghep_anh: form.ghep_anh,
+        ghep_anh: shouldGhepAnh,
         del_img: form.del_img,
         image_url: imgUrl,
         image_data_url: refImageDataUrl,
         duration: form.duration
       })
     });
+    if (!saveRes.ok) {
+      const errText = await saveRes.text();
+      throw new Error(`Lỗi lưu/ghép video (${saveRes.status}): ${errText}`);
+    }
     const saveData = await saveRes.json();
     const finalSavedPath = saveData.saved_path || `${outDir}/${targetFileName}`;
     if (saveData.stitched) {
-      appendShopeeLog(`✓ [Luồng ${workerId}] Đã ghép ảnh Outro thành công vào: ${finalSavedPath}`);
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã ghép ảnh Outro thành công (12s) vào: ${finalSavedPath}`);
+    } else if (effectiveIs16s) {
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video 16s hoàn chỉnh vào: ${finalSavedPath}`);
     } else {
       appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video vào: ${finalSavedPath}`);
     }
@@ -3807,7 +3849,12 @@
 
     const workerPromises = [];
     for (let w = 1; w <= maxWorkers; w++) {
+      if (shopeeStopRequested || shopeeForceStopRequested) break;
       workerPromises.push(workerLoop(w));
+      if (w < maxWorkers) {
+        // Giãn cách khởi động 1.2s giữa các luồng để tránh nghẽn CPU, Chrome CDP và Proxy khi chạy số lượng luồng lớn (20-30 luồng)
+        await new Promise(r => setTimeout(r, 1200));
+      }
     }
     await Promise.all(workerPromises);
 
@@ -4004,14 +4051,23 @@
       btn.disabled = true;
       btn.innerHTML = "⏳ Đang quét & ghép clip...";
     }
-    appendShopeeLog("⚡ Bắt đầu quét thư mục temp để ghép các cặp Clip A + Clip B thành video 16s...");
+    appendShopeeLog("⚡ Bắt đầu quét thư mục temp để xử lý các clip chờ ghép (16s Clip A+B và 12s Ghép ảnh)...");
 
     try {
       const outDir = (document.getElementById("sp_out_dir") ? document.getElementById("sp_out_dir").value : "").trim();
+      const prodImages = {};
+      const prods = (typeof shopeeClaimedProducts !== "undefined" && Array.isArray(shopeeClaimedProducts)) ? shopeeClaimedProducts : [];
+      prods.forEach(p => {
+        if (p.item_id && (p.image || (p.images && p.images[0]))) {
+          prodImages[String(p.item_id)] = p.image || p.images[0];
+        }
+      });
+      const ghepAnh = document.getElementById("sp_ghep_anh") ? document.getElementById("sp_ghep_anh").checked : true;
+
       const res = await fetch("/api/shopee/auto-stitch-temp", {
         method: "POST",
         headers: getHeaders(),
-        body: JSON.stringify({ out_dir: outDir })
+        body: JSON.stringify({ out_dir: outDir, product_images: prodImages, ghep_anh: ghepAnh })
       });
       const data = await res.json();
       if (!res.ok || !data.success) {
@@ -4021,12 +4077,12 @@
       appendShopeeLog(`✓ [Auto Stitch] ${data.message}`);
       if (data.stitched && data.stitched.length > 0) {
         data.stitched.forEach(item => {
-          appendShopeeLog(`   + Đã ghép xong SP ${item.item_id}: ${item.filename}`);
+          appendShopeeLog(`   + Đã xuất xong video SP ${item.item_id}: ${item.filename}`);
         });
         showToast(data.message, "success");
       } else {
-        appendShopeeLog(`i [Auto Stitch] Không có cặp clip A/B nào tồn đọng cần ghép.`);
-        showToast("Không có cặp clip A/B nào cần ghép trong temp!", "info");
+        appendShopeeLog(`i [Auto Stitch] Không có clip nào tồn đọng cần ghép.`);
+        showToast("Không có clip nào cần ghép trong temp!", "info");
       }
 
       // Cập nhật lại số liệu trên nút và console
@@ -4058,11 +4114,11 @@
       if (data && data.waiting_to_stitch > 0) {
         btn.innerHTML = `⚡ Ghép Clip Temp (${data.waiting_to_stitch} chờ ghép)`;
         btn.style.boxShadow = "0 0 12px rgba(16, 185, 129, 0.6)";
-        btn.title = `Có ${data.waiting_to_stitch} cặp clip A/B đang chờ ghép thành video 16s trong temp! Bấm để ghép ngay.`;
+        btn.title = `Có ${data.waiting_to_stitch} clip đang chờ ghép trong temp (gồm clip 16s A+B và clip 12s)! Bấm để ghép ngay.`;
       } else {
-        btn.innerHTML = `⚡ Ghép Clip Temp (16s)`;
+        btn.innerHTML = `⚡ Ghép Clip Temp`;
         btn.style.boxShadow = "none";
-        btn.title = `Tự động ghép tất cả các cặp Clip A + Clip B đang có sẵn trong folder temp thành video 16s hoàn chỉnh`;
+        btn.title = `Tự động ghép tất cả các cặp Clip A + Clip B hoặc clip dở dang trong folder temp`;
       }
     } catch (_) {}
   }
@@ -4239,6 +4295,95 @@
     }
   }
 
+  let isProxyEnabled = true;
+
+  async function fetchProxyStatus() {
+    try {
+      const res = await fetch("/api/proxy/status", { headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        isProxyEnabled = data.enabled !== false;
+        updateProxyModeUI(isProxyEnabled, data.assigned_accounts || 0, data.total_proxies || 0);
+      }
+    } catch (_) {}
+  }
+
+  function updateProxyModeUI(enabled, assignedCount, totalProxies) {
+    isProxyEnabled = enabled;
+    const btn = document.getElementById("btnToggleProxyMode");
+    const sel = document.getElementById("sp_proxy_mode");
+    const pEl = document.getElementById("spHomeProxyStatus");
+
+    if (sel) sel.value = enabled ? "enabled" : "disabled";
+
+    if (btn) {
+      if (enabled) {
+        btn.innerText = "🌐 Proxy: BẬT";
+        btn.style.background = "#2563eb";
+        btn.style.color = "#ffffff";
+        btn.title = "Đang BẬT Fake Proxy (HomeProxy). Bấm để TẮT và chạy mạng trực tiếp.";
+      } else {
+        btn.innerText = "⚡ Proxy: TẮT (Trực Tiếp)";
+        btn.style.background = "#059669";
+        btn.style.color = "#ffffff";
+        btn.title = "Đang TẮT Fake Proxy (Chạy Mạng Trực Tiếp). Bấm để BẬT lại.";
+      }
+    }
+
+    const btnAcc = document.getElementById("btnToggleProxyModeAcc");
+    if (btnAcc) {
+      if (enabled) {
+        btnAcc.innerText = "🌐 Proxy: ĐANG BẬT";
+        btnAcc.style.color = "#60a5fa";
+        btnAcc.style.borderColor = "#3b82f6";
+        btnAcc.style.background = "rgba(59,130,246,0.15)";
+      } else {
+        btnAcc.innerText = "⚡ Proxy: ĐANG TẮT (Trực Tiếp)";
+        btnAcc.style.color = "#34d399";
+        btnAcc.style.borderColor = "#10b981";
+        btnAcc.style.background = "rgba(16,185,129,0.15)";
+      }
+    }
+
+    if (pEl) {
+      if (!enabled) {
+        pEl.innerHTML = `<span style="color:#34d399;font-weight:700;">⚡ Chạy Trực Tiếp (Không Fake IP)</span>`;
+      } else {
+        if (assignedCount === 0) {
+          pEl.innerHTML = `<span style="color:#ef4444;font-weight:700;">Chưa gán proxy (Bấm Nạp)</span>`;
+        } else {
+          pEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;">Đã gắn ${assignedCount} TK (Pool: ${totalProxies})</span>`;
+        }
+      }
+    }
+  }
+
+  async function toggleProxyMode() {
+    const nextState = !isProxyEnabled;
+    await changeProxyMode(nextState ? "enabled" : "disabled");
+  }
+
+  async function changeProxyMode(val) {
+    const enable = val === "enabled" || val === true;
+    try {
+      const res = await fetch("/api/proxy/toggle", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ enabled: enable })
+      });
+      if (res.ok) {
+        const d = await res.json();
+        isProxyEnabled = d.enabled;
+        showToast(d.message || (isProxyEnabled ? "Đã BẬT Fake Proxy" : "Đã TẮT Fake Proxy"), "success");
+        await fetchProxyStatus();
+        await fetchBrowserTtlStatus();
+        await loadAccounts();
+      }
+    } catch (e) {
+      showToast(`Lỗi chuyển chế độ Proxy: ${e.message}`, "danger");
+    }
+  }
+
   // ==================== BROWSER TTL & RECYCLE ====================
   async function fetchBrowserTtlStatus() {
     try {
@@ -4257,23 +4402,7 @@
       }
     } catch (_) {}
 
-    // Cập nhật trạng thái HomeProxy
-    try {
-      const aRes = await fetch("/admin/accounts", { headers: getHeaders() });
-      if (aRes.ok) {
-        const aData = await aRes.json();
-        const accs = aData.accounts || [];
-        const withProxy = accs.filter(a => a.proxy).length;
-        const pEl = document.getElementById("spHomeProxyStatus");
-        if (pEl) {
-          if (withProxy === 0) {
-            pEl.innerHTML = `<span style="color:#ef4444;font-weight:700;">Chưa gán proxy (Bấm Nạp)</span>`;
-          } else {
-            pEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;">Đã gắn ${withProxy}/${accs.length} TK (Sticky)</span>`;
-          }
-        }
-      }
-    } catch (_) {}
+    await fetchProxyStatus();
   }
 
   async function changeBrowserTtl(val) {

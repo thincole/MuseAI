@@ -221,6 +221,16 @@ Khi khởi chạy Chrome, hệ thống inject các cờ vô hiệu hóa cơ ch�
 - Chặn rò rỉ WebRTC IP thật (`WebRTC Lock`).
 - Giả lập thông số phần cứng GPU (`GPU Spoofing`).
 
+### 6.5. Chế Độ Không Fake Proxy (Direct Connection Mode)
+Người dùng có thể chủ động **Bật/Tắt chế độ Fake Proxy** trực tiếp trên giao diện (Card Bảo Vệ Trình Duyệt hoặc Tab Tài Khoản) hoặc qua API `POST /api/proxy/toggle`:
+- **Trạng thái lưu trữ**: Tệp `data/proxy_settings.json` (`{"enabled": true/false}`).
+- **Khi Tắt Fake Proxy (Chạy Mạng Trực Tiếp)**:
+  - `proxy_manager.is_proxy_enabled()` trả về `False`.
+  - Toàn bộ Chrome Browser Context được tạo trống (`bc_params = {}`), kết nối mạng trực tiếp từ máy trạm tới `muse.ai` với tốc độ gốc tối đa.
+  - Loại bỏ hoàn toàn độ trễ của Local Forwarder TCP và nguy cơ nghẽn kết nối do bên bán proxy giới hạn luồng đồng thời.
+  - Phù hợp chạy quy mô lớn (20–30 luồng) trên đường truyền mạng ổn định.
+- **Khi Bật Fake Proxy**: Hệ thống tự động kích hoạt HomeProxy Sticky, mỗi tài khoản đi qua 1 proxy cố định để bảo vệ an toàn danh tính IP.
+
 ---
 
 ## 7. THUẬT TOÁN TỰ ĐỘNG DUY TRÌ PHIÊN (KEEPALIVE & VM WAKE)

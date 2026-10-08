@@ -755,10 +755,23 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
                 "-f", "concat", "-safe", "0",
                 "-i", list_file,
                 "-c", "copy",
+                "-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
                 output_path
             ]
             res = _run_ffmpeg_cmd(cmd, timeout=120)
+            if res.returncode == 0 and os.path.isfile(output_path):
+                # Kiểm tra lỗi tràn số 16-bit timebase (khiến Windows Explorer hiện 01:05:32)
+                try:
+                    test_dur = get_media_duration(output_path)
+                    if test_dur > 25.0:
+                        log.warning("concat_videos stream-copy bị lệch timebase (độ dài đọc được %.1fs > 25s), hủy và chuyển sang reencode...", test_dur)
+                        _safe_remove(output_path)
+                        res.returncode = 1
+                except Exception:
+                    pass
+
             if res.returncode != 0:
                 err1 = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
                 log.warning("concat_videos copy failed: %s; falling back to reencode", err1)

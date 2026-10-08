@@ -26,11 +26,46 @@ THINAPTM_DIR = os.environ.get("THINAPTM_DIR", "").strip() or r"E:\ThinAptm0707"
 DEFAULT_HOMEPROXY_TOKEN = "homepx42152_e21c0b975d1093642c0a6e95bd760a49a4f7bf5a2e67ba971535c18940288b1e"
 HOMEPROXY_TOKEN = os.environ.get("HOMEPROXY_TOKEN", "").strip() or DEFAULT_HOMEPROXY_TOKEN
 PROXY_CACHE_FILE = os.path.join(CFG.data_dir, "proxy_pool.json")
+PROXY_SETTINGS_FILE = os.path.join(CFG.data_dir, "proxy_settings.json")
 
 _forwarders: dict[str, int] = {}  # proxy_str -> local_port
 _forwarder_servers: list[socket.socket] = []
 _forwarder_lock = threading.Lock()
 _pool_lock = threading.Lock()
+_proxy_enabled_mem: bool | None = None
+
+
+def is_proxy_enabled() -> bool:
+    """Kiểm tra xem hệ thống có đang bật fake IP / proxy hay không.
+    Mặc định True, nhưng người dùng có thể tắt hoàn toàn để chạy mạng trực tiếp (Không fake IP)."""
+    global _proxy_enabled_mem
+    if _proxy_enabled_mem is not None:
+        return _proxy_enabled_mem
+    if os.path.isfile(PROXY_SETTINGS_FILE):
+        try:
+            with open(PROXY_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                _proxy_enabled_mem = bool(d.get("enabled", True))
+                return _proxy_enabled_mem
+        except Exception:
+            pass
+    _proxy_enabled_mem = True
+    return _proxy_enabled_mem
+
+
+def set_proxy_enabled(enabled: bool) -> bool:
+    """Bật hoặc tắt toàn bộ việc sử dụng Proxy trên toàn hệ thống."""
+    global _proxy_enabled_mem
+    _proxy_enabled_mem = bool(enabled)
+    os.makedirs(os.path.dirname(PROXY_SETTINGS_FILE), exist_ok=True)
+    try:
+        with open(PROXY_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"enabled": bool(enabled), "updated_at": int(time.time())}, f, indent=2)
+        log.info("🌐 [Proxy Manager] Chế độ Proxy đã chuyển sang: %s", "BẬT (Fake IP)" if enabled else "TẮT (Chạy Trực Tiếp / Không Fake IP)")
+        return True
+    except Exception as e:
+        log.warning("Lỗi lưu proxy settings: %s", e)
+        return False
 
 
 def parse_proxy_str(proxy_str: str) -> dict | None:
@@ -436,7 +471,11 @@ def assign_sticky_proxy(acc_id: str, proxy_str: str, ip: str = ""):
 
 def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False) -> str | None:
     """Kiểm tra proxy của tài khoản. Nếu proxy còn sống, giữ nguyên.
-    Nếu chưa có proxy hoặc proxy cũ đã chết (die), tự động chọn proxy mới còn sống từ Pool."""
+    Nếu chưa có proxy hoặc proxy cũ đã chết (die), tự động chọn proxy mới còn sống từ Pool.
+    Nếu người dùng tắt Fake Proxy (is_proxy_enabled=False), trả về None để chạy trực tiếp."""
+    if not is_proxy_enabled():
+        return None
+
     acc = store.get_account(acc_id)
     if not acc:
         return None
@@ -547,6 +586,8 @@ def sync_all_accounts_with_homeproxy() -> dict:
 
 def get_forwarder_url_for_account(acc_id: str) -> str | None:
     """Trả về URL http://127.0.0.1:<port> của local forwarder cho tài khoản, hoặc None."""
+    if not is_proxy_enabled():
+        return None
     try:
         p_str = ensure_alive_proxy_for_account(acc_id)
         if p_str:

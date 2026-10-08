@@ -1,7 +1,11 @@
 @echo off
-chcp 65001 > nul
 title MuseAI - Cap Nhat Phien Ban Moi Nhat
-cd /d "%~dp0"
+
+if exist "%~dp0root\tools\update_app.py" (
+    cd /d "%~dp0root"
+) else if exist "%~dp0tools\update_app.py" (
+    cd /d "%~dp0"
+)
 
 :: Tim va bo sung Git vao PATH neu Git da duoc cai dat tren may nhung chua them vao PATH
 where git >nul 2>nul
@@ -26,10 +30,10 @@ if %errorlevel% equ 0 (
 ) else (
     if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
         set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
-    ) else if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" (
-        set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
     ) else if exist "%LOCALAPPDATA%\Programs\Python\Python310\python.exe" (
         set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
+    ) else if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" (
+        set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
     ) else if exist "C:\Python312\python.exe" (
         set "PY_CMD=C:\Python312\python.exe"
     ) else (
@@ -50,7 +54,11 @@ if "%PY_CMD%"=="" (
     exit /b 1
 )
 
-:: Khoi chay tool cap nhat bang Python
+echo [*] Thu muc hoat dong: %CD%
+echo [*] Dang kiem tra cap nhat...
+echo.
+
+:: Khoi chay tool cap nhat bang Python trong thu muc root
 "%PY_CMD%" tools/update_app.py
 
 if %errorlevel% neq 0 (
@@ -58,5 +66,4 @@ if %errorlevel% neq 0 (
     echo [THONG BAO] Tien trinh cap nhat dung voi ma loi %errorlevel%.
 )
 
-echo.
 pause

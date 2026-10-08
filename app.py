@@ -853,7 +853,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id=cur_acc["id"],
                     cookies=cur_acc["cookies"],
                     expires=cur_acc.get("cookies_exp"),
-                    timeout=40
+                    timeout=75
                 )
                 res = session.generate(
                     prompt=prompt,
@@ -2509,6 +2509,9 @@ def save_temp_clip(req: dict):
             pass
 
     shopee_engine.set_cached_clip(item_id, f"clip_{part}", target_path)
+    image_url = str(req.get("image_url", "")).strip()
+    if image_url:
+        shopee_engine.set_cached_clip(item_id, "image_url", image_url)
     log.info("💾 [Temp Clip] Đã lưu clip thành phần: temp/%s (%s)", target_filename, target_path)
     return {"success": True, "path": target_path, "filename": target_filename}
 
@@ -2686,6 +2689,7 @@ def get_temp_stitch_summary(out_dir: str = ""):
     # Gom nhóm theo item_id
     clips_a = {}
     clips_b = {}
+    clips_raw = {}
     for fname in temp_files:
         if not fname.lower().endswith((".mp4", ".mov", ".webm")):
             continue
@@ -2706,10 +2710,15 @@ def get_temp_stitch_summary(out_dir: str = ""):
         if m_b:
             clips_b[m_b.group(1)] = fpath
             continue
+        m_raw = re.match(r"^(\d+)[-_]raw\.", lower)
+        if m_raw:
+            clips_raw[m_raw.group(1)] = fpath
+            continue
 
     paired_ids = set(clips_a.keys()) & set(clips_b.keys())
+    raw_ids = set(clips_raw.keys())
 
-    # Quét thư mục xuất video đích xem video 16s nào đã có
+    # Quét thư mục xuất video đích xem video nào đã có
     try:
         out_files = os.listdir(target_out)
     except OSError:
@@ -2732,6 +2741,8 @@ def get_temp_stitch_summary(out_dir: str = ""):
             final_ids.add(m_id.group(1))
 
     waiting_ids = [iid for iid in paired_ids if iid not in final_ids]
+    waiting_raw_ids = [iid for iid in raw_ids if iid not in final_ids]
+    total_waiting = len(waiting_ids) + len(waiting_raw_ids)
 
     return {
         "success": True,
@@ -2739,15 +2750,17 @@ def get_temp_stitch_summary(out_dir: str = ""):
         "temp_dir": temp_dir,
         "total_temp_files": len(temp_files),
         "total_pairs": len(paired_ids),
+        "total_raws": len(raw_ids),
         "already_stitched": len(paired_ids) - len(waiting_ids),
-        "waiting_to_stitch": len(waiting_ids),
-        "waiting_item_ids": sorted(waiting_ids)
+        "waiting_to_stitch": total_waiting,
+        "waiting_item_ids": sorted(waiting_ids),
+        "waiting_raw_ids": sorted(waiting_raw_ids)
     }
 
 
 @app.post("/api/shopee/auto-stitch-temp")
 def auto_stitch_temp_clips(req: dict):
-    """Tự động quét thư mục temp, tìm tất cả cặp clip -a và -b chưa ghép và nối thành video 16s qua FFmpeg."""
+    """Tự động quét thư mục temp, tìm tất cả cặp clip -a/-b và clip -raw chưa ghép và xử lý hoàn tất thành video xuất."""
     saved_cfg = _get_shopee_settings()
     out_dir = (req.get("out_dir") or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
     out_dir = os.path.normpath(out_dir)
@@ -2758,22 +2771,25 @@ def auto_stitch_temp_clips(req: dict):
 
     summary = get_temp_stitch_summary(out_dir)
     waiting_ids = summary.get("waiting_item_ids") or []
-    if not waiting_ids:
+    waiting_raw_ids = summary.get("waiting_raw_ids") or []
+    if not waiting_ids and not waiting_raw_ids:
         return {
             "success": True,
-            "message": "Không có cặp clip A/B nào cần ghép trong temp (tất cả đã được ghép hoặc chưa đủ cặp).",
+            "message": "Không có clip nào cần ghép trong temp (tất cả đã được xuất hoặc không còn file chờ).",
             "stitched_count": 0,
             "already_count": summary.get("already_stitched", 0)
         }
 
-    log.info("⚡ [Auto Stitch] Bắt đầu ghép tự động %d cặp clip trong %s...", len(waiting_ids), temp_dir)
+    log.info("⚡ [Auto Stitch] Bắt đầu ghép tự động: %d cặp clip 16s và %d clip raw trong %s...", len(waiting_ids), len(waiting_raw_ids), temp_dir)
     stitched_items = []
     failed_items = []
 
     delete_temp = bool(req.get("delete_temp", True))
+    product_images = req.get("product_images") or {}
+    ghep_anh = bool(req.get("ghep_anh", True))
 
+    # 1. Ghép các cặp clip A + B thành video 16s
     for iid in waiting_ids:
-        # Tìm file clip_a và clip_b
         f_a = None
         f_b = None
         for ext in (".mp4", ".mov", ".webm"):
@@ -2806,7 +2822,6 @@ def auto_stitch_temp_clips(req: dict):
                     "size": os.path.getsize(out_final)
                 })
                 log.info("✓ [Auto Stitch] Ghép thành công 16s: %s (%.1f MB)", target_name, os.path.getsize(out_final)/(1024*1024))
-                # Tự động xóa file clip tạm sau khi ghép thành công vào video đích
                 if delete_temp:
                     for f_tmp in (f_a, f_b):
                         try:
@@ -2820,15 +2835,87 @@ def auto_stitch_temp_clips(req: dict):
             log.warning("✗ [Auto Stitch] Lỗi ghép SP %s: %s", iid, err)
             failed_items.append({"item_id": iid, "reason": str(err)})
 
+    # 2. Xử lý các clip raw (8s/10s) chưa ghép: ghép ảnh 12s hoặc chuyển vào output folder
+    for iid in waiting_raw_ids:
+        f_raw = None
+        for ext in (".mp4", ".mov", ".webm"):
+            cand_raw = os.path.join(temp_dir, f"{iid}-raw{ext}")
+            if not os.path.isfile(cand_raw):
+                cand_raw = os.path.join(temp_dir, f"{iid}_raw{ext}")
+            if os.path.isfile(cand_raw) and os.path.getsize(cand_raw) >= 10000:
+                f_raw = cand_raw
+                break
+
+        if not f_raw:
+            continue
+
+        target_name = f"{iid}.mp4"
+        img_url = product_images.get(iid) or product_images.get(str(iid)) or ""
+        if not img_url:
+            cached_info = shopee_engine.get_cached_clips(iid)
+            img_url = cached_info.get("image_url") or ""
+
+        stitched_raw = False
+        temp_img = None
+        if ghep_anh and img_url:
+            try:
+                temp_img = os.path.join(CFG.data_dir, f"temp_auto_outro_{iid}_{int(time.time()*1000)}.jpg")
+                if img_url.startswith("data:image") and ";base64," in img_url:
+                    b64 = img_url.split(";base64,", 1)[1]
+                    with open(temp_img, "wb") as f:
+                        f.write(base64.b64decode(b64))
+                elif img_url.startswith("http"):
+                    shopee_engine.download_image_to_file(img_url, temp_img)
+                elif os.path.isfile(img_url):
+                    shutil.copy2(img_url, temp_img)
+
+                if os.path.isfile(temp_img) and os.path.getsize(temp_img) > 100:
+                    ok = shopee_engine.ghep_anh_12s(f_raw, temp_img, out_final, ai_duration=8.0)
+                    if ok:
+                        stitched_raw = True
+            except Exception as ge:
+                log.warning("Ghép ảnh 12s cho SP %s thất bại: %s", iid, ge)
+            finally:
+                if temp_img and os.path.isfile(temp_img):
+                    try:
+                        os.remove(temp_img)
+                    except Exception:
+                        pass
+
+        if not stitched_raw:
+            try:
+                shutil.copy2(f_raw, out_final)
+                stitched_raw = os.path.isfile(out_final) and os.path.getsize(out_final) >= 10000
+            except Exception as ce:
+                log.warning("Copy clip raw SP %s sang output thất bại: %s", iid, ce)
+
+        if stitched_raw:
+            stitched_items.append({
+                "item_id": iid,
+                "filename": target_name,
+                "path": out_final,
+                "size": os.path.getsize(out_final)
+            })
+            log.info("✓ [Auto Stitch] Đã xuất video hoàn chỉnh cho SP %s: %s (%.1f MB)", iid, target_name, os.path.getsize(out_final)/(1024*1024))
+            if delete_temp and os.path.isfile(f_raw):
+                try:
+                    os.remove(f_raw)
+                except Exception:
+                    pass
+        else:
+            failed_items.append({"item_id": iid, "reason": "Không thể ghép/lưu video từ file raw temp"})
+
+    total_stitched = len(stitched_items)
+    total_needed = len(waiting_ids) + len(waiting_raw_ids)
     return {
         "success": True,
         "out_dir": out_dir,
-        "total_waiting": len(waiting_ids),
-        "stitched_count": len(stitched_items),
+        "total_waiting": total_needed,
+        "stitched_count": total_stitched,
         "failed_count": len(failed_items),
         "stitched": stitched_items,
         "failed": failed_items,
-        "message": f"Đã ghép thành công {len(stitched_items)}/{len(waiting_ids)} video 16s và dọn sạch file tạm!"
+        "message": f"Đã xử lý và lưu thành công {total_stitched}/{total_needed} video vào thư mục output!"
     }
 
 
@@ -2969,11 +3056,30 @@ def get_proxy_status():
     alive = sum(1 for a in accounts if a.get("proxy_status") == "alive")
     return {
         "success": True,
+        "enabled": proxy_manager.is_proxy_enabled(),
         "total_proxies": len(pool),
         "proxies": pool[:30],
         "assigned_accounts": assigned,
         "alive_proxies": alive,
         "accounts": accounts
+    }
+
+
+@app.post("/api/proxy/toggle")
+def toggle_proxy_mode(req: dict):
+    """Bật hoặc tắt chế độ Fake Proxy (HomeProxy) trên toàn hệ thống."""
+    import proxy_manager
+    enabled = bool(req.get("enabled", True))
+    ok = proxy_manager.set_proxy_enabled(enabled)
+    # Tái sinh session pool nếu tắt proxy để các phiên mới mở trực tiếp
+    try:
+        engine.recycle_sessions()
+    except Exception:
+        pass
+    return {
+        "success": ok,
+        "enabled": proxy_manager.is_proxy_enabled(),
+        "message": "Đã BẬT Fake Proxy (HomeProxy Sticky)" if enabled else "Đã TẮT Fake Proxy (Chạy Trực Tiếp / Không Fake IP)"
     }
 
 
@@ -3068,9 +3174,9 @@ def download_shopee_image(req: dict):
 
 @app.post("/api/shopee/save-rendered-video")
 def save_rendered_video(req: dict):
-    """Lưu video đã render từ Muse media folder sang thư mục đầu ra chỉ định.
+    """Lưu video đã render sang thư mục đầu ra chỉ định.
     Nếu ghep_anh=True, thực hiện ghép ảnh sản phẩm làm Outro tạo video chuẩn 12s."""
-    filename = req.get("filename", "")
+    filename = str(req.get("filename") or "").strip()
     out_dir = req.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
     target_name = req.get("target_name") or filename
     ghep_anh = bool(req.get("ghep_anh", False))
@@ -3078,6 +3184,7 @@ def save_rendered_video(req: dict):
     image_url = req.get("image_url", "")
     image_data_url = req.get("image_data_url", "")
     duration_val = req.get("duration")
+    item_id = str(req.get("item_id") or "").strip()
 
     ai_dur = None
     if duration_val:
@@ -3091,10 +3198,71 @@ def save_rendered_video(req: dict):
         except Exception:
             ai_dur = None
 
-    src = _media_file(filename)
+    # Nếu là video 16s (duration >= 15 hoặc tên file chứa 16s), tuyệt đối KHÔNG ghép ảnh 12s làm co ngắn video
+    if ai_dur and ai_dur >= 15.0:
+        ghep_anh = False
+    elif "16s" in str(filename).lower() or "16s" in str(target_name).lower():
+        ghep_anh = False
+
     target_name = _bare_filename(target_name, "target_name")
     if not target_name.lower().endswith(_VIDEO_EXTS):
         raise HTTPException(400, "target_name phải là file video (.mp4)")
+
+    # Trích xuất item_id nếu chưa được truyền vào
+    if not item_id:
+        m_id = re.search(r"(\d{8,})", target_name) or re.search(r"(\d{8,})", str(filename))
+        if m_id:
+            item_id = m_id.group(1)
+
+    src = None
+    # 1. Nếu filename là đường dẫn tuyệt đối hợp lệ và file tồn tại
+    if os.path.isabs(filename) and os.path.isfile(filename):
+        src = filename
+    # 2. Kiểm tra trong CFG.media_dir
+    elif os.path.isfile(os.path.join(CFG.media_dir, os.path.basename(filename))):
+        src = os.path.join(CFG.media_dir, os.path.basename(filename))
+    # 3. Kiểm tra trong out_dir/temp/{filename}
+    elif os.path.isfile(os.path.join(out_dir, "temp", os.path.basename(filename))):
+        src = os.path.join(out_dir, "temp", os.path.basename(filename))
+    # 4. Kiểm tra trong out_dir/{filename}
+    elif os.path.isfile(os.path.join(out_dir, os.path.basename(filename))):
+        src = os.path.join(out_dir, os.path.basename(filename))
+
+    # 5. Tìm theo item_id trong out_dir/temp/
+    if not src and item_id:
+        temp_dir = os.path.join(out_dir, "temp")
+        candidates = [
+            os.path.join(temp_dir, f"{item_id}-raw.mp4"),
+            os.path.join(temp_dir, f"{item_id}_raw.mp4"),
+            os.path.join(temp_dir, f"{item_id}-a.mp4"),
+            os.path.join(temp_dir, f"{item_id}.mp4"),
+        ]
+        for c in candidates:
+            if os.path.isfile(c) and os.path.getsize(c) > 1000:
+                src = c
+                break
+
+    # 6. Tìm theo clip cache trong engine
+    if not src and item_id:
+        cached = shopee_engine.get_cached_clips(item_id)
+        for ck in ("clip_raw", "clip_a", "final_video"):
+            cp = cached.get(ck)
+            if cp and os.path.isfile(cp) and os.path.getsize(cp) > 1000:
+                src = cp
+                break
+
+    # 7. Fallback kiểm tra bất kỳ file video nào trong CFG.media_dir có chứa item_id
+    if not src and item_id and os.path.isdir(CFG.media_dir):
+        for fn in os.listdir(CFG.media_dir):
+            if item_id in fn and fn.lower().endswith(_VIDEO_EXTS):
+                p = os.path.join(CFG.media_dir, fn)
+                if os.path.isfile(p) and os.path.getsize(p) > 1000:
+                    src = p
+                    break
+
+    if not src or not os.path.isfile(src):
+        raise HTTPException(404, f"Không tìm thấy file video nguồn '{filename}' cho sản phẩm {item_id or target_name}")
+
     try:
         os.makedirs(out_dir, exist_ok=True)
         dst = os.path.join(out_dir, target_name)
@@ -3108,8 +3276,11 @@ def save_rendered_video(req: dict):
                     b64_content = image_data_url.split(";base64,", 1)[1]
                     with open(temp_img_path, "wb") as f:
                         f.write(base64.b64decode(b64_content))
-                elif image_url:
+                elif image_url and (image_url.startswith("http://") or image_url.startswith("https://")):
                     shopee_engine.download_image_to_file(image_url, temp_img_path)
+                elif image_url and os.path.isfile(image_url):
+                    import shutil
+                    shutil.copy2(image_url, temp_img_path)
 
                 if os.path.isfile(temp_img_path) and os.path.getsize(temp_img_path) > 100:
                     log.info("[Ghep 12s] Dang ghep anh Outro (12s, AI: %ss) vao video %s...", ai_dur or "auto", target_name)
@@ -3128,9 +3299,10 @@ def save_rendered_video(req: dict):
 
         if not stitched:
             import shutil
-            shutil.copy2(src, dst)
+            if os.path.abspath(src) != os.path.abspath(dst):
+                shutil.copy2(src, dst)
 
-        # Tự động dọn dẹp file trung gian trong CFG.media_dir sau khi đã lưu xong video hoàn chỉnh
+        # Tự động dọn dẹp file trung gian sau khi đã lưu xong video hoàn chỉnh
         if os.path.isfile(dst) and os.path.getsize(dst) > 1000:
             media_dir_abs = os.path.abspath(CFG.media_dir)
             if os.path.abspath(src).startswith(media_dir_abs):
@@ -3140,15 +3312,18 @@ def save_rendered_video(req: dict):
                     pass
 
             # Tự động dọn dẹp các clip tạm (-a, -b, -raw) trong out_dir/temp tương ứng với Item ID
-            m_target_id = re.search(r"(\d{8,})", target_name)
-            if m_target_id:
-                tid = m_target_id.group(1)
+            tid = item_id or ""
+            if not tid:
+                m_target_id = re.search(r"(\d{8,})", target_name)
+                if m_target_id:
+                    tid = m_target_id.group(1)
+            if tid:
                 temp_dir = os.path.join(out_dir, "temp")
                 if os.path.isdir(temp_dir):
                     for ext in (".mp4", ".mov", ".webm"):
                         for suffix in (f"{tid}-a{ext}", f"{tid}_a{ext}", f"{tid}-b{ext}", f"{tid}_b{ext}", f"{tid}-raw{ext}", f"{tid}_raw{ext}"):
                             tf = os.path.join(temp_dir, suffix)
-                            if os.path.isfile(tf):
+                            if os.path.isfile(tf) and os.path.abspath(tf) != os.path.abspath(dst):
                                 try:
                                     os.remove(tf)
                                 except Exception:

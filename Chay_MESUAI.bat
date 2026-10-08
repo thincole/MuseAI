@@ -1,16 +1,19 @@
 @echo off
-chcp 65001 > nul
-title MuseAI Video Studio Pro - Đang Khởi Động...
+title MuseAI Video Studio Pro
 
-cd /d "%~dp0"
+if exist "%~dp0root\desktop_app.py" (
+    cd /d "%~dp0root"
+) else if exist "%~dp0desktop_app.py" (
+    cd /d "%~dp0"
+)
 
 echo ====================================================================
-echo         MuseAI Video Studio Pro - Phần Mềm Tạo Video AI
-echo                  Phiên Bản Desktop Windows
+echo         MuseAI Video Studio Pro - Video Generator AI
+echo                  Desktop Windows Edition
 echo ====================================================================
 echo.
 
-:: Tìm đường dẫn Python 3 (dùng goto để tránh lỗi %errorlevel% bị expand sớm trong khối ngoặc)
+:: Tim Python 3
 set "PY_EXE="
 set "PY_ARGS="
 
@@ -19,16 +22,24 @@ if not errorlevel 1 (
     set "PY_EXE=python"
     goto :py_found
 )
-for %%V in (312 313 311 310) do (
-    if exist "%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe" (
-        set "PY_EXE=%LOCALAPPDATA%\Programs\Python\Python%%V\python.exe"
-        goto :py_found
-    )
+
+if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
+    set "PY_EXE=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+    goto :py_found
+)
+if exist "%LOCALAPPDATA%\Programs\Python\Python310\python.exe" (
+    set "PY_EXE=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
+    goto :py_found
+)
+if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" (
+    set "PY_EXE=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
+    goto :py_found
 )
 if exist "C:\Python312\python.exe" (
     set "PY_EXE=C:\Python312\python.exe"
     goto :py_found
 )
+
 where py >nul 2>nul
 if not errorlevel 1 (
     set "PY_EXE=py"
@@ -43,9 +54,16 @@ pause > nul
 exit /b 1
 
 :py_found
-echo [*] Su dung trinh thuc thi Python: %PY_EXE% %PY_ARGS%
-echo [*] Khoi dong ung dung Desktop (nhat ky phien truoc duoc giu o log.txt.1)...
+echo [*] Trinh thuc thi Python: %PY_EXE% %PY_ARGS%
+echo [*] Thu muc hoat dong: %CD%
+echo [*] Dang khoi dong ung dung Desktop...
 echo.
+
+if not exist "desktop_app.py" (
+    echo [LOI] Khong tim thay file desktop_app.py tai thu muc: %CD%
+    pause
+    exit /b 1
+)
 
 "%PY_EXE%" %PY_ARGS% desktop_app.py
 

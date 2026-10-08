@@ -1668,7 +1668,7 @@ class MuseEngine:
             pass
 
     def create_worker_session(self, cookies: dict, expires: dict | None = None,
-                              account_id: str | None = None, timeout: int = 40,
+                              account_id: str | None = None, timeout: int = 75,
                               ttl_seconds: int = 1800, max_tasks: int = 5) -> "MuseWorkerSession":
         """Khởi tạo một phiên làm việc độc lập (Isolated Browser Context) cho 1 worker thread qua HomeProxy.
         Mỗi worker có Cookie riêng, WebSocket riêng, Proxy riêng và Anti-Detect Stealth Script."""
@@ -1680,10 +1680,13 @@ class MuseEngine:
         if account_id:
             try:
                 import proxy_manager
-                proxy_str = proxy_manager.ensure_alive_proxy_for_account(account_id)
-                if proxy_str:
-                    forwarder_port = proxy_manager.start_local_forwarder(proxy_str)
-                    log.info("🌐 [Worker/HomeProxy] Tài khoản %s gắn Proxy cố định: %s (Forwarder 127.0.0.1:%d)", account_id, proxy_str, forwarder_port)
+                if proxy_manager.is_proxy_enabled():
+                    proxy_str = proxy_manager.ensure_alive_proxy_for_account(account_id)
+                    if proxy_str:
+                        forwarder_port = proxy_manager.start_local_forwarder(proxy_str)
+                        log.info("🌐 [Worker/HomeProxy] Tài khoản %s gắn Proxy cố định: %s (Forwarder 127.0.0.1:%d)", account_id, proxy_str, forwarder_port)
+                else:
+                    log.info("⚡ [Worker/Direct] Chế độ KHÔNG FAKE IP: Chạy kết nối trực tiếp cho TK %s", account_id)
             except Exception as pe:
                 log.warning("Không thể cấu hình proxy cho TK %s: %s", account_id, pe)
 
@@ -1759,7 +1762,7 @@ class MuseEngine:
             self._creating = set()
         return cond
 
-    def acquire_session(self, account_id: str, cookies: dict, expires: dict | None = None, timeout: int = 40) -> "MuseWorkerSession":
+    def acquire_session(self, account_id: str, cookies: dict, expires: dict | None = None, timeout: int = 75) -> "MuseWorkerSession":
         """Lấy Browser Session còn hạn TTL từ pool hoặc tạo phiên mới toanh qua HomeProxy.
 
         并发约定：
