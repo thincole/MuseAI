@@ -975,6 +975,18 @@ def claim_jobs_from_server(
                 blacklisted_samples.append(f"SP {p.get('item_id')}: {reason}")
             continue
 
+        # Chuẩn hóa link ảnh sản phẩm: đảm bảo luôn có cả image và image_url
+        img_val = str(p.get("image_url") or p.get("image") or "").strip()
+        if not img_val and p.get("images") and isinstance(p["images"], list) and len(p["images"]) > 0:
+            img_val = str(p["images"][0]).strip()
+        if img_val:
+            if img_val.startswith("//"):
+                img_val = "https:" + img_val
+            elif not img_val.startswith(("http://", "https://", "data:")):
+                img_val = f"https://cf.shopee.ph/file/{img_val}"
+        p["image"] = img_val
+        p["image_url"] = img_val
+
         products.append(p)
 
     if blacklisted_count > 0:
@@ -1036,6 +1048,10 @@ def _validate_public_http_url(url: str) -> str:
     if not isinstance(url, str) or not url.strip():
         raise ValueError("URL ảnh trống")
     url = url.strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not url.startswith(("http://", "https://", "data:")):
+        url = f"https://cf.shopee.ph/file/{url}"
     try:
         parsed = urllib.parse.urlsplit(url)
     except ValueError as e:

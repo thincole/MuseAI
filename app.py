@@ -1152,6 +1152,9 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb, reference_image=ref_img)
+            fn = str(res.get("filename", "")).lower()
+            if res.get("kind") != "video" or not fn.endswith((".mp4", ".webm", ".mov")) or res.get("size", 0) < 200000:
+                raise MuseGenerationError(f"Muse.ai đã sinh ra file không phải video (file: {res.get('filename')}, size: {res.get('size', 0)} bytes)")
             vurl = media_url(res["filename"])
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
                               elapsed=round(time.time() - t0, 1),
@@ -2492,6 +2495,8 @@ def save_temp_clip(req: dict):
         raise HTTPException(400, "part phải là a, b hoặc raw")
 
     src_path = _video_source(filename)
+    if not os.path.isfile(src_path) or os.path.getsize(src_path) < 200000:
+        raise HTTPException(400, f"File video nguồn '{filename}' không hợp lệ hoặc dung lượng quá nhỏ ({os.path.getsize(src_path) if os.path.isfile(src_path) else 0} bytes)")
 
     temp_dir = os.path.join(out_dir, "temp")
     os.makedirs(temp_dir, exist_ok=True)
@@ -2511,6 +2516,10 @@ def save_temp_clip(req: dict):
     shopee_engine.set_cached_clip(item_id, f"clip_{part}", target_path)
     image_url = str(req.get("image_url", "")).strip()
     if image_url:
+        if image_url.startswith("//"):
+            image_url = "https:" + image_url
+        elif not image_url.startswith(("http://", "https://", "data:")) and not os.path.isfile(image_url):
+            image_url = f"https://cf.shopee.ph/file/{image_url}"
         shopee_engine.set_cached_clip(item_id, "image_url", image_url)
     log.info("💾 [Temp Clip] Đã lưu clip thành phần: temp/%s (%s)", target_filename, target_path)
     return {"success": True, "path": target_path, "filename": target_filename}
@@ -2842,18 +2851,26 @@ def auto_stitch_temp_clips(req: dict):
             cand_raw = os.path.join(temp_dir, f"{iid}-raw{ext}")
             if not os.path.isfile(cand_raw):
                 cand_raw = os.path.join(temp_dir, f"{iid}_raw{ext}")
-            if os.path.isfile(cand_raw) and os.path.getsize(cand_raw) >= 10000:
+            if os.path.isfile(cand_raw) and os.path.getsize(cand_raw) >= 200000:
                 f_raw = cand_raw
                 break
 
         if not f_raw:
+            failed_items.append({"item_id": iid, "reason": "Clip raw không hợp lệ hoặc kích thước < 200KB"})
             continue
 
         target_name = f"{iid}.mp4"
-        img_url = product_images.get(iid) or product_images.get(str(iid)) or ""
+        out_final = os.path.join(out_dir, target_name)
+
+        img_url = str(product_images.get(iid) or product_images.get(str(iid)) or "").strip()
         if not img_url:
             cached_info = shopee_engine.get_cached_clips(iid)
-            img_url = cached_info.get("image_url") or ""
+            img_url = str(cached_info.get("image_url") or "").strip()
+        if img_url:
+            if img_url.startswith("//"):
+                img_url = "https:" + img_url
+            elif not img_url.startswith(("http://", "https://", "data:")) and not os.path.isfile(img_url):
+                img_url = f"https://cf.shopee.ph/file/{img_url}"
 
         stitched_raw = False
         temp_img = None
@@ -2870,7 +2887,8 @@ def auto_stitch_temp_clips(req: dict):
                     shutil.copy2(img_url, temp_img)
 
                 if os.path.isfile(temp_img) and os.path.getsize(temp_img) > 100:
-                    ok = shopee_engine.ghep_anh_12s(f_raw, temp_img, out_final, ai_duration=8.0)
+                    raw_dur = shopee_engine.get_media_duration(f_raw)
+                    ok = shopee_engine.ghep_anh_12s(f_raw, temp_img, out_final, ai_duration=raw_dur)
                     if ok:
                         stitched_raw = True
             except Exception as ge:
@@ -2885,7 +2903,7 @@ def auto_stitch_temp_clips(req: dict):
         if not stitched_raw:
             try:
                 shutil.copy2(f_raw, out_final)
-                stitched_raw = os.path.isfile(out_final) and os.path.getsize(out_final) >= 10000
+                stitched_raw = os.path.isfile(out_final) and os.path.getsize(out_final) >= 200000
             except Exception as ce:
                 log.warning("Copy clip raw SP %s sang output thất bại: %s", iid, ce)
 
@@ -3238,7 +3256,7 @@ def save_rendered_video(req: dict):
             os.path.join(temp_dir, f"{item_id}.mp4"),
         ]
         for c in candidates:
-            if os.path.isfile(c) and os.path.getsize(c) > 1000:
+            if os.path.isfile(c) and os.path.getsize(c) >= 200000:
                 src = c
                 break
 
@@ -3247,7 +3265,7 @@ def save_rendered_video(req: dict):
         cached = shopee_engine.get_cached_clips(item_id)
         for ck in ("clip_raw", "clip_a", "final_video"):
             cp = cached.get(ck)
-            if cp and os.path.isfile(cp) and os.path.getsize(cp) > 1000:
+            if cp and os.path.isfile(cp) and os.path.getsize(cp) >= 200000:
                 src = cp
                 break
 
@@ -3256,16 +3274,28 @@ def save_rendered_video(req: dict):
         for fn in os.listdir(CFG.media_dir):
             if item_id in fn and fn.lower().endswith(_VIDEO_EXTS):
                 p = os.path.join(CFG.media_dir, fn)
-                if os.path.isfile(p) and os.path.getsize(p) > 1000:
+                if os.path.isfile(p) and os.path.getsize(p) >= 200000:
                     src = p
                     break
 
-    if not src or not os.path.isfile(src):
-        raise HTTPException(404, f"Không tìm thấy file video nguồn '{filename}' cho sản phẩm {item_id or target_name}")
+    if not src or not os.path.isfile(src) or os.path.getsize(src) < 200000:
+        raise HTTPException(400, f"Không tìm thấy file video nguồn hợp lệ (>200KB) '{filename}' cho sản phẩm {item_id or target_name}")
 
     try:
         os.makedirs(out_dir, exist_ok=True)
         dst = os.path.join(out_dir, target_name)
+
+        # Tự động lấy image_url từ cache nếu client không gửi kèm
+        if not image_url and not image_data_url and item_id:
+            cached_info = shopee_engine.get_cached_clips(item_id)
+            image_url = cached_info.get("image_url") or ""
+
+        if image_url:
+            image_url = str(image_url).strip()
+            if image_url.startswith("//"):
+                image_url = "https:" + image_url
+            elif not image_url.startswith(("http://", "https://", "data:")) and not os.path.isfile(image_url):
+                image_url = f"https://cf.shopee.ph/file/{image_url}"
 
         stitched = False
         temp_img_path = None
@@ -3283,11 +3313,15 @@ def save_rendered_video(req: dict):
                     shutil.copy2(image_url, temp_img_path)
 
                 if os.path.isfile(temp_img_path) and os.path.getsize(temp_img_path) > 100:
-                    log.info("[Ghep 12s] Dang ghep anh Outro (12s, AI: %ss) vao video %s...", ai_dur or "auto", target_name)
+                    log.info("[Ghep 12s] Đang ghép ảnh Outro (12s, AI: %ss) vào video %s...", ai_dur or "auto", target_name)
                     ok = shopee_engine.ghep_anh_12s(src, temp_img_path, dst, ai_duration=ai_dur)
                     if ok:
                         stitched = True
-                        log.info("[Ghep 12s] Thanh cong: %s", dst)
+                        log.info("[Ghep 12s] Ghép thành công: %s", dst)
+                    else:
+                        log.warning("[Ghep 12s] FFmpeg ghep_anh_12s thất bại cho %s, sẽ dùng video gốc", target_name)
+                else:
+                    log.warning("[Ghep 12s] Không chuẩn bị được ảnh Outro cho SP %s (image_url: %s)", item_id, image_url[:60] if image_url else "None")
             except Exception as ge:
                 log.warning("Ghép ảnh 12s không thành công, dùng video gốc: %s", ge)
             finally:
@@ -3296,6 +3330,8 @@ def save_rendered_video(req: dict):
                         os.remove(temp_img_path)
                     except Exception:
                         pass
+        elif ghep_anh:
+            log.warning("[Ghep 12s] Bỏ qua ghép 12s cho SP %s vì thiếu cả image_url lẫn image_data_url", item_id)
 
         if not stitched:
             import shutil

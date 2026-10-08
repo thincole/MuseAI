@@ -3357,7 +3357,15 @@
       if (!pollRes.ok) continue;
       const pData = await pollRes.json();
       if (pData.status === "completed" || pData.status === "succeeded") {
-        return pData.result?.filename || `clip_${taskId}.mp4`;
+        if (pData.result && pData.result.kind === "image") {
+          throw new Error("Muse.ai sinh ra file ảnh thay vì video. Đang bỏ qua kết quả hỏng!");
+        }
+        const fname = pData.result?.filename || `clip_${taskId}.mp4`;
+        const lowFname = fname.toLowerCase();
+        if (lowFname.endsWith(".jpg") || lowFname.endsWith(".jpeg") || lowFname.endsWith(".png") || lowFname.endsWith(".webp")) {
+          throw new Error(`Muse.ai sinh ra định dạng ảnh (${fname}) thay vì video. Đang bỏ qua kết quả hỏng!`);
+        }
+        return fname;
       } else if (pData.status === "failed") {
         throw new Error(pData.error || "Muse.ai báo lỗi render video");
       }
@@ -3488,7 +3496,7 @@
           target_name: targetFileName,
           ghep_anh: false,
           del_img: form.del_img,
-          image_url: prod.image || (prod.images && prod.images[0]) || "",
+          image_url: prod.image_url || prod.image || (prod.images && prod.images[0]) || "",
           image_data_url: null,
           duration: form.duration
         })
@@ -3516,7 +3524,7 @@
 
     // TRƯỜNG HỢP 3: CẦN RENDER CLIP (THIẾU CLIP A HOẶC CLIP B HOẶC LÀ 8S)
     let refImageDataUrl = null;
-    const imgUrl = prod.image || (prod.images && prod.images[0]) || "";
+    const imgUrl = prod.image_url || prod.image || (prod.images && prod.images[0]) || "";
     if (imgUrl) {
       appendShopeeLog(`> [Luồng ${workerId}] Đang tải ảnh SP từ Shopee CDN...`);
       try {
@@ -4058,8 +4066,9 @@
       const prodImages = {};
       const prods = (typeof shopeeClaimedProducts !== "undefined" && Array.isArray(shopeeClaimedProducts)) ? shopeeClaimedProducts : [];
       prods.forEach(p => {
-        if (p.item_id && (p.image || (p.images && p.images[0]))) {
-          prodImages[String(p.item_id)] = p.image || p.images[0];
+        const pImg = p.image_url || p.image || (p.images && p.images[0]) || "";
+        if (p.item_id && pImg) {
+          prodImages[String(p.item_id)] = pImg;
         }
       });
       const ghepAnh = document.getElementById("sp_ghep_anh") ? document.getElementById("sp_ghep_anh").checked : true;
