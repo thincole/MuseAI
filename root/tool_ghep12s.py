@@ -13,8 +13,7 @@ Chức năng:
      - Làm mượt âm thanh với hiệu ứng fade-out nhẹ, chuẩn âm thanh stereo.
   4. Giao diện trực quan Tkinter hiện đại, đa luồng mượt mà, không đơ máy.
 """
-from __future__ import annotations
-
+import atexit
 import concurrent.futures
 import html as html_mod
 import json
@@ -22,6 +21,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import socket
 import ssl
 import subprocess
@@ -43,6 +43,32 @@ log = logging.getLogger("tool_ghep12s")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+
+
+def cleanup_cache_on_exit():
+    """Tự động dọn dẹp sạch toàn bộ file trong shopee_images_cache khi tắt ứng dụng."""
+    c_dir = os.path.join(SCRIPT_DIR, "data", "shopee_images_cache")
+    if os.path.isdir(c_dir):
+        try:
+            cnt = 0
+            for f in os.listdir(c_dir):
+                fp = os.path.join(c_dir, f)
+                try:
+                    if os.path.isfile(fp) or os.path.islink(fp):
+                        os.remove(fp)
+                        cnt += 1
+                    elif os.path.isdir(fp):
+                        shutil.rmtree(fp, ignore_errors=True)
+                        cnt += 1
+                except Exception:
+                    pass
+            if cnt > 0:
+                log.info("🧹 Đã dọn dẹp %d file trong shopee_images_cache khi tắt phần mềm.", cnt)
+        except Exception:
+            pass
+
+
+atexit.register(cleanup_cache_on_exit)
 
 # Thử import shopee_engine để dùng hàm ghep_anh_12s chuẩn
 try:
@@ -450,6 +476,9 @@ class Ghep12sApp:
 
         # Tự động test kết nối DB nhẹ nhàng ở chế độ nền
         self.root.after(500, self.test_db_connection_async)
+
+        # Xử lý dọn dẹp cache khi người dùng tắt cửa sổ phần mềm
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def setup_theme(self):
         """Thiết lập màu sắc và giao diện hiện đại."""
@@ -1173,6 +1202,15 @@ class Ghep12sApp:
     def _reset_ui_state(self):
         self.btn_start.config(state=tk.NORMAL, bg="#22c55e")
         self.btn_stop.config(state=tk.DISABLED, bg="#64748b")
+
+    def on_closing(self):
+        """Xử lý dọn dẹp sạch cache và tài nguyên khi người dùng tắt phần mềm."""
+        self.stop_event.set()
+        cleanup_cache_on_exit()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 # ----------------- ENTRY POINT -----------------

@@ -178,6 +178,35 @@ def fetch_shopee_product(url: str, timeout: int = 15) -> dict | None:
     return info
 
 
+MARKET_DOMAINS = {
+    "PH": "shopee.ph",
+    "VN": "shopee.vn",
+    "MY": "shopee.com.my",
+    "TH": "shopee.co.th",
+    "ID": "shopee.co.id",
+    "SG": "shopee.sg",
+    "TW": "shopee.tw",
+}
+
+
+def fetch_image_url_by_item_id(item_id: str, market: str = "PH", shop_id: str = "") -> str:
+    """Cào link ảnh đại diện khi chỉ còn ItemID (clip temp mồ côi, không còn dữ liệu sản phẩm trên giao diện).
+
+    Trả về "" nếu không lấy được (Shopee chặn, sai thị trường, sản phẩm đã bị gỡ...).
+    """
+    iid = str(item_id or "").strip()
+    if not iid.isdigit():
+        return ""
+    domain = MARKET_DOMAINS.get(str(market or "PH").strip().upper(), "shopee.ph")
+    sid = str(shop_id or "").strip() or "0"
+    try:
+        info = fetch_shopee_product(f"https://{domain}/product/{sid}/{iid}")
+    except Exception as e:
+        log.warning("Cào ảnh theo ItemID %s thất bại: %s", iid, e)
+        return ""
+    return str((info or {}).get("image") or "").strip()
+
+
 def scrape_multiple_shopee_links(links: list[str], max_workers: int = 5) -> list[dict]:
     """Cào thông tin hàng loạt link Shopee chạy song song đa luồng nhanh chóng."""
     results: list[dict] = []

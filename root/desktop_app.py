@@ -289,6 +289,28 @@ def main():
                     print(f"[+] Đã dọn dẹp sạch {del_cnt} file video tạm trong data/media.")
         except Exception:
             pass
+
+        # Dọn dẹp cache ảnh Shopee (shopee_images_cache) khi tắt app để tránh tốn dung lượng
+        try:
+            shopee_cache = os.path.join(BASE_DIR, "data", "shopee_images_cache")
+            if os.path.isdir(shopee_cache):
+                del_s = 0
+                for f in os.listdir(shopee_cache):
+                    fp = os.path.join(shopee_cache, f)
+                    try:
+                        if os.path.isfile(fp) or os.path.islink(fp):
+                            os.remove(fp)
+                            del_s += 1
+                        elif os.path.isdir(fp):
+                            shutil.rmtree(fp, ignore_errors=True)
+                            del_s += 1
+                    except Exception:
+                        pass
+                if del_s > 0:
+                    print(f"[+] Đã dọn dẹp sạch {del_s} ảnh trong data/shopee_images_cache.")
+        except Exception:
+            pass
+
         print("[+] Đã dọn dẹp sạch sẽ tài nguyên và tiến trình.")
 
     import atexit

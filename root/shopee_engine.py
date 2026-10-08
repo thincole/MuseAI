@@ -462,7 +462,11 @@ def _load_json_file(path: str, label: str) -> tuple[dict | None, str]:
 
 
 def get_cached_clips(item_id: str) -> dict:
-    """Lấy danh sách các clip thành phần (Clip A, Clip B) đã render thành công trước đó."""
+    """Lấy các clip thành phần (clip_a / clip_b / clip_raw) còn tồn tại trên đĩa, kèm image_url đã lưu.
+
+    image_url không phải file clip nên không kiểm tra tồn tại: set_cached_clip ghi nó vào cùng entry
+    và đây là nguồn ảnh dự phòng để ghép Outro 12s khi danh sách sản phẩm trên giao diện đã bị xóa.
+    """
     with _CLIP_CACHE_LOCK:
         data, _status = _load_json_file(CLIP_CACHE_FILE, "clip cache")
     if not data:
@@ -472,12 +476,15 @@ def get_cached_clips(item_id: str) -> dict:
         if not isinstance(item_data, dict):
             return {}
         valid = {}
-        for k in ("clip_a", "clip_b"):
+        for k in ("clip_a", "clip_b", "clip_raw"):
             fname = item_data.get(k)
             if fname:
                 fpath = fname if os.path.isabs(fname) else os.path.join(CFG.media_dir, fname)
                 if os.path.isfile(fpath) and os.path.getsize(fpath) > 10000:
                     valid[k] = fname
+        img = str(item_data.get("image_url") or "").strip()
+        if img:
+            valid["image_url"] = img
         return valid
     except Exception as e:
         log.warning("Lỗi đọc clip cache cho %s: %s", item_id, e)
@@ -1169,14 +1176,33 @@ def download_image_to_file(image_url: str, target_path: str, retries: int = 3) -
 
 
 
-def get_media_duration(vp: str) -> float:
-    """Đo thời lượng video bằng ffprobe."""
+def probe_media_duration(vp: str) -> float | None:
+    """Đo thời lượng video bằng ffprobe. Trả về None nếu không đo được (thiếu ffprobe, file hỏng...)."""
     cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', vp]
     try:
         result = _run_ffmpeg_cmd(cmd, timeout=10, text=True)
-        return float(result.stdout.strip())
+        dur = float(result.stdout.strip())
+        return dur if dur > 0 else None
     except Exception:
-        return 8.0
+        return None
+
+
+def get_media_duration(vp: str) -> float:
+    """Như probe_media_duration nhưng mặc định 8.0s khi không đo được (giữ hành vi cũ cho các chỗ gọi khác)."""
+    dur = probe_media_duration(vp)
+    return dur if dur is not None else 8.0
+
+
+OUTRO_TARGET_SECONDS = 12.0
+OUTRO_TOLERANCE_SECONDS = 0.5
+
+
+def is_valid_12s_output(vp: str) -> tuple[bool, float | None]:
+    """Kiểm tra video sau khi ghép Outro thực sự dài ~12s. Trả về (hợp_lệ, thời_lượng_đo_được)."""
+    dur = probe_media_duration(vp)
+    if dur is None:
+        return False, None
+    return abs(dur - OUTRO_TARGET_SECONDS) <= OUTRO_TOLERANCE_SECONDS, dur
 
 
 def ghep_anh_12s(

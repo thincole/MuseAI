@@ -31,9 +31,17 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VERSION_FILE = os.path.join(BASE_DIR, "version.txt")
-REQUIREMENTS_FILE = os.path.join(BASE_DIR, "requirements.txt")
+_CURR_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_CURR_DIR)
+_PARENT_DIR = os.path.dirname(_ROOT_DIR)
+
+if os.path.isfile(os.path.join(_PARENT_DIR, "Chay_MESUAI.bat")) or os.path.isdir(os.path.join(_PARENT_DIR, "root")):
+    BASE_DIR = _PARENT_DIR
+else:
+    BASE_DIR = _ROOT_DIR
+
+VERSION_FILE = os.path.join(_ROOT_DIR, "version.txt")
+REQUIREMENTS_FILE = os.path.join(_ROOT_DIR, "requirements.txt")
 TARGET_REPO = "https://github.com/thincole/MuseAI.git"
 
 GITHUB_ZIP_URLS = [
