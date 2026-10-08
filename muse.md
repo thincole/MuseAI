@@ -18,6 +18,7 @@
 8. [Hệ Thống Lọc Nội Dung & Blacklist Tự Động](#8-hệ-thống-lọc-nội-dung--blacklist-tự-động)
 9. [Thuật Toán Tính Tốc Độ Tạo Video (10-Phút Rolling Window)](#9-thuật-toán-tính-tốc-độ-tạo-video-10-phút-rolling-window)
 10. [Các Đoạn Mã Nguồn Cốt Lõi (Core Code Snippets)](#10-các-đoạn-mã-nguồn-cốt-lõi-core-code-snippets)
+11. [Xử Lý Sự Cố & Tối Ưu Hóa Timeout Render Đa Luồng (Fix Lỗi Hết Thời Gian Chờ Render Clip Video)](#11-xử-lý-sự-cố--tối-ưu-hóa-timeout-render-đa-luồng-fix-lỗi-hết-thời-gian-chờ-render-clip-video)
 
 ---
 
@@ -69,11 +70,13 @@ flowchart LR
     H --> I[Tự động xóa sạch clip tạm A & B]
 ```
 
-### 2.3. Cơ Chế Tái Sử Dụng File Tạm (Temp Reuse)
-Trước khi gửi yêu cầu render lên Muse.ai, hàm `process_shopee_product` luôn quét thư mục `F:\Video AI\VN\Mesu\temp`:
-- Nếu `{item_id}-a.mp4` đã tồn tại: Bỏ qua tạo Clip A.
-- Nếu `{item_id}-b.mp4` đã tồn tại: Bỏ qua tạo Clip B.
-- Nếu cả hai clip đã có sẵn: Chuyển thẳng sang bước ghép FFmpeg, tiết kiệm 100% thời gian và tài nguyên tài khoản.
+### 2.3. Cơ Chế Tái Sử Dụng File Tạm (Temp Reuse) Theo Độ Dài Video
+Trước khi gửi yêu cầu render lên Muse.ai, hệ thống kiểm tra sự tồn tại của file theo độ dài video:
+- **Với video độ dài 8s và 10s**: Tuyệt đối **KHÔNG** kiểm tra hoặc tận dụng clip trong thư mục `temp/` (chỉ kiểm tra xem đã có video thành phẩm hoàn chỉnh trong thư mục xuất hay chưa). Điều này tránh việc nhầm lẫn hoặc tái sử dụng nhầm các clip thô dở dang của video 16s trước đó.
+- **Với video độ dài 16s** (Chế độ ghép Dual-Clip Prompt A + B): Quét thư mục `temp/` (hoặc cấu hình `clip_cache.json`):
+  - Nếu `{item_id}-a.mp4` đã tồn tại: Bỏ qua tạo Clip A.
+  - Nếu `{item_id}-b.mp4` đã tồn tại: Bỏ qua tạo Clip B.
+  - Nếu cả hai clip A và B đã có sẵn: Chuyển thẳng sang bước ghép FFmpeg, tiết kiệm 100% thời gian và tài nguyên tài khoản.
 
 ### 2.4. Thuật Toán Ghép Video Bằng FFmpeg Stream Copy (Không Render Lại)
 Hai clip 8s được tạo ra từ cùng một mô hình Muse.ai có cùng kích thước (`720x1280`), cùng codec (`h264`), cùng FPS (`24fps/25fps`) và cùng profile màu. Do đó, hệ thống sử dụng giao thức **FFmpeg Concat Demuxer** với cờ `-c copy`:
@@ -397,6 +400,42 @@ def extract_ids_from_url(url: str) -> tuple[str, str]:
         
     return "", ""
 ```
+
+---
+
+## 11. XỬ LÝ SỰ CỐ & TỐI ƯU HÓA TIMEOUT RENDER ĐA LUỒNG (FIX LỖI HẾT THỜI GIAN CHỜ RENDER CLIP VIDEO)
+
+### 11.1. Hiện Tượng & Triệu Chứng
+Khi người dùng chạy nhiều luồng đồng thời (ví dụ: 15-20 luồng), nhật ký xử lý ghi nhận hàng loạt luồng báo lỗi đồng thời vào cùng một giây:
+```text
+[11:29:03] ❌ [Luồng 6] Lỗi SP 41209244493: Hết thời gian chờ render clip video
+[11:29:03] ❌ [Luồng 8] Lỗi SP 41832672461: Hết thời gian chờ render clip video
+[11:29:03] ❌ [Luồng 7] Lỗi SP 42024222334: Hết thời gian chờ render clip video
+[11:29:03] ❌ [Luồng 13] Lỗi SP 42122076115: Hết thời gian chờ render clip video
+```
+
+### 11.2. Bản Chất Nguyên Nhân (Root Causes)
+Qua phân tích mã nguồn và nhật ký thực thi chi tiết:
+1. **Lệch Timeout giữa Frontend và Backend**:
+   - Trong `config.py`, Backend cấu hình `MUSE2API_VIDEO_TIMEOUT = 600` (10 phút = 600 giây).
+   - Nhưng trong `studio.html` (`renderSingleVideoClip`), vòng lặp polling kiểm tra trạng thái task (`fetch("/v1/videos/" + taskId)`) bị gán cứng giới hạn:
+     `while (Date.now() - startPoll < 300000)` (300,000ms = 300 giây = đúng 5 phút).
+   - Khi chạy nhiều luồng cùng lúc (15-20 luồng), các tác vụ phải xếp hàng thuê tài khoản (`acquire_account`), khởi tạo Browser Context qua HomeProxy, điều hướng và gửi prompt lên Muse.ai. Dưới tải trọng cao, thời gian render thực tế của Muse.ai có thể kéo dài từ 3.5 đến 5.5 phút.
+   - Khi vượt qua giây thứ 300, Frontend ngay lập tức tự hủy vòng lặp và ném lỗi `throw new Error("Hết thời gian chờ render clip video")`, trong khi Backend thực tế vẫn đang xử lý bình thường. Vì các luồng cùng đợt xuất phát cùng lúc, chúng cùng chạm mốc 300 giây tại cùng một thời điểm.
+
+2. **Thiếu Cơ Chế Phát Hiện Sớm (Quick Fail) Khi Mô Hình Từ Chối / Chỉ Trả Về Văn Bản**:
+   - Trong `engine.py` (lớp `MuseWorkerSession._wait_attachment`), thiếu biến theo dõi văn bản ổn định `last_txt`, `txt_stable`. Nếu tài khoản hết lượt, bị giới hạn tần suất, hoặc mô hình AI trả lời bằng văn bản từ chối (refusal/policy) thay vì sinh video, luồng worker sẽ bị treo ngủ chờ mù quáng suốt 5-10 phút thay vì báo lỗi và giải phóng tài khoản ngay lập tức.
+
+### 11.3. Giải Pháp Đã Triển Khai (Fix Triệt Để)
+1. **Đồng Bộ Timeout Frontend Lên 10 Phút (600s)** trong `studio.html`:
+   - Nâng `maxPollMs = 600000` (600 giây), khớp hoàn toàn với `MUSE2API_VIDEO_TIMEOUT` của Backend.
+   - Bổ sung tham số `timeout: 600` gửi trực tiếp trong payload POST `/v1/videos`.
+   - Bổ sung log báo tiến độ định kỳ mỗi 60 giây (`> [Luồng X] Task ... vẫn đang render trên Muse.ai (120s/600s, tiến độ ~85%)...`) giúp người dùng theo dõi trực quan trạng thái tác vụ.
+2. **Cơ Chế Quick Fail & Quota Detect Trong `MuseWorkerSession`** (`engine.py`):
+   - Bổ sung phát hiện sớm nếu mô hình chỉ trả về văn bản mà không sinh video (kiểm tra `hasStop == False` và `cur_cnt > base_agent_cnt` cùng sự ổn định của văn bản `txt_stable >= 15`), ngay lập tức ném lỗi rõ ràng sau ~8-10 giây thay vì đợi 10 phút.
+   - Nhận diện các từ khóa hết quota/rate-limit mở rộng: `quota exceeded`, `limit reached`, `out of credits`, `token limit`.
+3. **Khuyến Nghị Vận Hành Đa Luồng**:
+   - Khi chạy trên máy trạm thông thường, nên duy trì từ **8 đến 12 luồng song song** để đạt tỷ lệ hoàn thành cao nhất, tránh hiện tượng nghẽn I/O Chrome và nghẽn băng thông proxy.
 
 ---
 

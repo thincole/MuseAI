@@ -2250,6 +2250,7 @@ class MuseWorkerSession:
         deadline = time.time() + timeout
         t_start = time.time()
         stable_src, stable_n = "", 0
+        last_txt, txt_stable = "", 0
         fallback_since = 0.0
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -2324,8 +2325,26 @@ class MuseWorkerSession:
             except Exception:
                 st = {}
             tail = st.get("tail") or ""
-            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail):
-                raise MuseGenerationError("账号额度不足")
+            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit|quota exceeded|limit reached", tail, re.I):
+                raise MuseGenerationError("Tài khoản đã hết hạn ngạch hoặc đạt giới hạn lượt dùng")
+
+            # Phát hiện sớm khi mô hình chỉ trả lời bằng văn bản (không có Stop button và không có video sinh ra)
+            cur_cnt = st.get("cnt") or 0
+            cur_txt = st.get("txt") or ""
+            has_stop = bool(st.get("stop"))
+            if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
+                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact", cur_txt, re.I))
+                if not is_media_report:
+                    if cur_txt == last_txt:
+                        txt_stable += 1
+                    else:
+                        last_txt, txt_stable = cur_txt, 0
+                    if txt_stable >= 15 and elapsed > 8.0:
+                        raise MuseGenerationError(f"Mô hình không sinh video, chỉ phản hồi văn bản: {cur_txt[:120]}")
+                else:
+                    txt_stable = 0
+            else:
+                txt_stable = 0
         return None
 
     def extract_bytes(self, src: str, expect: str = "image", retries: int = 4):

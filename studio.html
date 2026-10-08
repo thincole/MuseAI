@@ -3100,13 +3100,18 @@
     if (!shopeeClaimedProducts || shopeeClaimedProducts.length === 0) return;
     const form = getShopeeFormData();
     const outDir = form.out_dir || "F:/Video AI/PH/shopapi";
+    const durStr = String(form.duration || "").toLowerCase();
+    const promptChoice = String(form.ai_prompt || "").toLowerCase();
+    const is16s = durStr.includes("16") || promptChoice.includes("a + b");
+    const checkDuration = is16s ? 16 : 8;
     try {
       const res = await fetch("/api/shopee/batch-check-clips", {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({
           out_dir: outDir,
-          item_ids: shopeeClaimedProducts.map(p => p.item_id)
+          item_ids: shopeeClaimedProducts.map(p => p.item_id),
+          duration: checkDuration
         })
       });
       if (res.ok) {
@@ -3122,21 +3127,28 @@
               p._status = "completed";
               countFinal++;
             }
-            if (r.has_a) p._clipA = r.clip_a;
-            if (r.has_b) p._clipB = r.clip_b;
-            if (r.has_both && !r.has_final) countBoth++;
-            else if (r.has_a && !r.has_b && !r.has_final) countA++;
-            else if (r.has_b && !r.has_a && !r.has_final) countB++;
+            if (is16s) {
+              if (r.has_a) p._clipA = r.clip_a;
+              if (r.has_b) p._clipB = r.clip_b;
+              if (r.has_both && !r.has_final) countBoth++;
+              else if (r.has_a && !r.has_b && !r.has_final) countA++;
+              else if (r.has_b && !r.has_a && !r.has_final) countB++;
+            } else {
+              p._clipA = null;
+              p._clipB = null;
+            }
           }
         });
         renderShopeeProductsConsole();
         const notices = [];
         if (countFinal > 0) notices.push(`${countFinal} đã có video hoàn chỉnh`);
-        if (countBoth > 0) notices.push(`${countBoth} đã có sẵn cả Clip A+B`);
-        if (countA > 0) notices.push(`${countA} đã có Clip A`);
-        if (countB > 0) notices.push(`${countB} đã có Clip B`);
+        if (is16s) {
+          if (countBoth > 0) notices.push(`${countBoth} đã có sẵn cả Clip A+B`);
+          if (countA > 0) notices.push(`${countA} đã có Clip A`);
+          if (countB > 0) notices.push(`${countB} đã có Clip B`);
+        }
         if (notices.length > 0) {
-          appendShopeeLog(`⚡ [Kiểm tra thư mục temp/output]: Tìm thấy ${notices.join(", ")} -> Sẽ tận dụng ngay, không tạo lại!`);
+          appendShopeeLog(`⚡ [Kiểm tra thư mục output${is16s ? '/temp' : ''}]: Tìm thấy ${notices.join(", ")} -> Sẽ tận dụng ngay, không tạo lại!`);
         }
       }
     } catch (_) {}
@@ -3287,7 +3299,8 @@
       duration: durationSec,
       aspect_ratio: ar,
       size: ar,
-      model: "muse-video"
+      model: "muse-video",
+      timeout: 600
     };
     if (refImageDataUrl) {
       videoPayload.reference_image = refImageDataUrl;
@@ -3307,7 +3320,9 @@
     appendShopeeLog(`> [Luồng ${workerId}] Task ID: ${taskId}. Đang đợi Muse.ai render...`);
 
     const startPoll = Date.now();
-    while (Date.now() - startPoll < 300000) {
+    const maxPollMs = 600000; // 10 phút (600s), khớp hoàn toàn với Backend timeout CFG.video_timeout
+    let lastProgressLogSec = 0;
+    while (Date.now() - startPoll < maxPollMs) {
       if (shopeeForceStopRequested) break;
       await new Promise(r => setTimeout(r, 3000));
       const pollRes = await fetch(`/v1/videos/${taskId}`, { headers: getHeaders() });
@@ -3318,9 +3333,14 @@
       } else if (pData.status === "failed") {
         throw new Error(pData.error || "Muse.ai báo lỗi render video");
       }
+      const elapsedSec = Math.round((Date.now() - startPoll) / 1000);
+      if (elapsedSec - lastProgressLogSec >= 60) {
+        lastProgressLogSec = elapsedSec;
+        appendShopeeLog(`> [Luồng ${workerId}] Task ${taskId.slice(0, 16)}... vẫn đang render trên Muse.ai (${elapsedSec}s/600s, tiến độ ~${pData.progress || 0}%)...`);
+      }
     }
     if (shopeeForceStopRequested) throw new Error("Tiến trình bị buộc dừng khẩn cấp bởi người dùng");
-    throw new Error("Hết thời gian chờ render clip video");
+    throw new Error("Hết thời gian chờ render clip video (đã chờ quá 10 phút)");
   }
 
   async function renderShopeeProductItem(prod, idx, form, outDir, workerId) {
@@ -3362,18 +3382,25 @@
       targetFileName = `${String(idx + 1).padStart(4, "0")}_${prod.item_id}.mp4`;
     }
 
-    // 1. KIỂM TRA NGAY: Video hoàn chỉnh hoặc clip thô -a, -b đã có sẵn trong folder temp hoặc folder xuất chưa
-    let clipAFile = prod._clipA || null;
-    let clipBFile = prod._clipB || null;
+    const durStr = String(form.duration || "").toLowerCase();
+    const promptChoice = String(form.ai_prompt || "").toLowerCase();
+    const is16s = durStr.includes("16") || promptChoice.includes("a + b");
+    const checkDuration = is16s ? 16 : 8;
+
+    // 1. KIỂM TRA NGAY: Video hoàn chỉnh trong folder xuất (và clip thô -a, -b trong folder temp NẾU là video 16s)
+    let clipAFile = is16s ? (prod._clipA || null) : null;
+    let clipBFile = is16s ? (prod._clipB || null) : null;
     let finalVideoFile = prod._final_video || null;
 
     try {
-      const checkRes = await fetch(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}`, { headers: getHeaders() });
+      const checkRes = await fetch(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}&duration=${checkDuration}`, { headers: getHeaders() });
       if (checkRes.ok) {
         const chk = await checkRes.json();
         if (chk.final_video) finalVideoFile = chk.final_video;
-        if (chk.clip_a) clipAFile = chk.clip_a;
-        if (chk.clip_b) clipBFile = chk.clip_b;
+        if (is16s) {
+          if (chk.clip_a) clipAFile = chk.clip_a;
+          if (chk.clip_b) clipBFile = chk.clip_b;
+        }
       }
     } catch (_) {}
 
@@ -3394,10 +3421,6 @@
       }
       return;
     }
-
-    const durStr = String(form.duration || "").toLowerCase();
-    const promptChoice = String(form.ai_prompt || "").toLowerCase();
-    const is16s = durStr.includes("16") || promptChoice.includes("a + b");
 
     let ar = "9:16";
     if (form.aspect.includes("16:9")) ar = "16:9";

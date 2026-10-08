@@ -2513,7 +2513,7 @@ def save_temp_clip(req: dict):
     return {"success": True, "path": target_path, "filename": target_filename}
 
 
-def _inspect_product_clips(target_out: str, item_id: str) -> dict:
+def _inspect_product_clips(target_out: str, item_id: str, duration: int = 16) -> dict:
     clean_id = str(item_id or "").strip()
     res = {
         "clip_a": None,
@@ -2536,68 +2536,69 @@ def _inspect_product_clips(target_out: str, item_id: str) -> dict:
     temp_dir = os.path.join(target_out, "temp")
     res["temp_dir"] = temp_dir
 
-    candidate_temp_dirs = []
-    if os.path.isdir(temp_dir):
-        candidate_temp_dirs.append(temp_dir)
-    def_temp = os.path.join(shopee_engine.DEFAULT_OUT_DIR, "temp")
-    if os.path.isdir(def_temp) and def_temp not in candidate_temp_dirs:
-        candidate_temp_dirs.append(def_temp)
-
     clean_id_low = clean_id.lower()
 
-    # 1. Quét tìm clip_a, clip_b trong các folder temp
-    for tdir in candidate_temp_dirs:
-        try:
-            files = os.listdir(tdir)
-        except OSError:
-            continue
-        for fname in files:
-            if not fname.lower().endswith((".mp4", ".mov", ".webm")):
-                continue
-            lower = fname.lower()
-            fpath = os.path.join(tdir, fname)
+    # 1. Chỉ quét tìm clip_a, clip_b trong các folder temp khi độ dài là 16s (duration >= 16)
+    # Với video độ dài 8s và 10s: tuyệt đối KHÔNG check clip trong folder temp
+    try:
+        dur_val = int(duration or 16)
+    except (ValueError, TypeError):
+        dur_val = 16
+
+    if dur_val >= 16:
+        candidate_temp_dirs = []
+        if os.path.isdir(temp_dir):
+            candidate_temp_dirs.append(temp_dir)
+        def_temp = os.path.join(shopee_engine.DEFAULT_OUT_DIR, "temp")
+        if os.path.isdir(def_temp) and def_temp not in candidate_temp_dirs:
+            candidate_temp_dirs.append(def_temp)
+
+        for tdir in candidate_temp_dirs:
             try:
-                if os.path.getsize(fpath) < 10000:
-                    continue
+                files = os.listdir(tdir)
             except OSError:
                 continue
+            for fname in files:
+                if not fname.lower().endswith((".mp4", ".mov", ".webm")):
+                    continue
+                lower = fname.lower()
+                fpath = os.path.join(tdir, fname)
+                try:
+                    if os.path.getsize(fpath) < 10000:
+                        continue
+                except OSError:
+                    continue
 
-            # Clip A (-a hoặc _a)
-            if not res["clip_a"]:
-                if (lower == f"{clean_id_low}-a.mp4" or lower == f"{clean_id_low}_a.mp4" or
-                    lower.startswith(f"{clean_id_low}-a.") or lower.startswith(f"{clean_id_low}_a.")):
-                    res["clip_a"] = fpath
+                # Clip A (-a hoặc _a)
+                if not res["clip_a"]:
+                    if (lower == f"{clean_id_low}-a.mp4" or lower == f"{clean_id_low}_a.mp4" or
+                        lower.startswith(f"{clean_id_low}-a.") or lower.startswith(f"{clean_id_low}_a.")):
+                        res["clip_a"] = fpath
+                        res["has_a"] = True
+
+                # Clip B (-b hoặc _b)
+                if not res["clip_b"]:
+                    if (lower == f"{clean_id_low}-b.mp4" or lower == f"{clean_id_low}_b.mp4" or
+                        lower.startswith(f"{clean_id_low}-b.") or lower.startswith(f"{clean_id_low}_b.")):
+                        res["clip_b"] = fpath
+                        res["has_b"] = True
+
+        # 2. Fallback kiểm tra clip cache file (clip_cache.json) cho 16s
+        if not res["clip_a"] or not res["clip_b"]:
+            try:
+                cached = shopee_engine.get_cached_clips(clean_id)
+                if not res["clip_a"] and cached.get("clip_a"):
+                    res["clip_a"] = cached["clip_a"]
                     res["has_a"] = True
-
-            # Clip B (-b hoặc _b)
-            if not res["clip_b"]:
-                if (lower == f"{clean_id_low}-b.mp4" or lower == f"{clean_id_low}_b.mp4" or
-                    lower.startswith(f"{clean_id_low}-b.") or lower.startswith(f"{clean_id_low}_b.")):
-                    res["clip_b"] = fpath
+                if not res["clip_b"] and cached.get("clip_b"):
+                    res["clip_b"] = cached["clip_b"]
                     res["has_b"] = True
+            except Exception:
+                pass
 
-            # Clip raw (8s)
-            if not res["clip_raw"]:
-                if (lower == f"{clean_id_low}-raw.mp4" or lower == f"{clean_id_low}_raw.mp4" or
-                    lower.startswith(f"{clean_id_low}-raw.") or lower.startswith(f"{clean_id_low}_raw.")):
-                    res["clip_raw"] = fpath
+        res["has_both"] = bool(res["clip_a"] and res["clip_b"])
 
-    # 2. Fallback kiểm tra clip cache file (clip_cache.json)
-    if not res["clip_a"] or not res["clip_b"]:
-        try:
-            cached = shopee_engine.get_cached_clips(clean_id)
-            if not res["clip_a"] and cached.get("clip_a"):
-                res["clip_a"] = cached["clip_a"]
-                res["has_a"] = True
-            if not res["clip_b"] and cached.get("clip_b"):
-                res["clip_b"] = cached["clip_b"]
-                res["has_b"] = True
-        except Exception:
-            pass
-
-    res["has_both"] = bool(res["clip_a"] and res["clip_b"])
-
-    # 3. Quét kiểm tra video hoàn chỉnh trong target_out
+    # 3. Quét kiểm tra video hoàn chỉnh trong target_out (áp dụng cho mọi độ dài)
     candidate_out_dirs = [target_out] if os.path.isdir(target_out) else []
     if os.path.isdir(shopee_engine.DEFAULT_OUT_DIR) and shopee_engine.DEFAULT_OUT_DIR not in candidate_out_dirs:
         candidate_out_dirs.append(shopee_engine.DEFAULT_OUT_DIR)
@@ -2632,12 +2633,13 @@ def _inspect_product_clips(target_out: str, item_id: str) -> dict:
 
 
 @app.get("/api/shopee/check-temp-clips")
-def check_temp_clips(out_dir: str = "", item_id: str = ""):
-    """Kiểm tra xem các clip thô {item_id}-a.mp4 và {item_id}-b.mp4 hoặc video hoàn chỉnh đã có sẵn chưa."""
+def check_temp_clips(out_dir: str = "", item_id: str = "", duration: int = 16):
+    """Kiểm tra xem các clip thô {item_id}-a.mp4 và {item_id}-b.mp4 hoặc video hoàn chỉnh đã có sẵn chưa.
+    Với video độ dài 8s và 10s: chỉ kiểm tra video hoàn chỉnh trong out_dir, bỏ qua thư mục temp."""
     saved_cfg = _get_shopee_settings()
     target_out = (out_dir or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
     target_out = os.path.normpath(target_out)
-    return _inspect_product_clips(target_out, item_id)
+    return _inspect_product_clips(target_out, item_id, duration=duration)
 
 
 @app.post("/api/shopee/batch-check-clips")
@@ -2646,12 +2648,13 @@ def batch_check_shopee_clips(req: dict):
     saved_cfg = _get_shopee_settings()
     out_dir = (req.get("out_dir") or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
     out_dir = os.path.normpath(out_dir)
+    duration = int(req.get("duration", 16) or 16)
     item_ids = req.get("item_ids") or []
     results = {}
     for iid in item_ids:
         sid = str(iid).strip()
         if sid:
-            results[sid] = _inspect_product_clips(out_dir, sid)
+            results[sid] = _inspect_product_clips(out_dir, sid, duration=duration)
     return {"success": True, "results": results}
 
 
