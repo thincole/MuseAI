@@ -75,3 +75,7 @@ Thumbs.db
 *.zip
 *.tar.gz
 *.tar
+
+root/data/proxy_settings.json
+root/data/tasks.archive-*.json
+root/data/stuck_debug/
