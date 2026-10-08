@@ -2885,11 +2885,18 @@
     } catch (_) {}
   }
 
+  // Giữ tối đa N dòng: nối chuỗi innerText vô hạn khiến mỗi dòng log mới phải vẽ lại toàn bộ khung (càng chạy lâu càng lag).
+  const SHOPEE_LOG_MAX_LINES = 400;
   function appendShopeeLog(msg) {
     const logEl = document.getElementById("shopeeLiveLog");
     if (!logEl) return;
     const time = new Date().toLocaleTimeString("vi-VN", {hour: "2-digit", minute: "2-digit", second: "2-digit"});
-    logEl.innerText += `\n[${time}] ${msg}`;
+    const line = document.createElement("div");
+    line.textContent = `[${time}] ${msg}`;
+    logEl.appendChild(line);
+    while (logEl.childElementCount > SHOPEE_LOG_MAX_LINES) {
+      logEl.removeChild(logEl.firstElementChild);
+    }
     logEl.scrollTop = logEl.scrollHeight;
   }
 
@@ -3008,19 +3015,27 @@
     }, 350);
   }
 
+  // HTML đã vẽ cho từng dòng: lần vẽ sau chỉ thay những dòng đổi trạng thái thay vì dựng lại cả nghìn dòng.
+  let _shopeeConsoleRowsHtml = [];
+
+  function _escHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+  }
+
   function _doRenderShopeeProductsConsole() {
     const consoleEl = document.getElementById("shopeeProductsConsole");
     const countEl = document.getElementById("shopeeProductCount");
     if (!shopeeClaimedProducts || shopeeClaimedProducts.length === 0) {
       consoleEl.innerHTML = "Chưa có sản phẩm nào. Bấm [📥 Nhận SP] từ Database hoặc [🔗 Import URL (TXT)] từ file link để tạo video!";
       countEl.innerText = "0 SP";
+      _shopeeConsoleRowsHtml = [];
       return;
     }
     const m = (document.getElementById("sp_market") ? document.getElementById("sp_market").value : "PH");
     const symMap = { "VN": "₫", "ID": "Rp", "TH": "฿", "MY": "RM", "TW": "NT$", "SG": "S$", "PH": "₱" };
     const sym = symMap[m] || "₱";
     countEl.innerText = `${shopeeClaimedProducts.length} SP`;
-    consoleEl.innerHTML = shopeeClaimedProducts.map((p, idx) => {
+    const rows = shopeeClaimedProducts.map((p, idx) => {
       const statusIcon = p._status === "completed" ? "✅" : (p._status === "processing" ? "🔄" : (p._status === "failed" ? "❌" : "⏳"));
       const sold = p.historical_sold ?? p.sold ?? 0;
       const comm = p.commission_rate ? (p.commission_rate * 100).toFixed(0) : (p.commission ?? "0");
@@ -3036,9 +3051,20 @@
       } else if (p._clipB) {
         clipHint = ` <span style="background:rgba(251,191,36,0.2);color:#fbbf24;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(251,191,36,0.3);">[Có sẵn Clip B]</span>`;
       }
-      const line = `${statusIcon} [${idx + 1}] ${isImportedBadge}ID: ${p.item_id} | ${p.name || ''} | ${sym}${price} | Sold: ${sold} | Comm: ${comm}%${clipHint}`;
+      const line = `${statusIcon} [${idx + 1}] ${isImportedBadge}ID: ${_escHtml(p.item_id)} | ${_escHtml(p.name || '')} | ${sym}${_escHtml(price)} | Sold: ${_escHtml(sold)} | Comm: ${_escHtml(comm)}%${clipHint}`;
       return `<div style="margin-bottom:3px;${p._status === 'completed' ? 'color:#34d399;' : (p._status === 'failed' ? 'color:#f87171;' : '')}">${line}</div>`;
-    }).join("");
+    });
+
+    const sameShape = rows.length === _shopeeConsoleRowsHtml.length && consoleEl.childElementCount === rows.length;
+    if (!sameShape) {
+      consoleEl.innerHTML = rows.join("");
+    } else {
+      const children = consoleEl.children;
+      for (let i = 0; i < rows.length; i++) {
+        if (rows[i] !== _shopeeConsoleRowsHtml[i]) children[i].outerHTML = rows[i];
+      }
+    }
+    _shopeeConsoleRowsHtml = rows;
   }
 
   async function batchCheckClipsForConsole() {

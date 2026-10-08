@@ -395,7 +395,7 @@ class MuseEngine:
             "--autoplay-policy=no-user-gesture-required",
             "--mute-audio",
             "--disable-smooth-scrolling",
-            "--window-size=1024,768",
+            "--window-size=1440,900",
             f"--remote-debugging-port={self.cfg.cdp_port}",
             # 仅允许本机 DevTools 客户端（cdp.py 会显式发送匹配的 Origin），
             # 不再用 "*"：否则任意网页都可借浏览器连上 CDP。
@@ -406,7 +406,7 @@ class MuseEngine:
             "--webrtc-ip-handling-policy=disable_non_proxied_udp",
             "--force-webrtc-ip-handling-policy",
             "--disable-features=IsolateOrigins,site-per-process",
-            "--lang=vi-VN,vi,en-US,en",
+            "--lang=en-US,en",
             "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "about:blank",
         ]
@@ -434,8 +434,14 @@ class MuseEngine:
         os.makedirs(self.cfg.data_dir, exist_ok=True)
         self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
         cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
+        popen_kw = {}
+        if os.name == "nt":
+            # Ưu tiên thấp: Windows nhường CPU cho chuột/bàn phím/giao diện trước, máy không bị đơ khi render
+            # nhiều luồng. Các tiến trình con của Chrome (renderer, GPU, utility) kế thừa mức ưu tiên này.
+            popen_kw["creationflags"] = (getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+                                         | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
         self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
-                                     env=env, cwd=cwd_dir)
+                                     env=env, cwd=cwd_dir, **popen_kw)
         last = None
         for _ in range(90):
             try:
@@ -1067,12 +1073,7 @@ class MuseEngine:
                     att = best
                 else:
                     fallback_att = atts[-1]
-            if att is None and fallback_att is not None and expect == "video":
-                # 图片兜底：只有宽限期内仍未出现视频节点才接受
-                if fallback_since == 0.0:
-                    fallback_since = time.time()
-                if time.time() - fallback_since >= 15.0:
-                    att = fallback_att
+            # Task video KHÔNG nhận ảnh bìa làm kết quả (xem bản MuseWorkerSession._wait_attachment).
             if att:
                 src = att.get("src") or ""
                 v_src = att.get("vSrc") or ""
@@ -1086,7 +1087,8 @@ class MuseEngine:
                 if is_fallback:
                     want = True  # 宽限期已过，接受图片兜底结果
                 elif expect == "video":
-                    want = has_video or ("video" in tid) or ("video" in src) or ("video" in v_src) or src.endswith((".mp4", ".webm", ".mov"))
+                    # Chỉ nhận khi đã có NGUỒN video thật; thẻ gắn nhãn "video" mà mới có ảnh bìa thì chờ tiếp.
+                    want = bool(v_src) or src.lower().split("?", 1)[0].endswith((".mp4", ".webm", ".mov"))
                 else:
                     want = ("image" in tid) or (not has_video)
                 check_src = v_src if (expect == "video" and v_src) else src
@@ -1592,7 +1594,8 @@ class MuseEngine:
             candidates.append(att["vSrc"])
         if att.get("src") and att.get("src") not in candidates:
             candidates.append(att["src"])
-        if att.get("iSrc") and att.get("iSrc") not in candidates:
+        # Ảnh (iSrc) chỉ là kết quả với task ảnh; với video nó là ảnh bìa -> không bao giờ tải.
+        if expect != "video" and att.get("iSrc") and att.get("iSrc") not in candidates:
             candidates.append(att["iSrc"])
 
         selected_src = candidates[0] if candidates else ""
@@ -1890,6 +1893,10 @@ class MuseEngine:
             expired = session.is_expired()
             alive = (not expired) and session.is_alive()
         close_it = error or close_requested or not pooled or expired or not alive
+        if not close_it:
+            # Còn giữ trong pool: dừng video vừa sinh (đang tự phát lặp) trước khi trả về, lúc phiên
+            # vẫn in_use nên không luồng nào khác đang điều khiển trang này.
+            session.pause_media()
         with cond:
             session.in_use = False
             cur = self._session_pool.get(session.account_id)
@@ -1967,6 +1974,12 @@ class MuseEngine:
                 "in_use": in_use,
             })
         return out
+
+
+# Prompt hiện "Delivery not confirmed" liên tục quá số giây này thì coi như VM của tài khoản không kết nối được.
+UNDELIVERED_GRACE_SECONDS = 75
+# Sau khi gửi bao lâu mà trang vẫn ở /thread/new và agent chưa trả lời thì coi là prompt không tới được VM.
+STUCK_NEW_THREAD_SECONDS = 150
 
 
 class MuseWorkerSession:
@@ -2058,18 +2071,25 @@ class MuseWorkerSession:
 
     def _scroll_bottom(self):
         try:
-            self.page.js(
-                "(function(){"
-                "var els=[...document.querySelectorAll('*')].filter(function(e){"
-                "var s=getComputedStyle(e);"
-                "return (s.overflowY==='auto'||s.overflowY==='scroll')"
-                "&&e.scrollHeight>e.clientHeight+100;});"
-                "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
-                "if(els[0])els[0].scrollTop=els[0].scrollHeight;"
-                "var s=document.scrollingElement||document.body;"
-                "s.scrollTop=s.scrollHeight;"
-                "var el=document.querySelector('textarea');"
-                "if(el)el.scrollIntoView({block:'end'});return 1;})()")
+            # Bản có cache vùng cuộn (window.__m2aScroller) — không quét toàn bộ DOM mỗi lần gọi.
+            self.page.js(_SCROLL_BOTTOM_JS)
+        except Exception:
+            pass
+
+    _PAUSE_MEDIA_JS = (
+        "(function(){var n=0;document.querySelectorAll('video,audio').forEach(function(m){"
+        "try{m.pause();m.removeAttribute('src');"
+        "m.querySelectorAll('source').forEach(function(s){s.remove();});m.load();n++;}catch(e){}});"
+        "return n;})()"
+    )
+
+    def pause_media(self):
+        """Dừng và tháo nguồn mọi video/audio trên trang. Video Muse vừa sinh ra tự phát lặp và bị giải mã
+        bằng CPU (đã tắt GPU) suốt thời gian phiên nằm chờ trong pool -> tốn CPU vô ích."""
+        if self.is_closed:
+            return
+        try:
+            self.page.js(self._PAUSE_MEDIA_JS, timeout=5)
         except Exception:
             pass
 
@@ -2095,10 +2115,42 @@ class MuseWorkerSession:
         except Exception:
             pass
 
+    _USER_MSG_STATE_JS = (
+        "(function(){var g=[].slice.call(document.querySelectorAll('[class*=\"group/msg\"]'))"
+        ".filter(function(x){return x.querySelector('[class*=\"chat-user-bubble\"]');});"
+        "var last=g.length?g[g.length-1]:null;"
+        "return JSON.stringify({n:g.length,imgs:last?last.querySelectorAll('img').length:0});})()"
+    )
+
+    def _user_msg_state(self) -> tuple[int, int]:
+        """(số tin nhắn của người dùng trên trang, số ảnh trong tin nhắn cuối)."""
+        try:
+            st = json.loads(self.page.js(self._USER_MSG_STATE_JS) or "{}")
+            return int(st.get("n") or 0), int(st.get("imgs") or 0)
+        except Exception:
+            return -1, -1
+
+    def _ensure_sent_with_image(self, base_user_msgs: int, wait_seconds: float = 20.0):
+        """Tin nhắn vừa gửi phải kèm ảnh tham chiếu. Nếu bong bóng tin nhắn mới hiện ra mà không có ảnh thì Muse
+        sẽ trả lời "không nhận được ảnh" sau 1-4 phút -> báo lỗi ngay để đổi tài khoản."""
+        if base_user_msgs < 0:
+            return
+        deadline = time.time() + wait_seconds
+        n = imgs = 0
+        while time.time() < deadline:
+            n, imgs = self._user_msg_state()
+            if n > base_user_msgs and imgs > 0:
+                return
+            time.sleep(0.5)
+        if n > base_user_msgs and imgs == 0:
+            raise MuseGenerationError("Prompt đã gửi nhưng KHÔNG kèm ảnh tham chiếu (upload ảnh chưa xong) — đổi sang tài khoản khác")
+
     def _attach_image(self, image_data: str):
         b64, mime = self.engine._normalize_image(image_data)
         if not b64:
-            return
+            # Không có ảnh mà prompt lại ghi "dựa trên ảnh vừa tải lên" -> Muse trả lời "không nhận được ảnh",
+            # phí 1-4 phút. Dừng ngay để đổi tài khoản / báo lỗi rõ ràng.
+            raise MuseGenerationError("Không đọc được ảnh tham chiếu, đã dừng trước khi gửi prompt")
         _INJECT_JS = """
         (function(b64, mime) {
             try {
@@ -2166,6 +2218,26 @@ class MuseWorkerSession:
             if has_attached:
                 break
             time.sleep(0.3)
+        else:
+            raise MuseGenerationError("Ảnh tham chiếu chưa đính kèm được vào ô soạn tin sau 15s, đã dừng trước khi gửi prompt")
+
+        # Ảnh xem trước hiện ra ngay khi chọn file, nhưng upload lên Muse có thể chưa xong (nhất là qua proxy).
+        # Chờ (tối đa 45s) cho các dấu hiệu "đang tải" trong ô soạn tin biến mất rồi mới gửi.
+        busy_deadline = time.time() + 45.0
+        while time.time() < busy_deadline:
+            try:
+                busy = self.page.js(
+                    """(function(){
+                    var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+                    var c = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
+                    if (!c) return false;
+                    return !!c.querySelector('[role="progressbar"],[aria-busy="true"],[class*="animate-spin"],[class*="uploading" i]');
+                    })()""")
+            except Exception:
+                busy = False
+            if not busy:
+                break
+            time.sleep(0.5)
         time.sleep(0.5)
 
     def _send(self, prompt: str):
@@ -2246,6 +2318,43 @@ class MuseWorkerSession:
         time.sleep(0.3)
         return clicked
 
+    def _diagnose_stuck(self, reason: str):
+        """Ghi lại trạng thái trang + ảnh chụp màn hình khi prompt kẹt, để biết tin nhắn có thật sự được gửi không."""
+        try:
+            raw = self.page.js(
+                "(function(){var ta=document.querySelector('textarea');"
+                "var btns=[].slice.call(document.querySelectorAll('button,[role=button]'))"
+                ".filter(function(x){return x.offsetParent!==null;})"
+                ".map(function(x){return (x.getAttribute('aria-label')||x.getAttribute('data-testid')||(x.innerText||'')).slice(0,40)"
+                "+(x.disabled?' [disabled]':'');}).slice(0,30);"
+                "var users=document.querySelectorAll('[class*=\"chat-user-bubble\"]').length;"
+                "return JSON.stringify({url:location.href,lang:document.documentElement.lang,"
+                "viewport:innerWidth+'x'+innerHeight,textarea_len:ta?(ta.value||'').length:-1,"
+                "user_bubbles:users,buttons:btns,body_tail:(document.body?document.body.innerText:'').slice(-400)});})()")
+        except Exception as exc:  # noqa: BLE001
+            raw = f"js-error: {exc}"
+        shot = ""
+        try:
+            d = os.path.join(self.engine.cfg.data_dir, "stuck_debug")
+            os.makedirs(d, exist_ok=True)
+            tag = f"{self.account_id}-{int(time.time())}"
+            r = self.page.send("Page.captureScreenshot", {"format": "jpeg", "quality": 60}, timeout=15)
+            data = (r.get("result") or {}).get("data")
+            if data:
+                shot = os.path.join(d, tag + ".jpg")
+                with open(shot, "wb") as f:
+                    f.write(base64.b64decode(data))
+            # Giữ tối đa 30 ảnh gần nhất để không đầy ổ đĩa
+            files = sorted((os.path.join(d, x) for x in os.listdir(d)), key=os.path.getmtime)
+            for old in files[:-30]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning("🔎 [Stuck Debug] TK %s (%s) state=%s screenshot=%s", self.account_id, reason, raw, shot or "n/a")
+
     def _wait_attachment(self, baseline_src: str, timeout: int, expect: str,
                          on_progress=None, base_agent_cnt: int = 0,
                          base_att_cnt: int = 0, stop_event=None, baseline_sources=None) -> dict | None:
@@ -2255,6 +2364,7 @@ class MuseWorkerSession:
         stable_src, stable_n = "", 0
         last_txt, txt_stable = "", 0
         fallback_since = 0.0
+        undelivered_since = 0.0
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
@@ -2275,11 +2385,9 @@ class MuseWorkerSession:
                     att = best
                 else:
                     fallback_att = atts[-1]
-            if att is None and fallback_att is not None and expect == "video":
-                if fallback_since == 0.0:
-                    fallback_since = time.time()
-                if time.time() - fallback_since >= 15.0:
-                    att = fallback_att
+            # Task video KHÔNG BAO GIỜ nhận ảnh làm kết quả: Muse hiện ảnh bìa (khung hình đầu) trước, video tới
+            # sau — nhất là khi đi qua proxy chậm. Trước đây sau 15s sẽ "vồ" ảnh bìa này, bị loại vì không phải
+            # video và video thật bị bỏ phí. Cứ chờ đến khi có thẻ <video> hoặc hết timeout.
             if att:
                 src = att.get("src") or ""
                 v_src = att.get("vSrc") or ""
@@ -2293,7 +2401,8 @@ class MuseWorkerSession:
                 if is_fallback:
                     want = True
                 elif expect == "video":
-                    want = has_video or ("video" in tid) or ("video" in src) or ("video" in v_src) or src.endswith((".mp4", ".webm", ".mov"))
+                    # Chỉ nhận khi đã có NGUỒN video thật; thẻ gắn nhãn "video" mà mới có ảnh bìa thì chờ tiếp.
+                    want = bool(v_src) or src.lower().split("?", 1)[0].endswith((".mp4", ".webm", ".mov"))
                 else:
                     want = ("image" in tid) or (not has_video)
                 check_src = v_src if (expect == "video" and v_src) else src
@@ -2322,7 +2431,14 @@ class MuseWorkerSession:
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
                     var tail = document.body ? (document.body.innerText||'').slice(-700) : '';
-                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail});
+                    // Chữ đỏ "Delivery not confirmed" nằm trong nhóm tin nhắn của CHÍNH prompt vừa gửi
+                    // (không lấy chữ "Connecting..." ở thanh bên vì có thể là trạng thái cũ).
+                    var groups = [].slice.call(document.querySelectorAll('[class*="group/msg"]'))
+                        .filter(function(g){return g.querySelector('[class*="chat-user-bubble"]');});
+                    var lastUser = groups.length ? groups[groups.length-1] : null;
+                    var undelivered = !!(lastUser && /Delivery not confirmed/i.test(lastUser.innerText||''));
+                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail, undelivered: undelivered,
+                                           new_thread: location.pathname === '/thread/new'});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
             except Exception:
@@ -2331,10 +2447,32 @@ class MuseWorkerSession:
             if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit|quota exceeded|limit reached", tail, re.I):
                 raise MuseGenerationError("Tài khoản đã hết hạn ngạch hoặc đạt giới hạn lượt dùng")
 
-            # Phát hiện sớm khi mô hình chỉ trả lời bằng văn bản (không có Stop button và không có video sinh ra)
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
+
+            # Prompt kẹt "Delivery not confirmed / Connecting...": VM của tài khoản chưa kết nối được nên tin nhắn
+            # chưa hề tới Muse. Trước đây phải chờ mù hết timeout (10 phút); giờ quá ngưỡng thì báo lỗi để
+            # _run_generation đóng phiên này và chuyển sang tài khoản khác ngay.
+            no_reply = cur_cnt <= base_agent_cnt and len(atts) <= base_att_cnt
+            if st.get("undelivered") and not has_stop and no_reply:
+                if undelivered_since == 0.0:
+                    undelivered_since = time.time()
+                elif time.time() - undelivered_since >= UNDELIVERED_GRACE_SECONDS:
+                    raise MuseGenerationError(
+                        f"Prompt chưa tới được máy ảo Muse sau {UNDELIVERED_GRACE_SECONDS}s "
+                        f"(Delivery not confirmed / Connecting...) — đổi sang tài khoản khác")
+            else:
+                undelivered_since = 0.0
+            # Tín hiệu sớm hơn: prompt tới được Muse thì trang chuyển sang /thread/<id> và agent trả lời. Kẹt ở
+            # /thread/new mà không có trả lời quá ngưỡng = VM không nhận prompt (chữ đỏ chỉ hiện sau ~5 phút).
+            if st.get("new_thread") and no_reply and elapsed >= STUCK_NEW_THREAD_SECONDS:
+                self._diagnose_stuck("stuck /thread/new")
+                raise MuseGenerationError(
+                    f"Prompt chưa tới được máy ảo Muse sau {STUCK_NEW_THREAD_SECONDS}s "
+                    f"(vẫn ở /thread/new, agent chưa trả lời) — đổi sang tài khoản khác")
+
+            # Phát hiện sớm khi mô hình chỉ trả lời bằng văn bản (không có Stop button và không có video sinh ra)
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
                 is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact", cur_txt, re.I))
                 if not is_media_report:
@@ -2351,48 +2489,44 @@ class MuseWorkerSession:
         return None
 
     def extract_bytes(self, src: str, expect: str = "image", retries: int = 4):
+        # Link http(s): tải thẳng bằng Python, không phải mã hóa cả video thành base64 rồi đẩy qua CDP.
+        if src and src.startswith(("http://", "https://")):
+            data, mime, url = self._direct_python_download(src)
+            if data:
+                return data, mime, url
+        # blob:/data: hoặc tải thẳng lỗi: đọc trong trang theo từng khối 8MB thay vì 1 chuỗi base64 khổng lồ.
+        last = "?"
         for _ in range(retries):
-            raw = self.page.js(self.engine._EXTRACT_JS % (json.dumps(src), json.dumps(expect)),
-                               await_promise=True, timeout=600)
             try:
-                res = json.loads(raw) if raw else {}
-                if res.get("ok"):
-                    b64_str = res.get("b64") or res.get("data")
-                    if b64_str:
-                        return base64.b64decode(b64_str), res.get("mime", ""), res.get("url", "")
-                elif res.get("err"):
-                    log.warning("Worker extract_bytes JS error: %s", res.get("err"))
-            except Exception as e:
-                log.warning("Worker extract_bytes parse error: %s", e)
+                info = _cdp_extract_media(self.page, src)
+            except Exception as exc:  # noqa: BLE001
+                info = {"ok": False, "err": f"{type(exc).__name__}: {str(exc)[:150]}"}
+            if info.get("ok"):
+                return info["data"], info.get("mime", ""), info.get("url", "")
+            last = info.get("err", "?")
             time.sleep(1.0)
+        log.warning("Worker extract_bytes thất bại: %s", last)
         return None, None, None
 
     def _direct_python_download(self, url: str) -> tuple[bytes | None, str, str]:
-        """Tải trực tiếp byte media từ URL qua Python requests (bỏ qua CORS trình duyệt)."""
+        """Tải trực tiếp byte media qua Python (kèm cookie của trang + proxy của phiên), có giới hạn dung lượng
+        và từ chối trang HTML/JSON lỗi để không lưu nhầm thành video."""
         if not url or not url.startswith(("http://", "https://")):
             return None, "", ""
-        import requests
         proxies = None
         if self.forwarder_port:
             proxies = {
                 "http": f"http://127.0.0.1:{self.forwarder_port}",
                 "https": f"http://127.0.0.1:{self.forwarder_port}",
             }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Referer": "https://muse.ai/",
-            "Accept": "*/*",
-        }
         try:
-            resp = requests.get(url, headers=headers, proxies=proxies, timeout=60, stream=True)
-            if resp.status_code == 200:
-                content = resp.content
-                if len(content) > 1024:
-                    mime = resp.headers.get("content-type") or ""
-                    log.info("📥 [Worker Direct Python Download] Đã tải %d bytes thành công từ %s (Proxy Forwarder: %s)",
-                             len(content), url[:80], self.forwarder_port)
-                    return content, mime, url
-        except Exception as e:
+            content, info = _http_download_media(url, proxies, _page_cookie_header(self.page, url), timeout=60)
+            if content:
+                log.info("📥 [Worker Direct Python Download] Đã tải %d bytes từ %s (Proxy Forwarder: %s)",
+                         len(content), url[:80], self.forwarder_port)
+                return content, info, url
+            log.info("Worker direct download bỏ qua %s: %s", url[:80], info)
+        except Exception as e:  # noqa: BLE001
             log.warning("Worker direct python download error for %s: %s", url[:80], e)
         return None, "", ""
 
@@ -2455,9 +2589,13 @@ class MuseWorkerSession:
         base = atts_before[-1] if atts_before else {}
         baseline_src = base.get("src") or ""
         base_agent_cnt = self._agent_count()
+        base_user_msgs, _ = self._user_msg_state()
 
         if self._send(prompt) not in ("clicked", "enter-sent"):
             raise MuseGenerationError("提示词发送未确认，已停止生成")
+
+        if reference_image:
+            self._ensure_sent_with_image(base_user_msgs)
 
         att = self._wait_attachment(
             baseline_src, timeout, expect, on_progress=on_progress,
@@ -2473,7 +2611,8 @@ class MuseWorkerSession:
             candidates.append(att["vSrc"])
         if att.get("src") and att.get("src") not in candidates:
             candidates.append(att["src"])
-        if att.get("iSrc") and att.get("iSrc") not in candidates:
+        # Ảnh (iSrc) chỉ là kết quả với task ảnh; với video nó là ảnh bìa -> không bao giờ tải.
+        if expect != "video" and att.get("iSrc") and att.get("iSrc") not in candidates:
             candidates.append(att["iSrc"])
 
         data = mime = url = None

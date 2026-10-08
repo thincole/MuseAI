@@ -9,6 +9,14 @@ import time
 import uuid
 
 _LOCK = threading.Lock()
+# Khóa riêng cho tasks.json: ghi task không được chặn việc thuê/trả tài khoản (_LOCK).
+_TASK_LOCK = threading.Lock()
+
+# Tiến độ (progress) đổi mỗi ~0.6s cho từng luồng render: chỉ cập nhật RAM, ghi đĩa tối đa mỗi N giây.
+TASK_PERSIST_INTERVAL = 5.0
+# Chỉ giữ N task đã kết thúc mới nhất trong tasks.json (task đang chạy luôn được giữ).
+TASKS_KEEP = max(50, int(os.environ.get("MUSE2API_TASKS_KEEP", "500") or 500))
+_TERMINAL_STATUSES = ("completed", "succeeded", "success", "done", "failed")
 
 # 决定账号生死的核心 cookie（与 engine.ESSENTIAL_COOKIES 保持一致）
 ESSENTIAL_COOKIES = ("hatch_sess", "hatch_gw", "hatch_vml",
@@ -81,13 +89,14 @@ def _read(path: str, default):
         return default
 
 
-def _write(path: str, obj):
+def _write(path: str, obj, compact: bool = False):
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
+    dump_kw = {"separators": (",", ":")} if compact else {"indent": 1}
     fd, tmp = tempfile.mkstemp(dir=d)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=1)
+            json.dump(obj, f, ensure_ascii=False, **dump_kw)
         for attempt in range(5):
             try:
                 os.replace(tmp, path)
@@ -95,7 +104,7 @@ def _write(path: str, obj):
             except PermissionError:
                 if attempt == 4:
                     with open(path, "w", encoding="utf-8") as f:
-                        json.dump(obj, f, ensure_ascii=False, indent=1)
+                        json.dump(obj, f, ensure_ascii=False, **dump_kw)
                     break
                 time.sleep(0.05 * (attempt + 1))
     finally:
@@ -113,6 +122,8 @@ class Store:
         self.accounts: list[dict] = []
         self._sync_from_disk()
         self.tasks: dict[str, dict] = _read(cfg.tasks_file, {})
+        self._tasks_written_at = 0.0
+        self._archive_tasks_if_oversized()
 
     def _sync_from_disk(self):
         try:
@@ -381,48 +392,83 @@ class Store:
                 "expiring": expiring, "expired": expired}
 
     # ---------- 任务 ----------
+    def _pruned_tasks(self) -> dict[str, dict]:
+        """Giữ mọi task đang chạy + TASKS_KEEP task đã kết thúc mới nhất."""
+        finished = [t for t in self.tasks.values() if t.get("status") in _TERMINAL_STATUSES]
+        if len(finished) <= TASKS_KEEP:
+            return self.tasks
+        finished.sort(key=lambda t: t.get("created_at") or 0, reverse=True)
+        drop = {t["id"] for t in finished[TASKS_KEEP:]}
+        return {k: v for k, v in self.tasks.items() if k not in drop}
+
+    def _archive_tasks_if_oversized(self):
+        """tasks.json phình to (hàng nghìn task) làm mỗi lần ghi tốn hàng trăm ms CPU.
+        Lần đầu gặp: sao lưu nguyên bản ra tasks.archive-<thời gian>.json rồi chỉ giữ phần mới nhất."""
+        with _TASK_LOCK:
+            pruned = self._pruned_tasks()
+            if len(pruned) == len(self.tasks):
+                return
+            archive = os.path.join(os.path.dirname(self.cfg.tasks_file),
+                                   f"tasks.archive-{time.strftime('%Y%m%d-%H%M%S')}.json")
+            try:
+                _write(archive, self.tasks, compact=True)
+            except Exception:  # noqa: BLE001
+                return  # không sao lưu được thì giữ nguyên, không xóa lịch sử
+            self.tasks = pruned
+            self._flush_tasks_locked()
+
+    def _flush_tasks_locked(self):
+        """Ghi tasks.json (gọi khi đang giữ _TASK_LOCK)."""
+        self.tasks = self._pruned_tasks()
+        _write(self.cfg.tasks_file, self.tasks, compact=True)
+        self._tasks_written_at = time.time()
+
     def create_task(self, kind: str, prompt: str) -> dict:
-        with _LOCK:
+        with _TASK_LOCK:
             tid = "task_" + uuid.uuid4().hex[:20]
             t = {"id": tid, "object": "task", "kind": kind, "prompt": prompt,
                  "status": "queued", "created_at": int(time.time()),
                  "updated_at": int(time.time()), "result": None, "error": None}
             self.tasks[tid] = t
-            _write(self.cfg.tasks_file, self.tasks)
+            self._flush_tasks_locked()
             return t
 
     def update_task(self, tid: str, **kw):
-        with _LOCK:
+        with _TASK_LOCK:
             t = self.tasks.get(tid)
             if not t:
                 return None
             t.update(kw)
             t["updated_at"] = int(time.time())
-            _write(self.cfg.tasks_file, self.tasks)
+            # Chỉ đổi progress: RAM đã cập nhật (API đọc từ RAM), ghi đĩa tối đa mỗi TASK_PERSIST_INTERVAL giây.
+            if set(kw) <= {"progress"} and time.time() - self._tasks_written_at < TASK_PERSIST_INTERVAL:
+                return t
+            self._flush_tasks_locked()
             return t
 
     def get_task(self, tid: str) -> dict | None:
         return self.tasks.get(tid)
 
     def list_tasks(self, limit: int = 50) -> list[dict]:
-        items = sorted(self.tasks.values(),
-                       key=lambda t: t.get("created_at") or 0, reverse=True)
+        with _TASK_LOCK:
+            items = list(self.tasks.values())
+        items.sort(key=lambda t: t.get("created_at") or 0, reverse=True)
         return items[:limit]
 
     def delete_task(self, tid: str) -> bool:
-        with _LOCK:
+        with _TASK_LOCK:
             if tid in self.tasks:
                 del self.tasks[tid]
-                _write(self.cfg.tasks_file, self.tasks)
+                self._flush_tasks_locked()
                 return True
             return False
 
     def clear_tasks(self, keep: int = 0) -> int:
-        with _LOCK:
+        with _TASK_LOCK:
             items = sorted(self.tasks.values(),
                            key=lambda t: t.get("created_at") or 0, reverse=True)
             keep_ids = {t["id"] for t in items[:keep]}
             removed = len(self.tasks) - len(keep_ids)
             self.tasks = {k: v for k, v in self.tasks.items() if k in keep_ids}
-            _write(self.cfg.tasks_file, self.tasks)
+            self._flush_tasks_locked()
             return max(0, removed)

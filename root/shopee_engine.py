@@ -467,28 +467,42 @@ def get_cached_clips(item_id: str) -> dict:
     image_url không phải file clip nên không kiểm tra tồn tại: set_cached_clip ghi nó vào cùng entry
     và đây là nguồn ảnh dự phòng để ghép Outro 12s khi danh sách sản phẩm trên giao diện đã bị xóa.
     """
+    return get_cached_clips_many([item_id]).get(str(item_id), {})
+
+
+def _valid_cache_entry(item_data) -> dict:
+    if not isinstance(item_data, dict):
+        return {}
+    valid = {}
+    for k in ("clip_a", "clip_b", "clip_raw"):
+        fname = item_data.get(k)
+        if fname:
+            fpath = fname if os.path.isabs(fname) else os.path.join(CFG.media_dir, fname)
+            if os.path.isfile(fpath) and os.path.getsize(fpath) > 10000:
+                valid[k] = fname
+    img = str(item_data.get("image_url") or "").strip()
+    if img:
+        valid["image_url"] = img
+    return valid
+
+
+def get_cached_clips_many(item_ids) -> dict[str, dict]:
+    """Như get_cached_clips nhưng đọc/parse file cache MỘT lần cho cả danh sách ItemID."""
     with _CLIP_CACHE_LOCK:
         data, _status = _load_json_file(CLIP_CACHE_FILE, "clip cache")
     if not data:
         return {}
-    try:
-        item_data = data.get(str(item_id)) or {}
-        if not isinstance(item_data, dict):
-            return {}
-        valid = {}
-        for k in ("clip_a", "clip_b", "clip_raw"):
-            fname = item_data.get(k)
-            if fname:
-                fpath = fname if os.path.isabs(fname) else os.path.join(CFG.media_dir, fname)
-                if os.path.isfile(fpath) and os.path.getsize(fpath) > 10000:
-                    valid[k] = fname
-        img = str(item_data.get("image_url") or "").strip()
-        if img:
-            valid["image_url"] = img
-        return valid
-    except Exception as e:
-        log.warning("Lỗi đọc clip cache cho %s: %s", item_id, e)
-        return {}
+    out = {}
+    for iid in item_ids:
+        sid = str(iid)
+        try:
+            entry = _valid_cache_entry(data.get(sid))
+        except Exception as e:  # noqa: BLE001
+            log.warning("Lỗi đọc clip cache cho %s: %s", sid, e)
+            continue
+        if entry:
+            out[sid] = entry
+    return out
 
 
 def set_cached_clip(item_id: str, clip_key: str, filename: str) -> bool:
