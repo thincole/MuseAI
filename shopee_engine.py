@@ -77,25 +77,32 @@ def _run_ffmpeg_cmd(cmd: list[str], timeout: int = 180, check: bool = False, tex
 
 # ==================== CẤU HÌNH DATABASE NOVAGATE (đọc từ .env, không ghi cứng secret) ====================
 # Server URL / API key / Client ID để trong .env (file này đã được .gitignore) để không lộ khi commit.
-# Để trống nếu chưa cấu hình: /api/shopee/claim sẽ báo lỗi rõ ràng thay vì dùng key bí mật ghi cứng.
-# config._load_dotenv() đã chạy khi import config ở trên nên os.environ đã có giá trị từ .env.
-DEFAULT_SERVER_URL = os.environ.get("SHOPEE_SERVER_URL", "").strip()
-DEFAULT_API_KEY = os.environ.get("SHOPEE_API_KEY", "").strip()
-DEFAULT_CLIENT_ID = os.environ.get("SHOPEE_CLIENT_ID", "").strip()
+def get_computer_name() -> str:
+    """Lấy tên máy tính hiện tại đang chạy."""
+    return os.environ.get("COMPUTERNAME", "").strip() or socket.gethostname() or "MuseAI_Client"
+
+
+# Giá trị mặc định chuẩn:
+# - Server URL: http://100.79.170.67:3000
+# - API Key: shopee_secret_2026
+# - Client ID: Tên máy tính đang chạy (Hostname)
+DEFAULT_SERVER_URL = os.environ.get("SHOPEE_SERVER_URL", "").strip() or "http://100.79.170.67:3000"
+DEFAULT_API_KEY = os.environ.get("SHOPEE_API_KEY", "").strip() or "shopee_secret_2026"
+DEFAULT_CLIENT_ID = os.environ.get("SHOPEE_CLIENT_ID", "").strip() or get_computer_name()
 DEFAULT_OUT_DIR = os.environ.get("SHOPEE_OUT_DIR", "").strip() or os.path.join(CFG.base_dir, "output")
 
 
 # Đọc lại tại thời điểm gọi (không đóng băng giá trị lúc import) — dùng khi caller không truyền server_url/api_key.
 def _env_server_url() -> str:
-    return os.environ.get("SHOPEE_SERVER_URL", "").strip() or DEFAULT_SERVER_URL
+    return os.environ.get("SHOPEE_SERVER_URL", "").strip() or DEFAULT_SERVER_URL or "http://100.79.170.67:3000"
 
 
 def _env_api_key() -> str:
-    return os.environ.get("SHOPEE_API_KEY", "").strip() or DEFAULT_API_KEY
+    return os.environ.get("SHOPEE_API_KEY", "").strip() or DEFAULT_API_KEY or "shopee_secret_2026"
 
 
 def _env_client_id() -> str:
-    return os.environ.get("SHOPEE_CLIENT_ID", "").strip() or DEFAULT_CLIENT_ID
+    return os.environ.get("SHOPEE_CLIENT_ID", "").strip() or DEFAULT_CLIENT_ID or get_computer_name()
 
 
 # ==================== KHUNG CẢNH PRESET TỪ NOVAGATE ====================

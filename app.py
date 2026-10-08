@@ -2148,7 +2148,8 @@ def get_shopee_db_config():
     return {
         "server_url": server_url,
         "api_key": api_key,
-        "client_id": client_id
+        "client_id": client_id,
+        "computer_name": shopee_engine.get_computer_name()
     }
 
 
@@ -2156,7 +2157,7 @@ def get_shopee_db_config():
 def test_shopee_db_connection(data: dict):
     server_url = (data.get("server_url") or "").strip().rstrip("/")
     if not server_url:
-        return {"success": False, "message": "Server URL không được để trống"}
+        server_url = shopee_engine.DEFAULT_SERVER_URL
     if not (server_url.startswith("http://") or server_url.startswith("https://")):
         server_url = "http://" + server_url
 
@@ -2195,19 +2196,14 @@ def test_shopee_db_connection(data: dict):
 
 @app.post("/api/shopee/save-db-config")
 def save_shopee_db_config(data: dict):
-    server_url = (data.get("server_url") or "").strip().rstrip("/")
-    api_key = (data.get("api_key") or "").strip()
-    client_id = (data.get("client_id") or "").strip()
-
-    if not server_url:
-        raise HTTPException(400, "Địa chỉ Server URL không được để trống")
+    server_url = (data.get("server_url") or "").strip().rstrip("/") or "http://100.79.170.67:3000"
+    api_key = (data.get("api_key") or "").strip() or "shopee_secret_2026"
+    client_id = (data.get("client_id") or "").strip() or shopee_engine.get_computer_name()
 
     # 1. Cập nhật biến môi trường runtime
     os.environ["SHOPEE_SERVER_URL"] = server_url
-    if api_key:
-        os.environ["SHOPEE_API_KEY"] = api_key
-    if client_id:
-        os.environ["SHOPEE_CLIENT_ID"] = client_id
+    os.environ["SHOPEE_API_KEY"] = api_key
+    os.environ["SHOPEE_CLIENT_ID"] = client_id
 
     # 2. Cập nhật module shopee_engine runtime
     shopee_engine.DEFAULT_SERVER_URL = server_url

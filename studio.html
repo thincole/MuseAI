@@ -1609,7 +1609,7 @@
               📦 Nhận Lô Sản Phẩm từ Database Shopee
             </div>
             <div style="font-size:11.5px;color:var(--text-dim);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-              <span>Server: <code style="color:#60a5fa;" id="sp_db_display_url">http://100.79.170.67:3000</code> | Client: <code style="color:#60a5fa;" id="sp_db_display_client">XEON-CT2A_822d66_nova</code></span>
+              <span>Server: <code style="color:#60a5fa;" id="sp_db_display_url">http://100.79.170.67:3000</code> | Client: <code style="color:#60a5fa;" id="sp_db_display_client">XEON-CT2A</code></span>
               <button type="button" class="shopee-btn" onclick="openDatabaseConfigModal()" style="background:#1e293b;color:#93c5fd;border:1px solid #3b82f6;font-size:11px;padding:3px 9px;font-weight:700;display:inline-flex;align-items:center;gap:4px;" title="Chỉnh sửa địa chỉ máy chủ Database và thông tin máy trạm">
                 ✏️ Sửa DB
               </button>
@@ -1804,7 +1804,7 @@
         <label style="font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:6px;display:block;">
           💻 Tên định danh máy trạm (Client ID):
         </label>
-        <input type="text" class="shopee-input" id="db_modal_client_id" placeholder="XEON-CT2A_822d66_nova" style="width:100%;padding:8px 12px;font-size:13px;">
+        <input type="text" class="shopee-input" id="db_modal_client_id" placeholder="Tên máy tính (mặc định máy hiện tại)" style="width:100%;padding:8px 12px;font-size:13px;">
         <span style="font-size:11px;color:var(--text-dim);margin-top:4px;display:block;">Dùng để định danh máy trạm khi nhận sản phẩm hoặc giải phóng sản phẩm kẹt.</span>
       </div>
 
@@ -4138,12 +4138,17 @@
       btn.disabled = true;
       btn.innerText = "⏳ Đang nạp proxy...";
     }
-    showToast("Đang đồng bộ proxy từ E:\\ThinAptm0707...", "info");
+    showToast("Đang quét và nạp proxy từ ThinAptm hoặc file proxy.txt...", "info");
     try {
       const res = await fetch("/api/proxy/sync-thinaptm", { method: "POST", headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
-        showToast(`Đồng bộ thành công! Pool: ${data.pool_size || data.total_proxies} proxy, Gán: ${data.assigned_count || data.newly_assigned || 0} tài khoản.`, "success");
+        const total = data.pool_size || data.total_proxies || 0;
+        if (total === 0) {
+          showToast(data.message || "⚠️ Chưa tìm thấy proxy! Hãy đặt file 'proxy.txt' (mỗi dòng 1 proxy) vào thư mục MuseAI hoặc kiểm tra thư mục ThinAptm.", "warning");
+        } else {
+          showToast(`✓ Đồng bộ thành công! Pool: ${total} proxy, Đã gán: ${data.assigned_count || data.newly_assigned || 0} tài khoản.`, "success");
+        }
         await loadAccounts();
         await fetchBrowserTtlStatus();
       } else {
@@ -4326,9 +4331,9 @@
       const res = await fetch("/api/shopee/db-config", { headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
-        document.getElementById("db_modal_server_url").value = data.server_url || "";
-        document.getElementById("db_modal_client_id").value = data.client_id || "";
-        document.getElementById("db_modal_api_key").value = data.api_key || "";
+        document.getElementById("db_modal_server_url").value = data.server_url || "http://100.79.170.67:3000";
+        document.getElementById("db_modal_client_id").value = data.client_id || data.computer_name || "";
+        document.getElementById("db_modal_api_key").value = data.api_key || "shopee_secret_2026";
       }
     } catch (_) {}
     modal.classList.add("active");

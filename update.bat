@@ -3,6 +3,20 @@ chcp 65001 > nul
 title MuseAI - Cap Nhat Phien Ban Moi Nhat
 cd /d "%~dp0"
 
+:: Tim va bo sung Git vao PATH neu Git da duoc cai dat tren may nhung chua them vao PATH
+where git >nul 2>nul
+if %errorlevel% neq 0 (
+    if exist "C:\Program Files\Git\cmd\git.exe" (
+        set "PATH=C:\Program Files\Git\cmd;%PATH%"
+    ) else if exist "%LOCALAPPDATA%\Programs\Git\cmd\git.exe" (
+        set "PATH=%LOCALAPPDATA%\Programs\Git\cmd;%PATH%"
+    ) else if exist "C:\Program Files (x86)\Git\cmd\git.exe" (
+        set "PATH=C:\Program Files (x86)\Git\cmd;%PATH%"
+    ) else if exist "C:\Git\cmd\git.exe" (
+        set "PATH=C:\Git\cmd;%PATH%"
+    )
+)
+
 :: Tim Python tren he thong
 set "PY_CMD="
 

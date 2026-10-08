@@ -141,7 +141,7 @@ Hệ thống sử dụng các biểu thức chính quy (Regex) tối ưu để n
 ### 4.3. Quản Lý & Chỉnh Sửa Máy Chủ Database Trực Tiếp Từ Web UI
 - **Giao diện**: Nút `[✏️ Sửa DB]` trên thanh tiêu đề Card 2 ("Nhận Lô Sản Phẩm từ Database Shopee") mở modal cấu hình trực tiếp:
   - `Server URL`: Địa chỉ IP/domain máy chủ database (ví dụ: `http://100.79.170.67:3000`).
-  - `Client ID`: Tên định danh máy trạm (ví dụ: `XEON-CT2A_822d66_nova`).
+  - `Client ID`: Tên định danh máy trạm (mặc định lấy theo tên máy tính đang chạy, ví dụ: `XEON-CT2A`).
   - `API Key`: Khóa bảo mật API (`shopee_secret_2026`).
 - **Nút "⚡ Kiểm Tra Kết Nối (Ping)"**: Kiểm tra phản hồi HTTP và trạng thái mở cổng TCP tới máy chủ Database với timeout 4s.
 - **Nút "💾 Lưu Cấu Hình"**: Tự động cập nhật đồng thời 4 tầng:
@@ -204,7 +204,14 @@ Chrome ➔ 127.0.0.1:{local_port} ➔ [Local Forwarder] ➔ Remote Proxy (vproxy
 - Mỗi tài khoản `account_id` được gán cố định (`Sticky`) với một Proxy xác định.
 - Mỗi khi khởi tạo Browser Context cho tài khoản đó, hệ thống luôn chọn đúng Proxy đã gán.
 
-### 6.3. Cấu Hình Anti-Detect Stealth Trình Duyệt
+### 6.3. Thuật Toán Đồng Bộ HomeProxy.vn (Chuẩn ThinAptm)
+Để lấy danh sách proxy đang hoạt động từ dịch vụ HomeProxy.vn (22+ proxy):
+1. **Bước 1 - Lấy `x-merchant-id`**: Gửi request tới `GET /orders?page=1&limit=1` kèm `Bearer token` để trích xuất `merchant_id` của tài khoản người dùng.
+2. **Bước 2 - Lấy danh sách proxy thực sự**: Gửi request tới `GET /users/proxies?page=1&limit=500` kèm header `x-merchant-id`. Lọc các proxy có trạng thái `Completed` và chưa hết hạn `expiredAt > now_ms`.
+3. **Bước 3 - Fallback Orders**: Nếu danh sách `/users/proxies` rỗng, tự động phân tích các sản phẩm trong `/orders` để lấy thông tin kết nối.
+4. **Hỗ trợ biến môi trường `HOMEPROXY_TOKEN`**: Lưu token trong `.env` để khi chạy trên máy tính khác (kể cả không có tool ThinAptm), hệ thống vẫn tự động tải toàn bộ 22 proxy về máy trạm.
+
+### 6.4. Cấu Hình Anti-Detect Stealth Trình Duyệt
 Khi khởi chạy Chrome, hệ thống inject các cờ vô hiệu hóa cơ chế phát hiện tự động hóa của Cloudflare và Muse:
 - `--disable-blink-features=AutomationControlled`
 - Ghi đè `navigator.webdriver = false` qua CDP `Page.addScriptToEvaluateOnNewDocument`.
@@ -397,3 +404,6 @@ def extract_ids_from_url(url: str) -> tuple[str, str]:
 1. **Tuyệt đối không tự động upload code lên GitHub**: Mọi thay đổi mã nguồn trên máy phải để người dùng chủ động chạy `upload-github.bat`.
 2. **Khả năng tương thích Windows**: Giữ cho toàn bộ các script batch, đường dẫn file (`\\` và `/`), và mã hóa chuỗi luôn là `UTF-8` tương thích hoàn toàn với hệ điều hành Windows.
 3. **Giải phóng tài nguyên đĩa cứng**: Mọi quy trình ghép video đều phải kèm bước tự động dọn dẹp các tệp tạm `-a.mp4`, `-b.mp4` và `-raw` để bảo vệ dung lượng ổ cứng của người dùng.
+4. **Cơ chế Cập Nhật Kép (Dual-Engine / Zero-Git Mode)**: Công cụ `update.bat` và `tools/update_app.py` hỗ trợ cập nhật trên bất kỳ máy tính Windows nào mà **không bắt buộc phải cài đặt Git**. Nếu máy không có Git, hệ thống tự động tải gói ZIP mới nhất trực tiếp từ GitHub, bảo toàn nguyên vẹn tệp `.env`, thư mục `data/` và `output/`.
+5. **Cơ chế Nạp Proxy Đa Nguồn**: `proxy_manager.py` tự động quét tìm HomeProxy từ thư mục ThinAptm trên nhiều ổ đĩa (`E:`, `D:`, `C:`, `F:`) hoặc đọc trực tiếp danh sách proxy từ tệp `proxy.txt` ngay trong thư mục MuseAI.
+

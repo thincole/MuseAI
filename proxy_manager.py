@@ -21,7 +21,7 @@ store = Store(CFG)
 
 log = logging.getLogger("proxy_manager")
 
-THINAPTM_DIR = r"E:\ThinAptm0707"
+THINAPTM_DIR = os.environ.get("THINAPTM_DIR", "").strip() or r"E:\ThinAptm0707"
 PROXY_CACHE_FILE = os.path.join(CFG.data_dir, "proxy_pool.json")
 
 _forwarders: dict[str, int] = {}  # proxy_str -> local_port
@@ -217,70 +217,175 @@ def stop_all_forwarders():
 
 
 def load_proxies_from_thinaptm() -> list[str]:
-    """Đọc danh sách proxy từ E:\\ThinAptm0707 (settings.json và gọi HomeProxy API nếu có token)."""
+    """Đọc danh sách proxy từ ThinAptm0707 (trên mọi ổ đĩa) hoặc file proxy.txt trong thư mục MuseAI."""
     proxies: list[str] = []
     token = ""
 
-    settings_file = os.path.join(THINAPTM_DIR, "settings.json")
-    if os.path.isfile(settings_file):
-        try:
-            with open(settings_file, "r", encoding="utf-8") as f:
-                s = json.load(f)
-            token = s.get("homeproxy_token", "").strip()
-            for p in s.get("proxy_list", []):
-                p_clean = str(p).strip()
-                if p_clean and p_clean not in proxies and not p_clean.startswith("#"):
-                    proxies.append(p_clean)
-        except Exception as e:
-            log.warning("Lỗi đọc settings.json từ %s: %s", THINAPTM_DIR, e)
+    # 1. Quét danh sách các thư mục ứng viên ThinAptm
+    candidate_dirs = [THINAPTM_DIR]
+    for d in ["E", "D", "C", "F"]:
+        d_path = f"{d}:\\ThinAptm0707"
+        if d_path not in candidate_dirs:
+            candidate_dirs.append(d_path)
 
-    # Đọc thêm từ proxy_us_tot_8.txt nếu có
-    us_file = os.path.join(THINAPTM_DIR, "proxy_us_tot_8.txt")
-    if os.path.isfile(us_file):
-        try:
-            with open(us_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    p = line.strip()
-                    if p and not p.startswith("#") and p not in proxies:
-                        proxies.append(p)
-        except Exception:
-            pass
-
-    # Gọi API HomeProxy để cập nhật proxy sống mới nhất nếu có token
-    if token:
-        if token.lower().startswith("bearer "):
-            token = token[7:].strip()
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        for base in ["https://api.homeproxy.vn/api/v1", "https://app.homeproxy.vn/api/v2"]:
+    for c_dir in candidate_dirs:
+        if not os.path.isdir(c_dir):
+            continue
+        settings_file = os.path.join(c_dir, "settings.json")
+        if os.path.isfile(settings_file):
             try:
-                r = requests.get(f"{base}/users/proxies?page=1&limit=500", headers=headers, timeout=8)
-                if r.status_code == 200:
-                    data = r.json()
-                    items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                    now_ms = int(time.time() * 1000)
-                    for item in items:
-                        if item.get("status", {}).get("name") != "Completed":
-                            continue
-                        if item.get("expiredAt", 0) and item["expiredAt"] < now_ms:
-                            continue
-                        px = item.get("proxy", {})
-                        ip_data = px.get("ipaddress", {}) if isinstance(px.get("ipaddress"), dict) else {}
-                        host = ip_data.get("domain") or ip_data.get("ip") or px.get("domain") or px.get("ip") or px.get("host")
-                        port = px.get("port")
-                        user = px.get("username")
-                        pwd = str(px.get("password") or "").strip()
-                        if host and port:
-                            line = f"{host}:{port}:{user}:{pwd}" if user else f"{host}:{port}"
-                            if line not in proxies:
-                                proxies.append(line)
-                    log.info("🌐 Đã đồng bộ %d proxy trực tiếp từ HomeProxy API (%s)", len(items), base)
-                    break
-            except Exception as he:
-                log.warning("Gọi HomeProxy API %s thất bại: %s", base, he)
+                with open(settings_file, "r", encoding="utf-8") as f:
+                    s = json.load(f)
+                if not token:
+                    token = s.get("homeproxy_token", "").strip()
+                for p in s.get("proxy_list", []):
+                    p_clean = str(p).strip()
+                    if p_clean and p_clean not in proxies and not p_clean.startswith("#"):
+                        proxies.append(p_clean)
+            except Exception as e:
+                log.warning("Lỗi đọc settings.json từ %s: %s", c_dir, e)
+
+        # Đọc thêm từ các file proxy .txt trong thư mục ThinAptm
+        for txt_name in ["proxy_us_tot_8.txt", "proxy.txt", "proxies.txt"]:
+            us_file = os.path.join(c_dir, txt_name)
+            if os.path.isfile(us_file):
+                try:
+                    with open(us_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            p = line.strip()
+                            if p and not p.startswith("#") and p not in proxies:
+                                proxies.append(p)
+                except Exception:
+                    pass
+
+    # 2. Đọc thêm từ file proxy.txt hoặc proxies.txt ngay trong thư mục MuseAI (cực kỳ tiện khi mang sang máy khác)
+    local_proxy_files = [
+        os.path.join(CFG.base_dir, "proxy.txt"),
+        os.path.join(CFG.base_dir, "proxies.txt"),
+        os.path.join(CFG.base_dir, "proxy_pool.txt"),
+        os.path.join(CFG.data_dir, "proxy.txt"),
+        os.path.join(CFG.data_dir, "proxies.txt"),
+    ]
+    for lpf in local_proxy_files:
+        if os.path.isfile(lpf):
+            try:
+                with open(lpf, "r", encoding="utf-8") as f:
+                    for line in f:
+                        p = line.strip()
+                        if p and not p.startswith("#") and p not in proxies:
+                            proxies.append(p)
+                log.info("📄 Đã nạp proxy từ file cục bộ: %s (Hiện có %d proxy)", lpf, len(proxies))
+            except Exception as e:
+                log.warning("Lỗi đọc file proxy cục bộ %s: %s", lpf, e)
+
+    # 3. Lấy token HomeProxy (từ .env hoặc từ settings.json của ThinAptm)
+    if not token:
+        token = os.environ.get("HOMEPROXY_TOKEN", "").strip()
+
+    if token:
+        hp_list = fetch_proxies_from_homeproxy_api(token)
+        for p in hp_list:
+            if p and p not in proxies:
+                proxies.append(p)
+        log.info("🌐 Tổng số proxy thu thập được sau khi gọi HomeProxy API: %d proxy", len(proxies))
 
     # Lưu cache vào data/proxy_pool.json
     save_proxy_pool(proxies)
     return proxies
+
+
+def fetch_proxies_from_homeproxy_api(token: str) -> list[str]:
+    """Gọi HomeProxy.vn API chuẩn theo thuật toán của ThinAptm (hỗ trợ x-merchant-id và fallback orders)."""
+    if not token:
+        return []
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    proxy_lines: list[str] = []
+
+    # Bước 1: Lấy x-merchant-id từ /orders (HomeProxy yêu cầu header này để trả về danh sách proxy chính xác)
+    merchant_id = ""
+    for base in ["https://api.homeproxy.vn/api/v1", "https://app.homeproxy.vn/api/v2"]:
+        try:
+            r0 = requests.get(f"{base}/orders?page=1&limit=1", headers=headers, timeout=8)
+            if r0.status_code == 200:
+                orders_data = r0.json().get("data", [])
+                if orders_data:
+                    merchant_id = str(orders_data[0].get("user", {}).get("merchant", {}).get("id", ""))
+                    if merchant_id:
+                        break
+        except Exception:
+            pass
+
+    if merchant_id:
+        headers["x-merchant-id"] = merchant_id
+        log.info("🌐 [HomeProxy] Đã xác thực merchant_id: %s", merchant_id)
+
+    # Bước 2: Lấy danh sách proxy thực sự từ /users/proxies
+    now_ms = int(time.time() * 1000)
+    for base in ["https://api.homeproxy.vn/api/v1", "https://app.homeproxy.vn/api/v2"]:
+        try:
+            r = requests.get(f"{base}/users/proxies?page=1&limit=500", headers=headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for item in items:
+                    status_name = item.get("status", {}).get("name", "")
+                    expired_at = item.get("expiredAt", 0)
+                    if status_name != "Completed":
+                        continue
+                    if expired_at and expired_at < now_ms:
+                        continue
+                    px = item.get("proxy", {})
+                    ip_data = px.get("ipaddress", {}) if isinstance(px.get("ipaddress"), dict) else {}
+                    host = ip_data.get("domain") or ip_data.get("ip") or px.get("domain") or px.get("ip") or px.get("host")
+                    port = px.get("port")
+                    user = px.get("username")
+                    pwd = str(px.get("password") or "").strip()
+                    if host and port:
+                        try:
+                            port_int = int(str(port).strip())
+                            if 1 <= port_int <= 65535:
+                                line = f"{str(host).strip()}:{port_int}"
+                                if user:
+                                    line += f":{str(user).strip()}:{pwd}"
+                                if line not in proxy_lines:
+                                    proxy_lines.append(line)
+                        except Exception:
+                            pass
+                if proxy_lines:
+                    log.info("🌐 [HomeProxy] Lấy thành công từ %s/users/proxies: %d proxy", base, len(proxy_lines))
+                    break
+        except Exception as e:
+            log.warning("[HomeProxy] Lỗi gọi %s/users/proxies: %s", base, e)
+
+    # Bước 3: Fallback lấy từ orders nếu users/proxies bị lỗi hoặc rỗng
+    if not proxy_lines:
+        for base in ["https://api.homeproxy.vn/api/v1", "https://app.homeproxy.vn/api/v2"]:
+            try:
+                r2 = requests.get(f"{base}/orders?page=1&limit=100", headers=headers, timeout=10)
+                if r2.status_code == 200:
+                    orders = r2.json().get("data", [])
+                    for order in orders:
+                        if order.get("status", {}).get("name") != "Completed":
+                            continue
+                        for prod in order.get("products", []):
+                            host = prod.get("domain") or prod.get("ip") or ""
+                            port = prod.get("port")
+                            user = prod.get("user", "")
+                            pwd = str(prod.get("password") or "").strip()
+                            if host and port:
+                                line = f"{host}:{port}:{user}:{pwd}" if user else f"{host}:{port}"
+                                if line not in proxy_lines:
+                                    proxy_lines.append(line)
+                    if proxy_lines:
+                        log.info("🌐 [HomeProxy] Fallback lấy thành công từ %s/orders: %d proxy", base, len(proxy_lines))
+                        break
+            except Exception as e:
+                log.warning("[HomeProxy] Lỗi gọi %s/orders: %s", base, e)
+
+    return proxy_lines
 
 
 def get_cached_proxy_pool() -> list[str]:
@@ -378,6 +483,19 @@ def sync_all_accounts_with_homeproxy() -> dict:
     proxies = load_proxies_from_thinaptm()
     accounts = store.list_accounts()
     assigned_count = 0
+
+    if not proxies:
+        return {
+            "success": False,
+            "pool_size": 0,
+            "total_proxies": 0,
+            "alive_proxies": 0,
+            "total_accounts": len(accounts),
+            "assigned_count": 0,
+            "newly_assigned": 0,
+            "accounts": accounts,
+            "message": "Không tìm thấy proxy nào trong ThinAptm0707 hoặc file proxy.txt trong thư mục MuseAI!"
+        }
 
     # 1. Kiểm tra nhanh các proxy khả dụng bằng đa luồng (3.5s timeout)
     alive_proxies: list[tuple[str, str]] = []

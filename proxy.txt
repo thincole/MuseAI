@@ -1,0 +1,9 @@
+# Danh sách Proxy cho MuseAI Video Studio
+# Mỗi dòng 1 proxy. Hệ thống tự động gán cố định 1 proxy cho 1 tài khoản (Sticky Proxy)
+# Hỗ trợ các định dạng:
+#   IP:PORT:USER:PASS
+#   IP:PORT
+#
+# Ví dụ:
+# 103.152.112.50:8080:username:password
+# 45.120.12.34:3128
