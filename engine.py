@@ -393,7 +393,9 @@ class MuseEngine:
             "--disable-dev-shm-usage", "--disable-background-networking",
             "--no-first-run", "--no-default-browser-check",
             "--autoplay-policy=no-user-gesture-required",
-            "--window-size=1440,2400",
+            "--mute-audio",
+            "--disable-smooth-scrolling",
+            "--window-size=1024,768",
             f"--remote-debugging-port={self.cfg.cdp_port}",
             # 仅允许本机 DevTools 客户端（cdp.py 会显式发送匹配的 Origin），
             # 不再用 "*"：否则任意网页都可借浏览器连上 CDP。

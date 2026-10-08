@@ -22,6 +22,9 @@ store = Store(CFG)
 log = logging.getLogger("proxy_manager")
 
 THINAPTM_DIR = os.environ.get("THINAPTM_DIR", "").strip() or r"E:\ThinAptm0707"
+# Token HomeProxy.vn cố định cho hệ thống nội bộ
+DEFAULT_HOMEPROXY_TOKEN = "homepx42152_e21c0b975d1093642c0a6e95bd760a49a4f7bf5a2e67ba971535c18940288b1e"
+HOMEPROXY_TOKEN = os.environ.get("HOMEPROXY_TOKEN", "").strip() or DEFAULT_HOMEPROXY_TOKEN
 PROXY_CACHE_FILE = os.path.join(CFG.data_dir, "proxy_pool.json")
 
 _forwarders: dict[str, int] = {}  # proxy_str -> local_port
@@ -278,9 +281,9 @@ def load_proxies_from_thinaptm() -> list[str]:
             except Exception as e:
                 log.warning("Lỗi đọc file proxy cục bộ %s: %s", lpf, e)
 
-    # 3. Lấy token HomeProxy (từ .env hoặc từ settings.json của ThinAptm)
+    # 3. Lấy token HomeProxy (ưu tiên token từ settings.json, sau đó .env hoặc DEFAULT_HOMEPROXY_TOKEN)
     if not token:
-        token = os.environ.get("HOMEPROXY_TOKEN", "").strip()
+        token = HOMEPROXY_TOKEN or DEFAULT_HOMEPROXY_TOKEN
 
     if token:
         hp_list = fetch_proxies_from_homeproxy_api(token)
@@ -296,6 +299,7 @@ def load_proxies_from_thinaptm() -> list[str]:
 
 def fetch_proxies_from_homeproxy_api(token: str) -> list[str]:
     """Gọi HomeProxy.vn API chuẩn theo thuật toán của ThinAptm (hỗ trợ x-merchant-id và fallback orders)."""
+    token = token or DEFAULT_HOMEPROXY_TOKEN
     if not token:
         return []
     if token.lower().startswith("bearer "):

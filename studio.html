@@ -3046,7 +3046,24 @@
     saveShopeeSettings();
   }
 
-  function renderShopeeProductsConsole() {
+  let _renderShopeeConsoleTimer = null;
+  function renderShopeeProductsConsole(force = false) {
+    if (force) {
+      if (_renderShopeeConsoleTimer) {
+        clearTimeout(_renderShopeeConsoleTimer);
+        _renderShopeeConsoleTimer = null;
+      }
+      _doRenderShopeeProductsConsole();
+      return;
+    }
+    if (_renderShopeeConsoleTimer) return;
+    _renderShopeeConsoleTimer = setTimeout(() => {
+      _renderShopeeConsoleTimer = null;
+      _doRenderShopeeProductsConsole();
+    }, 350);
+  }
+
+  function _doRenderShopeeProductsConsole() {
     const consoleEl = document.getElementById("shopeeProductsConsole");
     const countEl = document.getElementById("shopeeProductCount");
     if (!shopeeClaimedProducts || shopeeClaimedProducts.length === 0) {
