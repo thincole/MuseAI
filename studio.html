@@ -1603,13 +1603,16 @@
 
         <!-- Card 2: Nhận Lô Sản Phẩm từ Database Shopee -->
         <div class="shopee-card">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
             <div class="shopee-card-title" style="margin-bottom:0;">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
               📦 Nhận Lô Sản Phẩm từ Database Shopee
             </div>
-            <div style="font-size:11px;color:var(--text-dim);">
-              Server: <code style="color:#60a5fa;" id="sp_db_display_url">http://100.79.170.67:3000</code> | Client: <code style="color:#60a5fa;">XEON-CT2A_822d66_nova</code>
+            <div style="font-size:11.5px;color:var(--text-dim);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <span>Server: <code style="color:#60a5fa;" id="sp_db_display_url">http://100.79.170.67:3000</code> | Client: <code style="color:#60a5fa;" id="sp_db_display_client">XEON-CT2A_822d66_nova</code></span>
+              <button type="button" class="shopee-btn" onclick="openDatabaseConfigModal()" style="background:#1e293b;color:#93c5fd;border:1px solid #3b82f6;font-size:11px;padding:3px 9px;font-weight:700;display:inline-flex;align-items:center;gap:4px;" title="Chỉnh sửa địa chỉ máy chủ Database và thông tin máy trạm">
+                ✏️ Sửa DB
+              </button>
             </div>
           </div>
 
@@ -1770,6 +1773,61 @@
     <div style="padding:14px 20px;display:flex;justify-content:flex-end;gap:10px;">
       <button class="btn-action primary" id="lightboxDownloadBtn" onclick="downloadLightboxMedia()">Lưu Về Máy</button>
       <button class="btn-action" onclick="closeLightbox()">Đóng</button>
+    </div>
+  </div>
+</div>
+
+<!-- Database Server Config Modal -->
+<div class="modal-overlay" id="databaseConfigModal" onclick="closeDatabaseConfigModal(event)">
+  <div class="modal-content" onclick="event.stopPropagation()" style="max-width: 580px;">
+    <div style="padding:14px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);">
+      <div style="font-weight:700;font-size:16px;color:#38bdf8;display:flex;align-items:center;gap:8px;">
+        <span>⚙️</span> Cài Đặt Máy Chủ Database Shopee
+      </div>
+      <button onclick="closeDatabaseConfigModal()" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;">✕</button>
+    </div>
+    
+    <div style="padding:20px;display:flex;flex-direction:column;gap:14px;">
+      <div style="font-size:12.5px;color:var(--text-muted);line-height:1.5;background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.25);padding:10px 14px;border-radius:8px;">
+        Cấu hình thông tin kết nối tới máy chủ lưu trữ Database sản phẩm Shopee. Các thay đổi sẽ được <b>lưu vĩnh viễn vào file .env</b> và áp dụng ngay lập tức mà không cần khởi động lại.
+      </div>
+
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:6px;display:block;">
+          🌐 Địa chỉ máy chủ (Server URL):
+        </label>
+        <input type="text" class="shopee-input" id="db_modal_server_url" placeholder="http://100.79.170.67:3000" style="width:100%;padding:8px 12px;font-size:13px;font-family:monospace;">
+        <span style="font-size:11px;color:var(--text-dim);margin-top:4px;display:block;">Ví dụ: <code>http://100.79.170.67:3000</code> hoặc <code>http://192.168.1.100:3000</code></span>
+      </div>
+
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:6px;display:block;">
+          💻 Tên định danh máy trạm (Client ID):
+        </label>
+        <input type="text" class="shopee-input" id="db_modal_client_id" placeholder="XEON-CT2A_822d66_nova" style="width:100%;padding:8px 12px;font-size:13px;">
+        <span style="font-size:11px;color:var(--text-dim);margin-top:4px;display:block;">Dùng để định danh máy trạm khi nhận sản phẩm hoặc giải phóng sản phẩm kẹt.</span>
+      </div>
+
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:6px;display:block;">
+          🔑 Khóa bảo mật API (API Key):
+        </label>
+        <input type="password" class="shopee-input" id="db_modal_api_key" placeholder="shopee_secret_2026" style="width:100%;padding:8px 12px;font-size:13px;font-family:monospace;">
+        <span style="font-size:11px;color:var(--text-dim);margin-top:4px;display:block;">Khóa bí mật xác thực quyền nhận và giải phóng dữ liệu.</span>
+      </div>
+
+      <!-- Test connection status banner -->
+      <div id="db_test_status" style="display:none;padding:8px 12px;border-radius:6px;font-size:12px;font-weight:600;"></div>
+    </div>
+
+    <div style="padding:14px 20px;display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--border);background:rgba(0,0,0,0.2);">
+      <button type="button" class="shopee-btn" id="btnTestDbConnection" onclick="testDatabaseConnection()" style="background:#0284c7;color:#fff;border:1px solid #38bdf8;font-size:12px;padding:6px 14px;font-weight:600;">
+        ⚡ Kiểm Tra Kết Nối (Ping)
+      </button>
+      <div style="display:flex;gap:10px;">
+        <button class="btn-action primary" onclick="saveDatabaseConfig()" style="background:#2563eb;border-color:#3b82f6;">💾 Lưu Cấu Hình</button>
+        <button class="btn-action" onclick="closeDatabaseConfigModal()">Đóng</button>
+      </div>
     </div>
   </div>
 </div>
@@ -2774,6 +2832,10 @@
       if (data.sv_server_url) {
         const el = document.getElementById("sp_db_display_url");
         if (el) el.innerText = data.sv_server_url;
+      }
+      if (data.sv_client_id) {
+        const cEl = document.getElementById("sp_db_display_client");
+        if (cEl) cEl.innerText = data.sv_client_id;
       }
       if (data.aspect) document.getElementById("sp_aspect").value = data.aspect;
       if (data.scene) document.getElementById("sp_scene").value = data.scene;
@@ -4252,6 +4314,122 @@
       if (body) body.style.display = "none";
       if (icon) icon.innerText = "▼ Mở rộng";
       if (btn) btn.title = "Mở rộng xem chi tiết phần này";
+    }
+  }
+  // ==================== DATABASE CONFIG MODAL ====================
+  async function openDatabaseConfigModal() {
+    const modal = document.getElementById("databaseConfigModal");
+    if (!modal) return;
+    const testStatus = document.getElementById("db_test_status");
+    if (testStatus) testStatus.style.display = "none";
+    try {
+      const res = await fetch("/api/shopee/db-config", { headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        document.getElementById("db_modal_server_url").value = data.server_url || "";
+        document.getElementById("db_modal_client_id").value = data.client_id || "";
+        document.getElementById("db_modal_api_key").value = data.api_key || "";
+      }
+    } catch (_) {}
+    modal.classList.add("active");
+  }
+
+  function closeDatabaseConfigModal(e) {
+    if (e && e.target !== e.currentTarget) return;
+    const modal = document.getElementById("databaseConfigModal");
+    if (modal) modal.classList.remove("active");
+  }
+
+  async function testDatabaseConnection() {
+    const url = document.getElementById("db_modal_server_url").value.trim();
+    const btn = document.getElementById("btnTestDbConnection");
+    const statusEl = document.getElementById("db_test_status");
+    if (!url) {
+      showToast("Vui lòng nhập Server URL trước khi kiểm tra!", "warning");
+      return;
+    }
+    if (btn) {
+      btn.disabled = true;
+      btn.innerText = "⏳ Đang kết nối...";
+    }
+    if (statusEl) {
+      statusEl.style.display = "block";
+      statusEl.style.background = "rgba(56,189,248,0.1)";
+      statusEl.style.color = "#38bdf8";
+      statusEl.style.border = "1px solid rgba(56,189,248,0.3)";
+      statusEl.innerText = "Đang kiểm tra kết nối tới " + url + "...";
+    }
+    try {
+      const res = await fetch("/api/shopee/test-db-connection", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ server_url: url })
+      });
+      const data = await res.json();
+      if (data.success) {
+        if (statusEl) {
+          statusEl.style.background = "rgba(34,197,94,0.12)";
+          statusEl.style.color = "#4ade80";
+          statusEl.style.border = "1px solid rgba(34,197,94,0.3)";
+          statusEl.innerText = `✓ ${data.message || 'Kết nối thành công!'}`;
+        }
+        showToast(data.message || "Kết nối Database thành công!", "success");
+      } else {
+        if (statusEl) {
+          statusEl.style.background = "rgba(239,68,68,0.12)";
+          statusEl.style.color = "#f87171";
+          statusEl.style.border = "1px solid rgba(239,68,68,0.3)";
+          statusEl.innerText = `✗ ${data.message || 'Không thể kết nối'}`;
+        }
+        showToast(data.message || "Không thể kết nối Database!", "danger");
+      }
+    } catch (err) {
+      if (statusEl) {
+        statusEl.style.background = "rgba(239,68,68,0.12)";
+        statusEl.style.color = "#f87171";
+        statusEl.style.border = "1px solid rgba(239,68,68,0.3)";
+        statusEl.innerText = `✗ Lỗi: ${err.message}`;
+      }
+      showToast(`Lỗi: ${err.message}`, "danger");
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerText = "⚡ Kiểm Tra Kết Nối (Ping)";
+      }
+    }
+  }
+
+  async function saveDatabaseConfig() {
+    const url = document.getElementById("db_modal_server_url").value.trim();
+    const clientId = document.getElementById("db_modal_client_id").value.trim();
+    const apiKey = document.getElementById("db_modal_api_key").value.trim();
+    if (!url) {
+      showToast("Vui lòng nhập Server URL!", "danger");
+      return;
+    }
+    try {
+      const res = await fetch("/api/shopee/save-db-config", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({
+          server_url: url,
+          client_id: clientId,
+          api_key: apiKey
+        })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        showToast("Đã lưu cấu hình Database thành công!", "success");
+        const urlEl = document.getElementById("sp_db_display_url");
+        if (urlEl) urlEl.innerText = data.server_url;
+        const clientEl = document.getElementById("sp_db_display_client");
+        if (clientEl) clientEl.innerText = data.client_id;
+        setTimeout(() => closeDatabaseConfigModal(), 400);
+      } else {
+        throw new Error(data.detail || data.message || "Lỗi lưu cấu hình");
+      }
+    } catch (e) {
+      showToast(`Lỗi lưu cấu hình Database: ${e.message}`, "danger");
     }
   }
 </script>

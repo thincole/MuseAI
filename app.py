@@ -2112,6 +2112,139 @@ def save_shopee_settings(settings: dict):
     return {"success": True}
 
 
+def _update_env_file(env_path: str, updates: dict[str, str]):
+    lines = []
+    found_keys = set()
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#") and "=" in stripped:
+                        k = stripped.split("=", 1)[0].strip()
+                        if k in updates and updates[k] is not None:
+                            lines.append(f"{k}={updates[k]}\n")
+                            found_keys.add(k)
+                            continue
+                    lines.append(line)
+        except Exception as e:
+            log.warning("Không đọc được file .env: %s", e)
+    for k, v in updates.items():
+        if k not in found_keys and v is not None:
+            lines.append(f"{k}={v}\n")
+    try:
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        log.warning("Không ghi được file .env: %s", e)
+
+
+@app.get("/api/shopee/db-config")
+def get_shopee_db_config():
+    cfg = _get_shopee_settings()
+    server_url = os.environ.get("SHOPEE_SERVER_URL", "").strip() or cfg.get("sv_server_url") or shopee_engine.DEFAULT_SERVER_URL
+    api_key = os.environ.get("SHOPEE_API_KEY", "").strip() or cfg.get("sv_api_key") or shopee_engine.DEFAULT_API_KEY
+    client_id = os.environ.get("SHOPEE_CLIENT_ID", "").strip() or cfg.get("sv_client_id") or shopee_engine.DEFAULT_CLIENT_ID
+    return {
+        "server_url": server_url,
+        "api_key": api_key,
+        "client_id": client_id
+    }
+
+
+@app.post("/api/shopee/test-db-connection")
+def test_shopee_db_connection(data: dict):
+    server_url = (data.get("server_url") or "").strip().rstrip("/")
+    if not server_url:
+        return {"success": False, "message": "Server URL không được để trống"}
+    if not (server_url.startswith("http://") or server_url.startswith("https://")):
+        server_url = "http://" + server_url
+
+    # 1. Thử HTTP Request
+    try:
+        import urllib.request
+        import urllib.error
+        test_endpoint = f"{server_url}/health" if not server_url.endswith((":3000", "/api")) else server_url
+        req = urllib.request.Request(
+            test_endpoint,
+            headers={"User-Agent": "MuseAI/1.0"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                return {"success": True, "message": f"Kết nối HTTP thành công (HTTP {resp.status})"}
+        except urllib.error.HTTPError as he:
+            return {"success": True, "message": f"Máy chủ phản hồi tốt (HTTP {he.code})"}
+    except Exception:
+        pass
+
+    # 2. Thử TCP Socket Connect
+    try:
+        import urllib.parse
+        import socket
+        p = urllib.parse.urlsplit(server_url)
+        host = p.hostname
+        port = p.port or (443 if p.scheme == "https" else 80)
+        if host:
+            with socket.create_connection((host, port), timeout=4):
+                return {"success": True, "message": f"Cổng {port} mở & kết nối mạng TCP thành công"}
+    except Exception as exc:
+        return {"success": False, "message": f"Không thể kết nối tới {server_url}: {exc}"}
+
+    return {"success": False, "message": "Không thể kết nối tới máy chủ Database"}
+
+
+@app.post("/api/shopee/save-db-config")
+def save_shopee_db_config(data: dict):
+    server_url = (data.get("server_url") or "").strip().rstrip("/")
+    api_key = (data.get("api_key") or "").strip()
+    client_id = (data.get("client_id") or "").strip()
+
+    if not server_url:
+        raise HTTPException(400, "Địa chỉ Server URL không được để trống")
+
+    # 1. Cập nhật biến môi trường runtime
+    os.environ["SHOPEE_SERVER_URL"] = server_url
+    if api_key:
+        os.environ["SHOPEE_API_KEY"] = api_key
+    if client_id:
+        os.environ["SHOPEE_CLIENT_ID"] = client_id
+
+    # 2. Cập nhật module shopee_engine runtime
+    shopee_engine.DEFAULT_SERVER_URL = server_url
+    if api_key:
+        shopee_engine.DEFAULT_API_KEY = api_key
+    if client_id:
+        shopee_engine.DEFAULT_CLIENT_ID = client_id
+
+    # 3. Ghi vào file .env để lưu vĩnh viễn qua các lần khởi động lại
+    env_file = os.path.join(CFG.base_dir, ".env")
+    _update_env_file(env_file, {
+        "SHOPEE_SERVER_URL": server_url,
+        "SHOPEE_API_KEY": api_key,
+        "SHOPEE_CLIENT_ID": client_id
+    })
+
+    # 4. Ghi vào data/shopee_settings.json
+    try:
+        cur_settings = _get_shopee_settings()
+        cur_settings["sv_server_url"] = server_url
+        if api_key:
+            cur_settings["sv_api_key"] = api_key
+        if client_id:
+            cur_settings["sv_client_id"] = client_id
+        with open(SHOPEE_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cur_settings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("Lỗi ghi shopee_settings.json: %s", e)
+
+    return {
+        "success": True,
+        "server_url": server_url,
+        "client_id": client_id,
+        "message": "Đã lưu cấu hình Database thành công!"
+    }
+
+
 @app.post("/api/shopee/claim")
 def claim_shopee_jobs(req: dict):
     cfg = _get_shopee_settings()
