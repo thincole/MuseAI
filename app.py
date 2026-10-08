@@ -29,16 +29,19 @@ import asyncio
 import base64
 import io
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
 import shutil
+import socket
 import threading
 import time
 import uuid
 import zipfile
+from urllib.parse import urlsplit
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -89,7 +92,8 @@ _PROTECTED_PREFIXES = ("/api/shopee/", "/api/proxy/", "/api/browser/")
 async def _require_key_for_internal_api(request: Request, call_next):
     if request.method != "OPTIONS" and request.url.path.startswith(_PROTECTED_PREFIXES):
         try:
-            auth(request.headers.get("authorization"))
+            # Nếu đặt MUSE2API_ADMIN_KEY thì các API nội bộ chỉ nhận admin key (xem admin_auth).
+            admin_auth(request.headers.get("authorization"))
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     return await call_next(request)
@@ -186,16 +190,52 @@ def resolve_model(name: str | None, default: str = "muse-image") -> str:
 
 
 # ------------------------- 鉴权 -------------------------
-def auth(authorization: str | None = Header(default=None)):
-    if not CFG.api_key:
-        return True
+def _bearer_token(authorization: str | None) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "缺少 Authorization: Bearer <key>")
     parts = authorization.split(None, 1)
-    token = parts[1].strip() if len(parts) > 1 else ""
-    if not token or not secrets.compare_digest(token, CFG.api_key):
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _token_matches(token: str, key: str | None) -> bool:
+    return bool(token and key) and secrets.compare_digest(token.encode(), str(key).encode())
+
+
+def _admin_key() -> str:
+    return (getattr(CFG, "admin_key", "") or "").strip()
+
+
+def auth(authorization: str | None = Header(default=None)):
+    """Key cho /v1/*: nhận API key hoặc admin key (nếu có đặt MUSE2API_ADMIN_KEY)."""
+    if not CFG.api_key and not _admin_key():
+        return True
+    token = _bearer_token(authorization)
+    if not (_token_matches(token, CFG.api_key) or _token_matches(token, _admin_key())):
         raise HTTPException(401, "API key 无效")
     return True
+
+
+def admin_auth(authorization: str | None = Header(default=None)):
+    """Key cho /admin/* và /api/{shopee,proxy,browser}/*.
+
+    MUSE2API_ADMIN_KEY rỗng -> giống hệt auth (hành vi cũ). Có đặt -> chỉ nhận admin key,
+    để API key phát cho client bên ngoài (/v1) không dùng được vào trang quản trị / đọc-ghi file.
+    """
+    admin_key = _admin_key()
+    if not admin_key:
+        return auth(authorization)
+    token = _bearer_token(authorization)
+    if not _token_matches(token, admin_key):
+        raise HTTPException(401, "Admin key 无效")
+    return True
+
+
+def _is_admin_request(request: Request) -> bool:
+    try:
+        admin_auth(request.headers.get("authorization"))
+        return True
+    except HTTPException:
+        return False
 
 
 # ------------------------- 请求模型 -------------------------
@@ -828,24 +868,40 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 return res, cur_acc["id"]
             except MuseAuthError as exc:
                 last_exc = exc
+                log.warning("✗ [Video Gen] Lỗi xác thực tài khoản %s: %s", cur_acc["id"], exc)
                 store.mark(cur_acc["id"], False, str(exc))
                 if session:
-                    engine.release_session(session, error=True)
+                    try:
+                        engine.release_session(session, error=True)
+                    except Exception:
+                        pass
                     session = None
             except MuseGenerationError as exc:
                 last_exc = exc
+                log.warning("✗ [Video Gen] Lỗi tạo video với TK %s: %s", cur_acc["id"], exc)
                 store.mark(cur_acc["id"], True, f"Tác vụ gián đoạn: {str(exc)[:60]}")
                 if session:
-                    engine.release_session(session, error=True)
+                    try:
+                        engine.release_session(session, error=True)
+                    except Exception:
+                        pass
                     session = None
             except Exception as exc:
+                log.exception("✗ [Video Gen] Ngoại lệ không xác định khi tạo video với TK %s: %s", cur_acc["id"], exc)
                 last_exc = MuseGenerationError(f"Tạo video thất bại: {exc}")
                 if session:
-                    engine.release_session(session, error=True)
+                    try:
+                        engine.release_session(session, error=True)
+                    except Exception:
+                        pass
                     session = None
             finally:
                 if session:
-                    engine.release_session(session, error=True)
+                    try:
+                        engine.release_session(session, error=True)
+                    except Exception:
+                        pass
+                    session = None
 
         raise last_exc or MuseGenerationError("Tạo video thất bại sau các lần thử")
     finally:
@@ -1457,7 +1513,7 @@ def get_media(name: str):
 
 # ------------------------- 管理：总览 -------------------------
 @app.get("/admin/status")
-def admin_status(_=Depends(auth)):
+def admin_status(_=Depends(admin_auth)):
     base = _public_base()
     return {
         "accounts": store.list_accounts(),
@@ -1478,7 +1534,7 @@ def admin_status(_=Depends(auth)):
 
 # ------------------------- 管理：账号池 -------------------------
 @app.get("/admin/accounts")
-def list_accounts(_=Depends(auth)):
+def list_accounts(_=Depends(admin_auth)):
     return {
         "accounts": store.list_accounts(),
         "stats": store.stats(),
@@ -1487,7 +1543,7 @@ def list_accounts(_=Depends(auth)):
 
 
 @app.post("/admin/accounts")
-def add_account(req: AccountRequest, _=Depends(auth)):
+def add_account(req: AccountRequest, _=Depends(admin_auth)):
     added: list[dict] = []
     seen: list[dict] = []          # 本次导入的所有 cookie，用来检查核心项是否齐全
 
@@ -1522,7 +1578,7 @@ def add_account(req: AccountRequest, _=Depends(auth)):
 
 
 @app.patch("/admin/accounts/{aid}")
-def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
+def patch_account(aid: str, req: AccountPatch, _=Depends(admin_auth)):
     acc = store.update_account(aid, label=req.label, enabled=req.enabled)
     if not acc:
         raise HTTPException(404, "账号不存在")
@@ -1531,7 +1587,7 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
 
 
 @app.delete("/admin/accounts/{aid}")
-def del_account(aid: str, _=Depends(auth)):
+def del_account(aid: str, _=Depends(admin_auth)):
     ok = store.delete_account(aid)
     if not ok:
         raise HTTPException(404, "账号不存在")
@@ -1539,7 +1595,7 @@ def del_account(aid: str, _=Depends(auth)):
 
 
 @app.post("/admin/accounts/{aid}/test")
-async def test_account(aid: str, _=Depends(auth)):
+async def test_account(aid: str, _=Depends(admin_auth)):
     """真实打开 muse.ai 验证该账号 cookie 是否仍可登录。"""
     acc = store.get_account(aid)
     if not acc:
@@ -1578,12 +1634,12 @@ async def test_account(aid: str, _=Depends(auth)):
 
 
 @app.post("/admin/accounts/{aid}/relogin")
-async def relogin_account(aid: str, _=Depends(auth)):
+async def relogin_account(aid: str, _=Depends(admin_auth)):
     return await test_account(aid, _)
 
 
 @app.post("/admin/accounts/{aid}/cookies")
-def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
+def update_cookies(aid: str, payload: dict = Body(...), _=Depends(admin_auth)):
     """更新某个账号的 cookie（用于会话过期后补新 cookie）。"""
     cookies = dict(payload.get("cookies") or {})
     if payload.get("cookie_header"):
@@ -1605,7 +1661,7 @@ def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
 
 
 @app.post("/admin/relogin")
-def relogin(_=Depends(auth)):
+def relogin(_=Depends(admin_auth)):
     acc = store.pick_account(rotate=True)
     if not acc:
         raise HTTPException(400, "没有可用账号")
@@ -1619,7 +1675,7 @@ def relogin(_=Depends(auth)):
 
 # ------------------------- 管理：额度 -------------------------
 @app.post("/admin/accounts/{aid}/quota")
-async def query_quota(aid: str, _=Depends(auth)):
+async def query_quota(aid: str, _=Depends(admin_auth)):
     """打开 muse.ai 的 Settings 面板读该账号的额度（实时），并缓存到账号记录。
 
     返回例：{"plan":"Free plan","weekly_reset":"Sep 30",
@@ -1652,7 +1708,7 @@ async def query_quota(aid: str, _=Depends(auth)):
 
 
 @app.post("/admin/quota")
-async def query_any_quota(_=Depends(auth)):
+async def query_any_quota(_=Depends(admin_auth)):
     """用当前最久未用的可用账号查一次额度（同池账号共享同一 muse.ai 计划的
     通常只有一人使用时够用；多账号时建议按账号查）。"""
     acc = store.pick_account(rotate=True)
@@ -1667,7 +1723,7 @@ def _public_base() -> str:
 
 
 @app.get("/admin/apikey")
-def get_apikey(_=Depends(auth)):
+def get_apikey(_=Depends(admin_auth)):
     base = _public_base()
     base_url = f"{base}/v1" if base else ""
     return {"api_key": CFG.api_key, "base_url": base_url,
@@ -1676,7 +1732,7 @@ def get_apikey(_=Depends(auth)):
 
 
 @app.post("/admin/apikey/rotate")
-def rotate_apikey(_=Depends(auth)):
+def rotate_apikey(_=Depends(admin_auth)):
     """生成新的 API Key，写入 .env 并立即生效（不用重启）。"""
     import secrets
     new_key = "m2a_" + secrets.token_hex(24)
@@ -1757,24 +1813,24 @@ def extension_files():
 
 # ------------------------- 管理：任务 / 媒体 -------------------------
 @app.get("/admin/tasks")
-def admin_tasks(limit: int = 50, _=Depends(auth)):
+def admin_tasks(limit: int = 50, _=Depends(admin_auth)):
     return {"tasks": store.list_tasks(limit)}
 
 
 @app.delete("/admin/tasks/{tid}")
-def del_task(tid: str, _=Depends(auth)):
+def del_task(tid: str, _=Depends(admin_auth)):
     if not store.delete_task(tid):
         raise HTTPException(404, "任务不存在")
     return {"deleted": True}
 
 
 @app.post("/admin/tasks/clear")
-def clear_tasks(payload: dict = Body(default={}), _=Depends(auth)):
+def clear_tasks(payload: dict = Body(default={}), _=Depends(admin_auth)):
     return {"removed": store.clear_tasks(int(payload.get("keep") or 0))}
 
 
 @app.get("/admin/media")
-def admin_media(_=Depends(auth)):
+def admin_media(_=Depends(admin_auth)):
     d = CFG.media_dir
     items = []
     if os.path.isdir(d):
@@ -1791,7 +1847,7 @@ def admin_media(_=Depends(auth)):
 
 
 @app.post("/admin/media/delete")
-def delete_media(payload: dict = Body(default={}), _=Depends(auth)):
+def delete_media(payload: dict = Body(default={}), _=Depends(admin_auth)):
     names = payload.get("names", [])
     if isinstance(names, str):
         names = [names]
@@ -1815,7 +1871,7 @@ def delete_media(payload: dict = Body(default={}), _=Depends(auth)):
 
 
 @app.delete("/admin/media/{name}")
-def delete_single_media(name: str, _=Depends(auth)):
+def delete_single_media(name: str, _=Depends(admin_auth)):
     if "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "非法文件名")
     p = os.path.join(CFG.media_dir, name)
@@ -1880,7 +1936,7 @@ def cleanup_media(max_age_days: int = 0, max_files: int = 0, dry_run: bool = Fal
 
 
 @app.post("/admin/media/cleanup")
-def admin_media_cleanup(payload: dict = Body(default={}), _=Depends(auth)):
+def admin_media_cleanup(payload: dict = Body(default={}), _=Depends(admin_auth)):
     """Dọn thủ công thư mục media. Body (tùy chọn): max_age_days, max_files, dry_run.
     Không truyền thì dùng cấu hình MUSE2API_MEDIA_RETENTION_DAYS / MUSE2API_MEDIA_MAX_FILES."""
     age = payload.get("max_age_days")
@@ -2328,18 +2384,386 @@ def save_temp_clip(req: dict):
     return {"success": True, "path": target_path, "filename": target_filename}
 
 
+def _inspect_product_clips(target_out: str, item_id: str) -> dict:
+    clean_id = str(item_id or "").strip()
+    res = {
+        "clip_a": None,
+        "clip_b": None,
+        "clip_raw": None,
+        "final_video": None,
+        "has_a": False,
+        "has_b": False,
+        "has_both": False,
+        "has_final": False,
+        "temp_dir": "",
+    }
+    if not clean_id:
+        return res
+
+    saved_cfg = _get_shopee_settings()
+    if not target_out:
+        target_out = saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    target_out = os.path.normpath(str(target_out).strip())
+    temp_dir = os.path.join(target_out, "temp")
+    res["temp_dir"] = temp_dir
+
+    candidate_temp_dirs = []
+    if os.path.isdir(temp_dir):
+        candidate_temp_dirs.append(temp_dir)
+    def_temp = os.path.join(shopee_engine.DEFAULT_OUT_DIR, "temp")
+    if os.path.isdir(def_temp) and def_temp not in candidate_temp_dirs:
+        candidate_temp_dirs.append(def_temp)
+
+    clean_id_low = clean_id.lower()
+
+    # 1. Quét tìm clip_a, clip_b trong các folder temp
+    for tdir in candidate_temp_dirs:
+        try:
+            files = os.listdir(tdir)
+        except OSError:
+            continue
+        for fname in files:
+            if not fname.lower().endswith((".mp4", ".mov", ".webm")):
+                continue
+            lower = fname.lower()
+            fpath = os.path.join(tdir, fname)
+            try:
+                if os.path.getsize(fpath) < 10000:
+                    continue
+            except OSError:
+                continue
+
+            # Clip A (-a hoặc _a)
+            if not res["clip_a"]:
+                if (lower == f"{clean_id_low}-a.mp4" or lower == f"{clean_id_low}_a.mp4" or
+                    lower.startswith(f"{clean_id_low}-a.") or lower.startswith(f"{clean_id_low}_a.")):
+                    res["clip_a"] = fpath
+                    res["has_a"] = True
+
+            # Clip B (-b hoặc _b)
+            if not res["clip_b"]:
+                if (lower == f"{clean_id_low}-b.mp4" or lower == f"{clean_id_low}_b.mp4" or
+                    lower.startswith(f"{clean_id_low}-b.") or lower.startswith(f"{clean_id_low}_b.")):
+                    res["clip_b"] = fpath
+                    res["has_b"] = True
+
+            # Clip raw (8s)
+            if not res["clip_raw"]:
+                if (lower == f"{clean_id_low}-raw.mp4" or lower == f"{clean_id_low}_raw.mp4" or
+                    lower.startswith(f"{clean_id_low}-raw.") or lower.startswith(f"{clean_id_low}_raw.")):
+                    res["clip_raw"] = fpath
+
+    # 2. Fallback kiểm tra clip cache file (clip_cache.json)
+    if not res["clip_a"] or not res["clip_b"]:
+        try:
+            cached = shopee_engine.get_cached_clips(clean_id)
+            if not res["clip_a"] and cached.get("clip_a"):
+                res["clip_a"] = cached["clip_a"]
+                res["has_a"] = True
+            if not res["clip_b"] and cached.get("clip_b"):
+                res["clip_b"] = cached["clip_b"]
+                res["has_b"] = True
+        except Exception:
+            pass
+
+    res["has_both"] = bool(res["clip_a"] and res["clip_b"])
+
+    # 3. Quét kiểm tra video hoàn chỉnh trong target_out
+    candidate_out_dirs = [target_out] if os.path.isdir(target_out) else []
+    if os.path.isdir(shopee_engine.DEFAULT_OUT_DIR) and shopee_engine.DEFAULT_OUT_DIR not in candidate_out_dirs:
+        candidate_out_dirs.append(shopee_engine.DEFAULT_OUT_DIR)
+
+    for od in candidate_out_dirs:
+        try:
+            files = os.listdir(od)
+        except OSError:
+            continue
+        for fname in files:
+            if not fname.lower().endswith((".mp4", ".mov", ".webm")):
+                continue
+            lower = fname.lower()
+            if (lower == f"{clean_id_low}.mp4" or
+                lower.startswith(f"{clean_id_low}.") or
+                f"_{clean_id_low}." in lower or
+                f"-{clean_id_low}." in lower or
+                lower.endswith(f"_{clean_id_low}.mp4") or
+                lower.endswith(f"-{clean_id_low}.mp4")):
+                fpath = os.path.join(od, fname)
+                try:
+                    if os.path.getsize(fpath) >= 50000:
+                        res["final_video"] = fpath
+                        res["has_final"] = True
+                        break
+                except OSError:
+                    continue
+        if res["has_final"]:
+            break
+
+    return res
+
+
 @app.get("/api/shopee/check-temp-clips")
 def check_temp_clips(out_dir: str = "", item_id: str = ""):
-    """Kiểm tra xem các clip thô {item_id}-a.mp4 và {item_id}-b.mp4 đã có sẵn trong folder output/temp chưa."""
-    target_out = out_dir or shopee_engine.DEFAULT_OUT_DIR
+    """Kiểm tra xem các clip thô {item_id}-a.mp4 và {item_id}-b.mp4 hoặc video hoàn chỉnh đã có sẵn chưa."""
+    saved_cfg = _get_shopee_settings()
+    target_out = (out_dir or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    target_out = os.path.normpath(target_out)
+    return _inspect_product_clips(target_out, item_id)
+
+
+@app.post("/api/shopee/batch-check-clips")
+def batch_check_shopee_clips(req: dict):
+    """Kiểm tra nhanh hàng loạt sản phẩm xem đã có clip -a, -b hoặc video hoàn chỉnh chưa."""
+    saved_cfg = _get_shopee_settings()
+    out_dir = (req.get("out_dir") or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    out_dir = os.path.normpath(out_dir)
+    item_ids = req.get("item_ids") or []
+    results = {}
+    for iid in item_ids:
+        sid = str(iid).strip()
+        if sid:
+            results[sid] = _inspect_product_clips(out_dir, sid)
+    return {"success": True, "results": results}
+
+
+@app.get("/api/shopee/temp-stitch-summary")
+def get_temp_stitch_summary(out_dir: str = ""):
+    """Thống kê các clip trong thư mục temp: có bao nhiêu cặp -a, -b và bao nhiêu cặp chưa ghép thành 16s."""
+    saved_cfg = _get_shopee_settings()
+    target_out = (out_dir or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    target_out = os.path.normpath(target_out)
     temp_dir = os.path.join(target_out, "temp")
-    res = {"clip_a": None, "clip_b": None, "clip_raw": None}
-    if os.path.isdir(temp_dir) and item_id and _SAFE_ID_RE.match(item_id):
-        for part in ("a", "b", "raw"):
-            p = os.path.join(temp_dir, f"{item_id}-{part}.mp4")
-            if os.path.isfile(p) and os.path.getsize(p) > 10000:
-                res[f"clip_{part}"] = p
-    return res
+
+    if not os.path.isdir(temp_dir):
+        return {
+            "success": True,
+            "out_dir": target_out,
+            "temp_dir": temp_dir,
+            "total_temp_files": 0,
+            "total_pairs": 0,
+            "already_stitched": 0,
+            "waiting_to_stitch": 0,
+            "waiting_item_ids": []
+        }
+
+    try:
+        temp_files = os.listdir(temp_dir)
+    except OSError:
+        temp_files = []
+
+    # Gom nhóm theo item_id
+    clips_a = {}
+    clips_b = {}
+    for fname in temp_files:
+        if not fname.lower().endswith((".mp4", ".mov", ".webm")):
+            continue
+        fpath = os.path.join(temp_dir, fname)
+        try:
+            sz = os.path.getsize(fpath)
+            if sz < 10000:
+                continue
+        except OSError:
+            continue
+
+        lower = fname.lower()
+        m_a = re.match(r"^(\d+)[-_]a\.", lower)
+        if m_a:
+            clips_a[m_a.group(1)] = fpath
+            continue
+        m_b = re.match(r"^(\d+)[-_]b\.", lower)
+        if m_b:
+            clips_b[m_b.group(1)] = fpath
+            continue
+
+    paired_ids = set(clips_a.keys()) & set(clips_b.keys())
+
+    # Quét thư mục xuất video đích xem video 16s nào đã có
+    try:
+        out_files = os.listdir(target_out)
+    except OSError:
+        out_files = []
+
+    final_ids = set()
+    for of in out_files:
+        if not of.lower().endswith((".mp4", ".mov", ".webm")):
+            continue
+        of_path = os.path.join(target_out, of)
+        try:
+            if os.path.getsize(of_path) < 50000:
+                continue
+        except OSError:
+            continue
+        of_low = of.lower()
+        # Tìm item_id trong tên file video đích
+        m_id = re.search(r"(\d{8,})", of_low)
+        if m_id:
+            final_ids.add(m_id.group(1))
+
+    waiting_ids = [iid for iid in paired_ids if iid not in final_ids]
+
+    return {
+        "success": True,
+        "out_dir": target_out,
+        "temp_dir": temp_dir,
+        "total_temp_files": len(temp_files),
+        "total_pairs": len(paired_ids),
+        "already_stitched": len(paired_ids) - len(waiting_ids),
+        "waiting_to_stitch": len(waiting_ids),
+        "waiting_item_ids": sorted(waiting_ids)
+    }
+
+
+@app.post("/api/shopee/auto-stitch-temp")
+def auto_stitch_temp_clips(req: dict):
+    """Tự động quét thư mục temp, tìm tất cả cặp clip -a và -b chưa ghép và nối thành video 16s qua FFmpeg."""
+    saved_cfg = _get_shopee_settings()
+    out_dir = (req.get("out_dir") or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    out_dir = os.path.normpath(out_dir)
+    temp_dir = os.path.join(out_dir, "temp")
+
+    if not os.path.isdir(temp_dir):
+        return {"success": False, "message": f"Thư mục temp không tồn tại: {temp_dir}"}
+
+    summary = get_temp_stitch_summary(out_dir)
+    waiting_ids = summary.get("waiting_item_ids") or []
+    if not waiting_ids:
+        return {
+            "success": True,
+            "message": "Không có cặp clip A/B nào cần ghép trong temp (tất cả đã được ghép hoặc chưa đủ cặp).",
+            "stitched_count": 0,
+            "already_count": summary.get("already_stitched", 0)
+        }
+
+    log.info("⚡ [Auto Stitch] Bắt đầu ghép tự động %d cặp clip trong %s...", len(waiting_ids), temp_dir)
+    stitched_items = []
+    failed_items = []
+
+    delete_temp = bool(req.get("delete_temp", True))
+
+    for iid in waiting_ids:
+        # Tìm file clip_a và clip_b
+        f_a = None
+        f_b = None
+        for ext in (".mp4", ".mov", ".webm"):
+            cand_a = os.path.join(temp_dir, f"{iid}-a{ext}")
+            if not os.path.isfile(cand_a):
+                cand_a = os.path.join(temp_dir, f"{iid}_a{ext}")
+            if os.path.isfile(cand_a) and os.path.getsize(cand_a) >= 10000:
+                f_a = cand_a
+
+            cand_b = os.path.join(temp_dir, f"{iid}-b{ext}")
+            if not os.path.isfile(cand_b):
+                cand_b = os.path.join(temp_dir, f"{iid}_b{ext}")
+            if os.path.isfile(cand_b) and os.path.getsize(cand_b) >= 10000:
+                f_b = cand_b
+
+        if not f_a or not f_b:
+            failed_items.append({"item_id": iid, "reason": "Không tìm thấy file Clip A hoặc Clip B hợp lệ"})
+            continue
+
+        target_name = f"{iid}.mp4"
+        out_final = os.path.join(out_dir, target_name)
+
+        try:
+            ok = shopee_engine.concat_videos([f_a, f_b], out_final)
+            if ok and os.path.isfile(out_final) and os.path.getsize(out_final) >= 50000:
+                stitched_items.append({
+                    "item_id": iid,
+                    "filename": target_name,
+                    "path": out_final,
+                    "size": os.path.getsize(out_final)
+                })
+                log.info("✓ [Auto Stitch] Ghép thành công 16s: %s (%.1f MB)", target_name, os.path.getsize(out_final)/(1024*1024))
+                # Tự động xóa file clip tạm sau khi ghép thành công vào video đích
+                if delete_temp:
+                    for f_tmp in (f_a, f_b):
+                        try:
+                            if os.path.isfile(f_tmp):
+                                os.remove(f_tmp)
+                        except Exception as de:
+                            log.warning("Không thể xóa file temp %s: %s", f_tmp, de)
+            else:
+                failed_items.append({"item_id": iid, "reason": "FFmpeg concat_videos trả về thất bại"})
+        except Exception as err:
+            log.warning("✗ [Auto Stitch] Lỗi ghép SP %s: %s", iid, err)
+            failed_items.append({"item_id": iid, "reason": str(err)})
+
+    return {
+        "success": True,
+        "out_dir": out_dir,
+        "total_waiting": len(waiting_ids),
+        "stitched_count": len(stitched_items),
+        "failed_count": len(failed_items),
+        "stitched": stitched_items,
+        "failed": failed_items,
+        "message": f"Đã ghép thành công {len(stitched_items)}/{len(waiting_ids)} video 16s và dọn sạch file tạm!"
+    }
+
+
+@app.post("/api/shopee/clean-temp-clips")
+def clean_finished_temp_clips(req: dict):
+    """Xóa tất cả các file clip tạm (-a, -b, -raw) trong thư mục temp mà video hoàn chỉnh đã tồn tại."""
+    saved_cfg = _get_shopee_settings()
+    out_dir = (req.get("out_dir") or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    out_dir = os.path.normpath(out_dir)
+    temp_dir = os.path.join(out_dir, "temp")
+
+    if not os.path.isdir(temp_dir):
+        return {"success": True, "deleted_count": 0, "freed_mb": 0, "message": "Thư mục temp không tồn tại"}
+
+    try:
+        out_files = os.listdir(out_dir)
+    except OSError:
+        out_files = []
+
+    final_ids = set()
+    for of in out_files:
+        if not of.lower().endswith((".mp4", ".mov", ".webm")):
+            continue
+        p = os.path.join(out_dir, of)
+        try:
+            if os.path.getsize(p) < 50000:
+                continue
+        except OSError:
+            continue
+        m = re.search(r"(\d{8,})", of.lower())
+        if m:
+            final_ids.add(m.group(1))
+
+    try:
+        temp_files = os.listdir(temp_dir)
+    except OSError:
+        temp_files = []
+
+    deleted_count = 0
+    freed_bytes = 0
+    for tf in temp_files:
+        if not tf.lower().endswith((".mp4", ".mov", ".webm")):
+            continue
+        lower = tf.lower()
+        m_id = re.match(r"^(\d+)[-_](?:a|b|raw)\.", lower)
+        if m_id and m_id.group(1) in final_ids:
+            tf_path = os.path.join(temp_dir, tf)
+            try:
+                sz = os.path.getsize(tf_path)
+                os.remove(tf_path)
+                deleted_count += 1
+                freed_bytes += sz
+            except Exception as e:
+                log.warning("Không thể xóa file temp %s: %s", tf, e)
+
+    freed_mb = round(freed_bytes / (1024 * 1024), 1)
+    freed_gb = round(freed_bytes / (1024 ** 3), 2)
+    msg = f"Đã dọn dẹp {deleted_count} file clip tạm, giải phóng {freed_gb} GB ({freed_mb} MB) dung lượng ổ cứng!"
+    log.info("🧹 [Clean Temp] %s", msg)
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "freed_bytes": freed_bytes,
+        "freed_mb": freed_mb,
+        "freed_gb": freed_gb,
+        "message": msg
+    }
 
 
 @app.get("/muse-logo.svg")
@@ -2583,6 +3007,21 @@ def save_rendered_video(req: dict):
                 except Exception:
                     pass
 
+            # Tự động dọn dẹp các clip tạm (-a, -b, -raw) trong out_dir/temp tương ứng với Item ID
+            m_target_id = re.search(r"(\d{8,})", target_name)
+            if m_target_id:
+                tid = m_target_id.group(1)
+                temp_dir = os.path.join(out_dir, "temp")
+                if os.path.isdir(temp_dir):
+                    for ext in (".mp4", ".mov", ".webm"):
+                        for suffix in (f"{tid}-a{ext}", f"{tid}_a{ext}", f"{tid}-b{ext}", f"{tid}_b{ext}", f"{tid}-raw{ext}", f"{tid}_raw{ext}"):
+                            tf = os.path.join(temp_dir, suffix)
+                            if os.path.isfile(tf):
+                                try:
+                                    os.remove(tf)
+                                except Exception:
+                                    pass
+
         return {"success": True, "saved_path": dst, "stitched": stitched}
     except Exception as e:
         raise HTTPException(500, f"Lỗi lưu file video: {e}")
@@ -2769,7 +3208,7 @@ async def _keepalive_loop():
 
 
 @app.post("/admin/accounts/keepalive")
-async def trigger_keepalive_all(force: bool = True, _=Depends(auth)):
+async def trigger_keepalive_all(force: bool = True, _=Depends(admin_auth)):
     """管理员手动触发一次全账号保活续期。"""
     if KEEPALIVE_STATE["running"]:
         return {"status": "busy", "message": "保活任务正在执行中，请稍候"}
@@ -2777,13 +3216,13 @@ async def trigger_keepalive_all(force: bool = True, _=Depends(auth)):
 
 
 @app.post("/admin/accounts/{aid}/keepalive")
-async def trigger_keepalive_single(aid: str, _=Depends(auth)):
+async def trigger_keepalive_single(aid: str, _=Depends(admin_auth)):
     """手动针对单个账号执行保活续期。"""
     return await asyncio.to_thread(_probe_account_sync, aid, False)
 
 
 @app.get("/admin/keepalive/status")
-def get_keepalive_status(_=Depends(auth)):
+def get_keepalive_status(_=Depends(admin_auth)):
     """获取保活守护协程状态。"""
     return KEEPALIVE_STATE
 
@@ -3077,7 +3516,7 @@ def _require_upstream_sync():
 
 @app.post("/admin/update/upgrade")
 @app.post("/admin/repo/pull")
-async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
+async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(admin_auth)):
     """一键从 GitHub 官方仓库拉取最新更新并自动平滑重启服务。"""
     _require_upstream_sync()
     res = await asyncio.to_thread(_upgrade_from_github_sync)
@@ -3095,7 +3534,7 @@ async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
 
 
 @app.post("/admin/repo/push")
-async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
+async def admin_repo_push(payload: dict = Body(default={}), _=Depends(admin_auth)):
     """维护者专用：将当前节点核心代码推送到 GitHub 仓库（自动过滤 .env 与 data 目录）。"""
     _require_upstream_sync()
     msg =(payload.get("message") or "").strip() or f"chore: sync update ({time.strftime('%Y-%m-%d %H:%M:%S')})"

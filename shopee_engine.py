@@ -84,6 +84,20 @@ DEFAULT_API_KEY = os.environ.get("SHOPEE_API_KEY", "").strip()
 DEFAULT_CLIENT_ID = os.environ.get("SHOPEE_CLIENT_ID", "").strip()
 DEFAULT_OUT_DIR = os.environ.get("SHOPEE_OUT_DIR", "").strip() or os.path.join(CFG.base_dir, "output")
 
+
+# Đọc lại tại thời điểm gọi (không đóng băng giá trị lúc import) — dùng khi caller không truyền server_url/api_key.
+def _env_server_url() -> str:
+    return os.environ.get("SHOPEE_SERVER_URL", "").strip() or DEFAULT_SERVER_URL
+
+
+def _env_api_key() -> str:
+    return os.environ.get("SHOPEE_API_KEY", "").strip() or DEFAULT_API_KEY
+
+
+def _env_client_id() -> str:
+    return os.environ.get("SHOPEE_CLIENT_ID", "").strip() or DEFAULT_CLIENT_ID
+
+
 # ==================== KHUNG CẢNH PRESET TỪ NOVAGATE ====================
 SCENES = [
     ("📦 Tổng kho hàng hóa",
@@ -365,15 +379,91 @@ def build_tvc_prompt(product_name: str, lang: str = "ph", review_style: str = "U
 
 CLIP_CACHE_FILE = os.path.join(CFG.data_dir, "shopee_clip_cache.json")
 
+# Khóa cho từng file JSON (RLock để add_to_blacklist có thể giữ khóa xuyên suốt get -> sửa -> save).
+_CLIP_CACHE_LOCK = threading.RLock()
+_BLACKLIST_LOCK = threading.RLock()
+
+# Trạng thái trả về của _load_json_file
+_JSON_MISSING = "missing"
+_JSON_OK = "ok"
+_JSON_CORRUPT_PRESERVED = "corrupt_preserved"      # file hỏng đã được đổi tên .corrupt-<ts> -> ghi mới an toàn
+_JSON_CORRUPT_UNPRESERVED = "corrupt_unpreserved"  # file hỏng nhưng KHÔNG đổi tên được -> cấm ghi đè
+_JSON_READ_ERROR = "read_error"                    # lỗi I/O khi đọc (khóa file, quyền...) -> không ghi đè
+
+
+def _atomic_write_json(path: str, data) -> None:
+    """Ghi JSON nguyên tử: ghi ra `path + '.tmp'` (cùng thư mục) -> flush + fsync -> os.replace (thử lại vài lần
+    vì trên Windows file đích có thể đang bị process khác/antivirus mở tạm thời). Ném lỗi nếu thất bại."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        last_err: Exception | None = None
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as e:
+                last_err = e
+                time.sleep(0.05 * (attempt + 1))
+        raise last_err  # type: ignore[misc]
+    except BaseException:
+        _safe_remove(tmp)
+        raise
+
+
+def _preserve_corrupt_file(path: str, label: str, err) -> bool:
+    """Đổi tên file JSON hỏng thành `<path>.corrupt-<ts>` để không mất dữ liệu. Trả về True nếu đổi tên thành công."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dst = f"{path}.corrupt-{ts}"
+    n = 1
+    while os.path.exists(dst):
+        dst = f"{path}.corrupt-{ts}-{n}"
+        n += 1
+    try:
+        os.replace(path, dst)
+        log.error("File %s (%s) bị hỏng (%s) — đã lưu lại thành %s, dùng giá trị mặc định.", label, path, err, dst)
+        return True
+    except OSError as e2:
+        log.error("File %s (%s) bị hỏng (%s) và KHÔNG đổi tên được (%s) — sẽ không ghi đè để tránh mất dữ liệu.",
+                  label, path, err, e2)
+        return False
+
+
+def _load_json_file(path: str, label: str) -> tuple[dict | None, str]:
+    """Đọc file JSON (object). Trả về (data | None, trạng thái _JSON_*).
+    File hỏng (JSON lỗi / không phải object) được đổi tên .corrupt-<ts> trước khi trả về None."""
+    if not os.path.isfile(path):
+        return None, _JSON_MISSING
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        ok = _preserve_corrupt_file(path, label, e)
+        return None, (_JSON_CORRUPT_PRESERVED if ok else _JSON_CORRUPT_UNPRESERVED)
+    except OSError as e:
+        log.warning("Không đọc được %s (%s): %s", label, path, e)
+        return None, _JSON_READ_ERROR
+    if not isinstance(data, dict):
+        ok = _preserve_corrupt_file(path, label, f"gốc JSON là {type(data).__name__}, cần object")
+        return None, (_JSON_CORRUPT_PRESERVED if ok else _JSON_CORRUPT_UNPRESERVED)
+    return data, _JSON_OK
+
 
 def get_cached_clips(item_id: str) -> dict:
     """Lấy danh sách các clip thành phần (Clip A, Clip B) đã render thành công trước đó."""
-    if not os.path.isfile(CLIP_CACHE_FILE):
+    with _CLIP_CACHE_LOCK:
+        data, _status = _load_json_file(CLIP_CACHE_FILE, "clip cache")
+    if not data:
         return {}
     try:
-        with open(CLIP_CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
         item_data = data.get(str(item_id)) or {}
+        if not isinstance(item_data, dict):
+            return {}
         valid = {}
         for k in ("clip_a", "clip_b"):
             fname = item_data.get(k)
@@ -382,30 +472,33 @@ def get_cached_clips(item_id: str) -> dict:
                 if os.path.isfile(fpath) and os.path.getsize(fpath) > 10000:
                     valid[k] = fname
         return valid
-    except Exception:
+    except Exception as e:
+        log.warning("Lỗi đọc clip cache cho %s: %s", item_id, e)
         return {}
 
 
-def set_cached_clip(item_id: str, clip_key: str, filename: str):
-    """Lưu lại tên file clip thành phần đã render thành công của sản phẩm."""
-    os.makedirs(os.path.dirname(CLIP_CACHE_FILE), exist_ok=True)
-    data = {}
-    if os.path.isfile(CLIP_CACHE_FILE):
+def set_cached_clip(item_id: str, clip_key: str, filename: str) -> bool:
+    """Lưu lại tên file clip thành phần đã render thành công của sản phẩm (đọc-sửa-ghi dưới khóa, ghi nguyên tử)."""
+    with _CLIP_CACHE_LOCK:
+        data, status = _load_json_file(CLIP_CACHE_FILE, "clip cache")
+        if status in (_JSON_CORRUPT_UNPRESERVED, _JSON_READ_ERROR):
+            log.error("Bỏ qua ghi clip cache (%s=%s) vì file hiện tại không đọc được/không sao lưu được.", item_id, clip_key)
+            return False
+        data = data or {}
+        str_id = str(item_id)
+        entry = data.get(str_id)
+        if not isinstance(entry, dict):
+            entry = {}
+            data[str_id] = entry
+        entry[clip_key] = filename
+        entry["updated_at"] = int(time.time())
         try:
-            with open(CLIP_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    str_id = str(item_id)
-    if str_id not in data:
-        data[str_id] = {}
-    data[str_id][clip_key] = filename
-    data[str_id]["updated_at"] = int(time.time())
-    try:
-        with open(CLIP_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+            _atomic_write_json(CLIP_CACHE_FILE, data)
+            return True
+        except Exception as e:
+            log.warning("Lỗi lưu clip cache: %s", e)
+            return False
+
 
 BLACKLIST_FILE = os.path.join(CFG.data_dir, "shopee_blacklist.json")
 
@@ -413,7 +506,7 @@ DEFAULT_BLACKLIST = {
     "enabled": True,
     "auto_block_safety": True,
     "keywords": [
-        "vape", "pod", "thuốc lá", "thuoc la", "cigar", "xì gà", "xi ga",
+        "vape", "pod", "thuốc lá", "thuoc la", "cigar", "cigarette", "xì gà", "xi ga",
         "bao cao su", "kích dục", "kich duc", "sextoy", "sex toy", "tình dục", "tinh duc",
         "18+", "người lớn", "nguoi lon", "dao găm", "súng", "sung", "vũ khí", "vu khi",
         "fake", "replica", "hàng nhái", "hang nhai", "shisha", "bóng cười", "bong cuoi"
@@ -422,75 +515,186 @@ DEFAULT_BLACKLIST = {
 }
 
 
+def _default_blacklist() -> dict:
+    """Bản sao sâu của DEFAULT_BLACKLIST — tránh việc sửa list bên trong làm hỏng giá trị mặc định của module."""
+    return copy.deepcopy(DEFAULT_BLACKLIST)
+
+
 def get_blacklist() -> dict:
-    """Lấy danh sách Blacklist (từ khóa cấm & Item ID cấm)."""
-    if not os.path.isfile(BLACKLIST_FILE):
-        return dict(DEFAULT_BLACKLIST)
-    try:
-        with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if "keywords" not in data:
-                data["keywords"] = list(DEFAULT_BLACKLIST["keywords"])
-            if "item_ids" not in data:
-                data["item_ids"] = []
-            if "enabled" not in data:
-                data["enabled"] = True
-            if "auto_block_safety" not in data:
-                data["auto_block_safety"] = True
-            return data
-    except Exception:
-        return dict(DEFAULT_BLACKLIST)
+    """Lấy danh sách Blacklist (từ khóa cấm & Item ID cấm). Luôn trả về object mới, an toàn để sửa."""
+    with _BLACKLIST_LOCK:
+        data, _status = _load_json_file(BLACKLIST_FILE, "blacklist")
+    if data is None:
+        return _default_blacklist()
+    if not isinstance(data.get("keywords"), list):
+        data["keywords"] = copy.deepcopy(DEFAULT_BLACKLIST["keywords"])
+    if not isinstance(data.get("item_ids"), list):
+        data["item_ids"] = []
+    if "enabled" not in data:
+        data["enabled"] = True
+    if "auto_block_safety" not in data:
+        data["auto_block_safety"] = True
+    return data
 
 
 def save_blacklist(data: dict) -> bool:
-    """Lưu danh sách Blacklist xuống file data/shopee_blacklist.json."""
-    os.makedirs(os.path.dirname(BLACKLIST_FILE), exist_ok=True)
-    try:
-        kw_list = []
-        for kw in data.get("keywords", []):
-            k = str(kw).strip().lower()
-            if k and k not in kw_list:
-                kw_list.append(k)
+    """Lưu danh sách Blacklist xuống file data/shopee_blacklist.json (dưới khóa, ghi nguyên tử)."""
+    with _BLACKLIST_LOCK:
+        try:
+            kw_list = []
+            for kw in data.get("keywords", []) or []:
+                k = unicodedata.normalize("NFC", str(kw)).strip().lower()
+                if k and k not in kw_list:
+                    kw_list.append(k)
 
-        ids_list = []
-        for iid in data.get("item_ids", []):
-            i = str(iid).strip()
-            if i and i not in ids_list:
-                ids_list.append(i)
+            ids_list = []
+            for iid in data.get("item_ids", []) or []:
+                i = str(iid).strip()
+                if i and i not in ids_list:
+                    ids_list.append(i)
 
-        clean_data = {
-            "enabled": bool(data.get("enabled", True)),
-            "auto_block_safety": bool(data.get("auto_block_safety", True)),
-            "keywords": kw_list,
-            "item_ids": ids_list,
-            "updated_at": int(time.time())
-        }
-        with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(clean_data, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        log.warning("Lỗi lưu blacklist: %s", e)
-        return False
+            clean_data = {
+                "enabled": bool(data.get("enabled", True)),
+                "auto_block_safety": bool(data.get("auto_block_safety", True)),
+                "keywords": kw_list,
+                "item_ids": ids_list,
+                "updated_at": int(time.time())
+            }
+            # Không ghi đè file hỏng khi chưa sao lưu được nó (.corrupt-<ts>).
+            if os.path.isfile(BLACKLIST_FILE):
+                _old, status = _load_json_file(BLACKLIST_FILE, "blacklist")
+                if status == _JSON_CORRUPT_UNPRESERVED:
+                    log.error("Không lưu blacklist: file hiện tại bị hỏng và chưa sao lưu được.")
+                    return False
+            _atomic_write_json(BLACKLIST_FILE, clean_data)
+            return True
+        except Exception as e:
+            log.warning("Lỗi lưu blacklist: %s", e)
+            return False
 
 
 def add_to_blacklist(item_id: str | None = None, keyword: str | None = None, reason: str = "") -> dict:
-    """Thêm một Item ID hoặc Từ khóa vào Blacklist."""
-    bl = get_blacklist()
-    added = []
-    if item_id:
-        sid = str(item_id).strip()
-        if sid and sid not in bl.get("item_ids", []):
-            bl.setdefault("item_ids", []).append(sid)
-            added.append(f"ID {sid}")
-    if keyword:
-        skw = str(keyword).strip().lower()
-        if skw and skw not in bl.get("keywords", []):
-            bl.setdefault("keywords", []).append(skw)
-            added.append(f"Từ khóa '{skw}'")
-    if added:
-        save_blacklist(bl)
-        log.info("🚫 Đã thêm vào Blacklist (%s): %s", reason or "manual", ", ".join(added))
+    """Thêm một Item ID hoặc Từ khóa vào Blacklist (giữ khóa xuyên suốt đọc -> sửa -> ghi)."""
+    with _BLACKLIST_LOCK:
+        bl = get_blacklist()
+        added = []
+        if item_id:
+            sid = str(item_id).strip()
+            if sid and sid not in bl.get("item_ids", []):
+                bl.setdefault("item_ids", []).append(sid)
+                added.append(f"ID {sid}")
+        if keyword:
+            skw = unicodedata.normalize("NFC", str(keyword)).strip().lower()
+            if skw and skw not in bl.get("keywords", []):
+                bl.setdefault("keywords", []).append(skw)
+                added.append(f"Từ khóa '{skw}'")
+        if added:
+            if save_blacklist(bl):
+                log.info("🚫 Đã thêm vào Blacklist (%s): %s", reason or "manual", ", ".join(added))
+            else:
+                log.warning("Không lưu được Blacklist khi thêm: %s", ", ".join(added))
     return bl
+
+
+# ---------- So khớp từ khóa Blacklist (theo ranh giới từ, có xử lý dấu tiếng Việt) ----------
+# Ranh giới từ = không đứng cạnh chữ cái/chữ số (dấu "_" được coi là ký tự phân tách).
+_BL_LEFT = r"(?<![^\W_])"
+_BL_RIGHT = r"(?![^\W_])"
+_BL_SEP = r"[\s\-_]+"  # cụm nhiều từ: cho phép nhiều khoảng trắng / gạch nối / gạch dưới giữa các từ
+
+
+def _strip_accents(s: str) -> str:
+    """Bỏ dấu tiếng Việt / Latin: NFD + bỏ dấu kết hợp (Mn), 'đ' -> 'd'."""
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s.replace("đ", "d").replace("Đ", "D")
+
+
+def _has_latin_diacritics(s: str) -> bool:
+    """True nếu chuỗi có chữ Latin mang dấu (ví dụ 'ổ', 'ú', 'đ') — tức người bán gõ tiếng Việt có dấu."""
+    for ch in s:
+        if ch in ("đ", "Đ"):
+            return True
+        if ord(ch) > 127 and ch.isalpha():
+            dec = unicodedata.normalize("NFD", ch)
+            if len(dec) > 1 and dec[0].isascii():
+                return True
+    return False
+
+
+def _bl_pattern(kw: str) -> re.Pattern | None:
+    parts = [p for p in re.split(_BL_SEP, kw) if p]
+    if not parts:
+        return None
+    body = _BL_SEP.join(re.escape(p) for p in parts)
+    # Từ khóa tiếng Anh (ASCII) kết thúc bằng chữ cái: cho phép số nhiều "s"/"es" (pods, vapes, cigars).
+    suffix = "(?:e?s)?" if kw.isascii() and kw[-1].isalpha() else ""
+    return re.compile(_BL_LEFT + body + suffix + _BL_RIGHT)
+
+
+_BL_CACHE_LOCK = threading.Lock()
+_BL_COMPILED_CACHE: dict[tuple, list] = {}
+
+
+def _compile_blacklist_keywords(keywords: tuple) -> list[tuple[str, str, re.Pattern | None, re.Pattern | None]]:
+    """Biên dịch danh sách từ khóa thành [(kw, loại, pattern_có_dấu, pattern_không_dấu)].
+    loại:
+      - "accented": từ khóa có dấu (súng, thuốc lá) -> khớp NGUYÊN DẤU với tên có dấu; với tên gõ không dấu
+        thì khớp dạng bỏ dấu.
+      - "alias":    từ khóa ASCII trùng dạng bỏ dấu của 1 từ khóa có dấu trong danh sách (sung <-> súng,
+        thuoc la <-> thuốc lá) -> CHỈ áp dụng cho tên gõ không dấu (tránh 'bổ sung' bị coi là 'súng').
+      - "ascii":    từ khóa ASCII thuần (vape, pod, cigar, 18+, bao cao su) -> khớp mọi tên (đã bỏ dấu).
+    """
+    with _BL_CACHE_LOCK:
+        cached = _BL_COMPILED_CACHE.get(keywords)
+    if cached is not None:
+        return cached
+    norm_kws = []
+    for kw in keywords:
+        k = unicodedata.normalize("NFC", str(kw if kw is not None else "")).strip().lower()
+        if k and k not in norm_kws:
+            norm_kws.append(k)
+    accented_plain = {_strip_accents(k) for k in norm_kws if _strip_accents(k) != k}
+    compiled = []
+    for k in norm_kws:
+        plain = _strip_accents(k)
+        if plain != k:
+            compiled.append((k, "accented", _bl_pattern(k), _bl_pattern(plain)))
+        elif k in accented_plain:
+            compiled.append((k, "alias", None, _bl_pattern(k)))
+        else:
+            compiled.append((k, "ascii", None, _bl_pattern(k)))
+    with _BL_CACHE_LOCK:
+        if len(_BL_COMPILED_CACHE) > 32:
+            _BL_COMPILED_CACHE.clear()
+        _BL_COMPILED_CACHE[keywords] = compiled
+    return compiled
+
+
+def _match_blacklist_keyword(name: str, keywords) -> str | None:
+    """Trả về từ khóa cấm đầu tiên khớp với tên sản phẩm (theo ranh giới từ), hoặc None."""
+    name_nfc = unicodedata.normalize("NFC", str(name or "")).lower()
+    if not name_nfc.strip():
+        return None
+    name_plain = _strip_accents(name_nfc)
+    name_has_diacritics = _has_latin_diacritics(name_nfc)
+    try:
+        key = tuple(str(k) for k in (keywords or []))
+    except TypeError:
+        return None
+    for kw, kind, pat_acc, pat_plain in _compile_blacklist_keywords(key):
+        if kind == "accented":
+            if pat_acc is not None and pat_acc.search(name_nfc):
+                return kw
+            if not name_has_diacritics and pat_plain is not None and pat_plain.search(name_plain):
+                return kw
+        elif kind == "alias":
+            if not name_has_diacritics and pat_plain is not None and pat_plain.search(name_plain):
+                return kw
+        else:
+            if pat_plain is not None and pat_plain.search(name_plain):
+                return kw
+    return None
 
 
 def is_product_blacklisted(product: dict, blacklist_data: dict | None = None) -> tuple[bool, str]:
@@ -505,23 +709,21 @@ def is_product_blacklisted(product: dict, blacklist_data: dict | None = None) ->
     if iid_str and iid_str in blacklisted_ids:
         return True, f"ID {iid_str} nằm trong danh sách đen (Blacklist)"
 
-    # 2. Kiểm tra Từ khóa cấm trong tên sản phẩm
-    name = (product.get("name") or "").lower()
-    if not name:
+    # 2. Kiểm tra Từ khóa cấm trong tên sản phẩm (theo ranh giới từ, xem _compile_blacklist_keywords)
+    name = product.get("name") or ""
+    if not str(name).strip():
         return False, ""
 
-    for kw in bl.get("keywords", []):
-        skw = str(kw).strip().lower()
-        if not skw:
-            continue
-        if skw in name:
-            return True, f"Chứa từ khóa cấm '{skw}'"
+    hit = _match_blacklist_keyword(name, bl.get("keywords", []))
+    if hit:
+        return True, f"Chứa từ khóa cấm '{hit}'"
 
     return False, ""
 
 
 def concat_videos(clip_paths: list[str], output_path: str) -> bool:
-    """Ghép nhiều clip video thành 1 video 16s hoàn chỉnh bằng FFmpeg, có khóa FFMPEG_LOCK và luồng ưu tiên thấp."""
+    """Ghép nhiều clip video thành 1 video 16s hoàn chỉnh bằng FFmpeg (giới hạn đồng thời qua FFMPEG_SEMAPHORE,
+    tiến trình ưu tiên thấp). Thất bại thì xóa file output dở dang."""
     if not clip_paths:
         return False
     if len(clip_paths) == 1:
@@ -530,9 +732,10 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
         return True
 
     t0 = time.time()
-    with FFMPEG_LOCK:
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        list_file = os.path.join(tempfile.gettempdir(), f"concat_{int(time.time()*1000)}_{random.randint(100, 999)}.txt")
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    list_file = os.path.join(tempfile.gettempdir(), f"concat_{int(time.time()*1000)}_{random.randint(100, 999)}.txt")
+    ok = False
+    with FFMPEG_SEMAPHORE:
         try:
             with open(list_file, "w", encoding="utf-8") as f:
                 for p in clip_paths:
@@ -552,6 +755,7 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
             if res.returncode != 0:
                 err1 = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
                 log.warning("concat_videos copy failed: %s; falling back to reencode", err1)
+                _safe_remove(output_path)  # bỏ output dở dang của lần stream-copy
                 # Thử 2: re-encode nếu stream khác codec hoặc timeline
                 # Giới hạn -threads 2 để không chiếm dụng toàn bộ core CPU của máy (tránh đơ máy)
                 cmd_reencode = [
@@ -575,13 +779,12 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
             return ok
         except Exception as e:
             log.warning("Lỗi concat_videos: %s", e)
+            ok = False
             return False
         finally:
-            if os.path.exists(list_file):
-                try:
-                    os.remove(list_file)
-                except Exception:
-                    pass
+            _safe_remove(list_file)
+            if not ok:
+                _safe_remove(output_path)  # không để lại file video hỏng/dở dang
 
 
 def build_video_prompts_16s(product_name: str, scene_choice: str = "🎲 Random", lang: str = "ph", review_style: str = "Unboxing") -> tuple[list[str], str]:
@@ -679,9 +882,9 @@ def parse_price(v, default=0.0) -> float:
 
 
 def claim_jobs_from_server(
-    server_url: str = DEFAULT_SERVER_URL,
-    api_key: str = DEFAULT_API_KEY,
-    client_id: str = DEFAULT_CLIENT_ID,
+    server_url: str | None = None,
+    api_key: str | None = None,
+    client_id: str | None = None,
     market: str = "PH",
     limit: int = 2000,
     sort_by: str = "sold",
@@ -693,6 +896,9 @@ def claim_jobs_from_server(
     return_stats: bool = False,
 ) -> list[dict] | tuple[list[dict], int]:
     """Nhận lô sản phẩm từ Server PostgreSQL trung tâm của Shopee và tự động lọc Blacklist."""
+    server_url = server_url or _env_server_url()
+    api_key = api_key or _env_api_key()
+    client_id = client_id or _env_client_id()
     payload = {
         "market": market,
         "clientId": client_id,
@@ -759,69 +965,172 @@ def claim_jobs_from_server(
     return products
 
 
-def release_stuck_jobs(server_url: str = DEFAULT_SERVER_URL, api_key: str = DEFAULT_API_KEY, client_id: str = DEFAULT_CLIENT_ID) -> int:
+def release_stuck_jobs(server_url: str | None = None, api_key: str | None = None, client_id: str | None = None) -> int:
     """Giải phóng các sản phẩm đang kẹt ở trạng thái processing."""
+    server_url = server_url or _env_server_url()
+    api_key = api_key or _env_api_key()
+    client_id = client_id or _env_client_id()
     res = call_seed_api(server_url, api_key, "POST", "/api/thinaptm/release-jobs", {"clientId": client_id})
     return res.get("released", 0) if isinstance(res, dict) else 0
 
 
 def report_job_completion(
-    server_url: str = DEFAULT_SERVER_URL,
-    api_key: str = DEFAULT_API_KEY,
+    server_url: str | None = None,
+    api_key: str | None = None,
     item_id: str = "",
     status: str = "completed",
     video_path: str = None
 ) -> bool:
     """Báo cáo trạng thái hoàn thành của sản phẩm về Server PostgreSQL."""
+    server_url = server_url or _env_server_url()
+    api_key = api_key or _env_api_key()
     payload = {"itemId": item_id, "status": status, "tool": "museai"}
     if video_path:
         payload["video_path"] = video_path
     try:
         call_seed_api(server_url, api_key, "POST", "/api/thinaptm/complete-job", payload)
         return True
-    except Exception:
+    except Exception as e:
+        log.warning("Báo cáo complete-job thất bại (item_id=%s, status=%s, server=%s): %s: %s",
+                    item_id, status, server_url or "<chưa cấu hình>", type(e).__name__, e)
         return False
 
 
+# ==================== TẢI ẢNH SẢN PHẨM (chống SSRF) ====================
+MAX_IMAGE_BYTES = 15 * 1024 * 1024  # 15MB
+_IMAGE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"}
+
+
+def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+        or ip.is_multicast or ip.is_unspecified or not ip.is_global
+    )
+
+
+def _validate_public_http_url(url: str) -> str:
+    """Chỉ cho phép http/https tới host công khai. Phân giải DNS và từ chối IP private/loopback/link-local/
+    reserved/multicast. Ném ValueError (thông điệp rõ ràng) nếu bị từ chối."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("URL ảnh trống")
+    url = url.strip()
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError as e:
+        raise ValueError(f"URL ảnh không hợp lệ: {e}") from None
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"URL ảnh bị từ chối: chỉ cho phép http/https (nhận '{scheme or 'không có scheme'}')")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL ảnh bị từ chối: thiếu host")
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        raise ValueError("URL ảnh bị từ chối: port không hợp lệ") from None
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OSError) as e:
+        raise ValueError(f"URL ảnh bị từ chối: không phân giải được host '{host}' ({e})") from None
+    if not infos:
+        raise ValueError(f"URL ảnh bị từ chối: host '{host}' không có địa chỉ IP")
+    for info in infos:
+        ip_str = str(info[4][0]).split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            raise ValueError(f"URL ảnh bị từ chối: địa chỉ IP không hợp lệ '{ip_str}'") from None
+        if not _is_public_ip(ip):
+            raise ValueError(f"URL ảnh bị từ chối: host '{host}' trỏ tới địa chỉ nội bộ/không công khai ({ip})")
+    return url
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Kiểm tra lại từng URL redirect (tránh redirect sang 127.0.0.1 / mạng nội bộ / file://)."""
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_public_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_IMAGE_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
+
+
+def _read_capped(resp, cap: int = MAX_IMAGE_BYTES) -> bytes:
+    """Đọc body theo từng khối, dừng & báo lỗi nếu vượt quá `cap` byte."""
+    cl = (resp.headers.get("Content-Length") or "").strip()
+    if cl.isdigit() and int(cl) > cap:
+        raise ValueError(f"Ảnh quá lớn ({int(cl)} byte > giới hạn {cap} byte)")
+    buf = bytearray()
+    while True:
+        chunk = resp.read(64 * 1024)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > cap:
+            raise ValueError(f"Ảnh quá lớn (> giới hạn {cap} byte)")
+    return bytes(buf)
+
+
+def _fetch_image_bytes(image_url: str, timeout: int = 15, require_image_type: bool = True) -> tuple[bytes, str]:
+    """Tải ảnh an toàn. Trả về (data, content_type). ValueError = bị từ chối (không nên thử lại)."""
+    url = _validate_public_http_url(image_url)
+    req = urllib.request.Request(url, headers=_IMAGE_HEADERS)
+    with _IMAGE_OPENER.open(req, timeout=timeout) as resp:
+        raw_ct = resp.headers.get("Content-Type") or ""
+        ctype = raw_ct.split(";", 1)[0].strip().lower()
+        if require_image_type and ctype and not ctype.startswith("image/"):
+            raise ValueError(f"URL không trả về ảnh (Content-Type: {ctype})")
+        data = _read_capped(resp, MAX_IMAGE_BYTES)
+    return data, (ctype or "image/jpeg")
+
+
 def download_image_as_data_url(image_url: str, retries: int = 3) -> str | None:
-    """Tải ảnh sản phẩm từ Shopee CDN về bộ nhớ và trả về chuỗi Data URL Base64."""
+    """Tải ảnh sản phẩm từ Shopee CDN về bộ nhớ và trả về chuỗi Data URL Base64.
+    Ném ValueError nếu URL bị từ chối (scheme/IP nội bộ/không phải ảnh/quá 15MB); lỗi mạng -> thử lại rồi trả None."""
     if not image_url:
         return None
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"}
+    _validate_public_http_url(image_url)
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(image_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                content_type = resp.headers.get("Content-Type", "image/jpeg")
-                data = resp.read()
-                if len(data) > 0:
-                    b64 = base64.b64encode(data).decode("utf-8")
-                    return f"data:{content_type};base64,{b64}"
-        except Exception:
+            data, content_type = _fetch_image_bytes(image_url, timeout=15, require_image_type=True)
+            if len(data) > 0:
+                b64 = base64.b64encode(data).decode("utf-8")
+                return f"data:{content_type};base64,{b64}"
+        except ValueError:
+            raise
+        except Exception as e:
+            log.debug("Tải ảnh thất bại (lần %d/%d) %s: %s", attempt + 1, retries, image_url, e)
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
     return None
 
 
 def download_image_to_file(image_url: str, target_path: str, retries: int = 3) -> bool:
-    """Tải ảnh sản phẩm từ Shopee CDN và lưu trực tiếp ra file trên ổ đĩa."""
+    """Tải ảnh sản phẩm từ Shopee CDN và lưu trực tiếp ra file trên ổ đĩa.
+    Ném ValueError nếu URL bị từ chối (scheme/IP nội bộ/quá 15MB); lỗi mạng -> thử lại rồi trả False."""
     if not image_url or not target_path:
         return False
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"}
+    _validate_public_http_url(image_url)
     os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(image_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = resp.read()
-                if len(data) > 0:
-                    with open(target_path, "wb") as f:
-                        f.write(data)
-                    return True
-        except Exception:
+            data, _ctype = _fetch_image_bytes(image_url, timeout=15, require_image_type=False)
+            if len(data) > 0:
+                with open(target_path, "wb") as f:
+                    f.write(data)
+                return True
+        except ValueError:
+            raise
+        except Exception as e:
+            log.debug("Tải ảnh ra file thất bại (lần %d/%d) %s: %s", attempt + 1, retries, image_url, e)
             if attempt < retries - 1:
                 time.sleep(1.0 * (attempt + 1))
     return False
+
 
 
 def get_media_duration(vp: str) -> float:
@@ -845,120 +1154,130 @@ def ghep_anh_12s(
     - Nếu video AI 8s: giữ nguyên tốc độ chuẩn 8s (không làm chậm), tạo Outro ảnh phóng to (zoom-in) 4s -> Tổng 12.0s.
     - Nếu video AI 10s: giữ nguyên tốc độ chuẩn 10s, tạo Outro ảnh phóng to (zoom-in) 2s -> Tổng 12.0s.
     - Xử lý làm mượt âm thanh (fade out tự nhiên cuối đoạn AI) để nối sang Outro không bị giật/nổ tiếng.
-    - Được đồng bộ qua FFMPEG_LOCK và ưu tiên tiến trình thấp để CPU không bị quá tải làm đơ máy.
+    - Bước encode FFmpeg được giới hạn đồng thời qua FFMPEG_SEMAPHORE (ffprobe nhẹ chạy ngoài semaphore)
+      và chạy ưu tiên tiến trình thấp để CPU không bị quá tải làm đơ máy.
+    - Thất bại thì xóa file output dở dang.
     """
     if not os.path.isfile(video_path) or not os.path.isfile(image_path):
         return False
 
     t0 = time.time()
-    with FFMPEG_LOCK:
-        def check_has_audio(vp):
-            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', vp]
-            try:
-                result = _run_ffmpeg_cmd(cmd, timeout=10, text=True)
-                return len(result.stdout.strip()) > 0
-            except Exception:
-                return False
 
-        def get_video_info(vp):
-            cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,r_frame_rate', '-of', 'json', vp]
-            try:
-                result = _run_ffmpeg_cmd(cmd, timeout=10, text=True)
-                data = json.loads(result.stdout)
-                stream = data['streams'][0]
-                width = int(stream['width'])
-                height = int(stream['height'])
-                fps_str = stream['r_frame_rate']
-                if '/' in fps_str:
-                    num, den = fps_str.split('/')
-                    fps = float(num) / float(den)
-                else:
-                    fps = float(fps_str)
-                return width, height, fps
-            except Exception:
-                return 720, 1280, 24.0
-
+    def check_has_audio(vp):
+        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', vp]
         try:
-            has_audio = check_has_audio(video_path)
-            width, height, fps = get_video_info(video_path)
-            fps_int = int(round(fps))
-            if fps_int <= 0:
-                fps_int = 24
+            result = _run_ffmpeg_cmd(cmd, timeout=10, text=True)
+            return len(result.stdout.strip()) > 0
+        except Exception:
+            return False
 
-            # Xác định độ dài video AI (8s hoặc 10s)
-            if ai_duration is not None and ai_duration > 0:
-                chosen_ai_dur = float(ai_duration)
+    def get_video_info(vp):
+        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,r_frame_rate', '-of', 'json', vp]
+        try:
+            result = _run_ffmpeg_cmd(cmd, timeout=10, text=True)
+            data = json.loads(result.stdout)
+            stream = data['streams'][0]
+            width = int(stream['width'])
+            height = int(stream['height'])
+            fps_str = stream['r_frame_rate']
+            if '/' in fps_str:
+                num, den = fps_str.split('/')
+                fps = float(num) / float(den)
             else:
-                chosen_ai_dur = get_media_duration(video_path)
+                fps = float(fps_str)
+            return width, height, fps
+        except Exception:
+            return 720, 1280, 24.0
 
-            if chosen_ai_dur >= 9.0:
-                video_dur = 10.0
-                image_dur = 2.0
-            else:
-                video_dur = 8.0
-                image_dur = 4.0
+    # --- Chuẩn bị (ffprobe + dựng filter) — KHÔNG giữ semaphore ---
+    try:
+        has_audio = check_has_audio(video_path)
+        width, height, fps = get_video_info(video_path)
+        fps_int = int(round(fps))
+        if fps_int <= 0:
+            fps_int = 24
 
-            total_image_frames = int(round(image_dur * fps_int))
+        # Xác định độ dài video AI (8s hoặc 10s)
+        if ai_duration is not None and ai_duration > 0:
+            chosen_ai_dur = float(ai_duration)
+        else:
+            chosen_ai_dur = get_media_duration(video_path)
 
-            # Hiệu ứng phóng to mượt mà (Zoom-In) 1.0x -> 1.3x
-            w_scale = int(width * 1.3)
-            if w_scale % 2 != 0: w_scale += 1
-            h_scale = int(height * 1.3)
-            if h_scale % 2 != 0: h_scale += 1
+        if chosen_ai_dur >= 9.0:
+            video_dur = 10.0
+            image_dur = 2.0
+        else:
+            video_dur = 8.0
+            image_dur = 4.0
 
-            zoom_step = 0.3 / max(1, total_image_frames)
-            zoom_expr = f"min(zoom+{zoom_step:.6f},1.3)"
-            x_expr = "iw/2-(iw/zoom/2)"
-            y_expr = "ih/2-(ih/zoom/2)"
+        total_image_frames = int(round(image_dur * fps_int))
 
-            # Video AI nguyên bản, không làm chậm, cắt chuẩn video_dur
-            v_part = f"[0:v]scale={width}:{height},fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setpts=PTS-STARTPTS[v_part]"
+        # Hiệu ứng phóng to mượt mà (Zoom-In) 1.0x -> 1.3x
+        w_scale = int(width * 1.3)
+        if w_scale % 2 != 0: w_scale += 1
+        h_scale = int(height * 1.3)
+        if h_scale % 2 != 0: h_scale += 1
 
-            # Outro ảnh chuyển động phóng to (zoom-in)
-            i_v = (
-                f"[1:v]scale={w_scale}:{h_scale}:force_original_aspect_ratio=increase,"
-                f"crop={w_scale}:{h_scale},"
-                f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height},"
-                f"fps={fps_int},trim=0:{image_dur},setpts=PTS-STARTPTS[i_v]"
+        zoom_step = 0.3 / max(1, total_image_frames)
+        zoom_expr = f"min(zoom+{zoom_step:.6f},1.3)"
+        x_expr = "iw/2-(iw/zoom/2)"
+        y_expr = "ih/2-(ih/zoom/2)"
+
+        # Video AI nguyên bản, không làm chậm, cắt chuẩn video_dur
+        v_part = f"[0:v]scale={width}:{height},fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setpts=PTS-STARTPTS[v_part]"
+
+        # Outro ảnh chuyển động phóng to (zoom-in)
+        i_v = (
+            f"[1:v]scale={w_scale}:{h_scale}:force_original_aspect_ratio=increase,"
+            f"crop={w_scale}:{h_scale},"
+            f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height},"
+            f"fps={fps_int},trim=0:{image_dur},setpts=PTS-STARTPTS[i_v]"
+        )
+
+        filter_parts = [v_part, i_v]
+        if has_audio:
+            fade_dur = 0.6
+            fade_start = max(0.0, video_dur - fade_dur)
+            # Làm mượt âm thanh: chuẩn hóa stereo 48kHz, pad nếu thiếu, fade-out nhẹ 0.6s cuối video AI
+            a_part = (
+                f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                f"apad=whole_dur={video_dur},atrim=0:{video_dur},"
+                f"afade=t=out:st={fade_start:.2f}:d={fade_dur:.2f},asetpts=PTS-STARTPTS[a_part]"
             )
+            i_a = f"anullsrc=r=48000:cl=stereo,atrim=0:{image_dur},asetpts=PTS-STARTPTS[i_a]"
+            concat = "[v_part][a_part][i_v][i_a]concat=n=2:v=1:a=1[outv][outa]"
+            filter_parts.extend([a_part, i_a, concat])
+            map_args = ["-map", "[outv]", "-map", "[outa]"]
+        else:
+            concat = "[v_part][i_v]concat=n=2:v=1:a=0[outv]"
+            filter_parts.append(concat)
+            map_args = ["-map", "[outv]"]
 
-            filter_parts = [v_part, i_v]
-            if has_audio:
-                fade_dur = 0.6
-                fade_start = max(0.0, video_dur - fade_dur)
-                # Làm mượt âm thanh: chuẩn hóa stereo 48kHz, pad nếu thiếu, fade-out nhẹ 0.6s cuối video AI
-                a_part = (
-                    f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-                    f"apad=whole_dur={video_dur},atrim=0:{video_dur},"
-                    f"afade=t=out:st={fade_start:.2f}:d={fade_dur:.2f},asetpts=PTS-STARTPTS[a_part]"
-                )
-                i_a = f"anullsrc=r=48000:cl=stereo,atrim=0:{image_dur},asetpts=PTS-STARTPTS[i_a]"
-                concat = "[v_part][a_part][i_v][i_a]concat=n=2:v=1:a=1[outv][outa]"
-                filter_parts.extend([a_part, i_a, concat])
-                map_args = ["-map", "[outv]", "-map", "[outa]"]
-            else:
-                concat = "[v_part][i_v]concat=n=2:v=1:a=0[outv]"
-                filter_parts.append(concat)
-                map_args = ["-map", "[outv]"]
+        filter_complex_str = "; ".join(filter_parts)
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-            filter_complex_str = "; ".join(filter_parts)
-            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-loop", "1", "-t", str(image_dur), "-i", image_path,
+            "-filter_complex", filter_complex_str
+        ]
+        cmd.extend(map_args)
+        cmd.extend([
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
+            "-pix_fmt", "yuv420p"
+        ])
+        if has_audio:
+            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+        cmd.append(output_path)
+    except Exception as e:
+        log.warning("Lỗi chuẩn bị ghép video 12s: %s", e)
+        return False
 
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", video_path,
-                "-loop", "1", "-t", str(image_dur), "-i", image_path,
-                "-filter_complex", filter_complex_str
-            ]
-            cmd.extend(map_args)
-            cmd.extend([
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
-                "-pix_fmt", "yuv420p"
-            ])
-            if has_audio:
-                cmd.extend(["-c:a", "aac", "-b:a", "192k"])
-            cmd.append(output_path)
-
+    # --- Encode (nặng) — giới hạn đồng thời qua FFMPEG_SEMAPHORE ---
+    ok = False
+    with FFMPEG_SEMAPHORE:
+        try:
             res = _run_ffmpeg_cmd(cmd, timeout=90)
             if res.returncode != 0:
                 err = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
@@ -971,3 +1290,6 @@ def ghep_anh_12s(
         except Exception as e:
             log.warning("Lỗi ghép video 12s bằng ffmpeg: %s", e)
             return False
+        finally:
+            if not ok:
+                _safe_remove(output_path)  # không để lại file video hỏng/dở dang

@@ -986,7 +986,8 @@ async function queryQuota(aid, btn){
     }else{
       toast('设置面板里没有读到额度数据（可能是页面结构变了）', 'warn');
     }
-    loadPool();
+    if (btn){ btn.disabled = false; btn.textContent = '额度'; }   // 先复位，loadPool 遇到忙碌按钮会跳过重绘
+    loadPool(true);
   }catch(e){
     toast('额度查询失败：' + e.message, 'bad');
     if (btn){ btn.disabled = false; btn.textContent = '额度'; }
@@ -1013,8 +1014,10 @@ function expiryBadge(a){
 
 /* ================= 账号池 ================= */
 let accounts = [];
+let _poolLastJson = '';
+let _poolRenderedAt = 0;
 
-async function loadPool(){
+async function loadPool(force){
   try{
     const d = await api('/admin/accounts');
     accounts = d.accounts || [];
@@ -1046,6 +1049,14 @@ async function loadPool(){
     }else{
       bar.style.display = 'none';
     }
+
+    // 表格有按钮处于忙碌状态（如「查询中…」）时不重绘，避免冲掉进行中的状态
+    if ($('poolBody').querySelector('button:disabled')) return;
+    // 数据没变化就不重绘（但每 60s 至少重绘一次，让「x 秒前」「剩 x 小时」保持更新）
+    const json = JSON.stringify(accounts);
+    if (!force && json === _poolLastJson && Date.now() - _poolRenderedAt < 60000) return;
+    _poolLastJson = json;
+    _poolRenderedAt = Date.now();
 
     if (!accounts.length){
       $('poolBody').innerHTML = '<tr><td colspan="10" class="empty">还没有账号。去「获取 Cookie」页签按三步导入一个</td></tr>';
@@ -1080,6 +1091,7 @@ async function loadPool(){
       </tr>`;
     }).join('');
   }catch(e){
+    _poolLastJson = '';
     $('poolBody').innerHTML = authOK === false
       ? '<tr><td colspan="10" class="empty">🔑 请先在右上角填入 API Key 并点「保存」</td></tr>'
       : `<tr><td colspan="10" class="empty">加载失败：${esc(e.message)}</td></tr>`;
@@ -1304,7 +1316,113 @@ async function delSelectedMedia(){
   }
 }
 
-async function loadMedia(){
+/* 媒体库分页渲染：每次只渲染 60 个，视频进入视口才加载 src（preload=none → metadata） */
+const MEDIA_PAGE = 60;
+let _mediaShown = 0;
+let _mediaSig = '';
+let _mediaLoading = null;          // 正在进行的 loadMedia Promise（防止重复请求）
+let _mediaReloadPending = false;   // 加载中又被调用 → 结束后再刷新一次
+const _mediaVideoObs = ('IntersectionObserver' in window) ? new IntersectionObserver(entries => {
+  entries.forEach(en => {
+    if (!en.isIntersecting) return;
+    const v = en.target;
+    _mediaVideoObs.unobserve(v);
+    if (v.dataset.src && !v.getAttribute('src')){ v.preload = 'metadata'; v.src = v.dataset.src; }
+  });
+}, {rootMargin: '200px'}) : null;
+const _mediaMoreObs = ('IntersectionObserver' in window) ? new IntersectionObserver(entries => {
+  if (entries.some(en => en.isIntersecting)) appendMediaPage();
+}, {rootMargin: '300px'}) : null;
+
+function mediaTileHtml(m){
+  const isSel = _selectedMedia.has(m.name);
+  return `
+      <div class="tile ${isSel ? 'selected' : ''}" data-name="${esc(m.name)}">
+        <label class="check-tag" title="勾选以批量操作" onclick="event.stopPropagation()">
+          <input type="checkbox" class="tile-check" ${isSel ? 'checked' : ''}>
+        </label>
+        <div class="thumb">${m.kind === 'video'
+          ? `<video data-src="${esc(m.url)}" muted playsinline preload="none"></video>`
+          : `<img src="${esc(m.url)}" loading="lazy" alt="">`}</div>
+        <div class="meta">
+          <div class="nm" title="${esc(m.name)}">${esc(m.name)}</div>
+          <div style="margin-top:3px">${fmtBytes(m.bytes)} · ${fmtTime(m.mtime)}</div>
+          <div class="ac">
+            <a class="badge info" href="${esc(m.url)}" target="_blank">打开</a>
+            <a class="badge mute" href="${esc(m.url)}" download>下载</a>
+            <a class="badge bad" href="javascript:void(0)" data-act="del">删除</a>
+          </div>
+        </div>
+      </div>`;
+}
+
+function observeMediaVideos(root){
+  root.querySelectorAll('video[data-src]:not([src])').forEach(v => {
+    if (_mediaVideoObs) _mediaVideoObs.observe(v);
+    else { v.preload = 'metadata'; v.src = v.dataset.src; }
+  });
+}
+
+function appendMediaPage(){
+  const grid = $('mediaGrid');
+  const oldMore = grid.querySelector('.media-more');
+  if (oldMore){ if (_mediaMoreObs) _mediaMoreObs.unobserve(oldMore); oldMore.remove(); }
+  const next = _allMedia.slice(_mediaShown, _mediaShown + MEDIA_PAGE);
+  if (!next.length) return;
+  const frag = document.createElement('div');
+  frag.innerHTML = next.map(mediaTileHtml).join('');
+  const nodes = Array.from(frag.children);
+  nodes.forEach(n => grid.appendChild(n));
+  nodes.forEach(n => observeMediaVideos(n));
+  _mediaShown += next.length;
+  renderMediaMore();
+}
+
+function renderMediaMore(){
+  const grid = $('mediaGrid');
+  const left = _allMedia.length - _mediaShown;
+  if (left <= 0) return;
+  const more = document.createElement('div');
+  more.className = 'media-more';
+  more.style.cssText = 'grid-column:1/-1;text-align:center;padding:10px';
+  more.innerHTML = `<button class="ghost" data-act="more">加载更多（剩余 ${left} 个）</button>`;
+  grid.appendChild(more);
+  if (_mediaMoreObs) _mediaMoreObs.observe(more);
+}
+
+/* 媒体网格事件委托：勾选 / 删除 / 加载更多（避免在 onclick 字符串里拼接文件名） */
+(function bindMediaGrid(){
+  const grid = $('mediaGrid');
+  if (!grid) return;
+  grid.addEventListener('change', e => {
+    const chk = e.target.closest && e.target.closest('.tile-check');
+    if (!chk) return;
+    const tile = chk.closest('.tile[data-name]');
+    if (tile) toggleMediaSelect(tile.dataset.name);
+  });
+  grid.addEventListener('click', e => {
+    const act = e.target.closest && e.target.closest('[data-act]');
+    if (!act) return;
+    if (act.dataset.act === 'more'){ e.preventDefault(); appendMediaPage(); return; }
+    if (act.dataset.act === 'del'){
+      e.preventDefault();
+      const tile = act.closest('.tile[data-name]');
+      if (tile) delSingleMedia(tile.dataset.name);
+    }
+  });
+})();
+
+function loadMedia(){
+  if (_mediaLoading){ _mediaReloadPending = true; return _mediaLoading; }
+  _mediaLoading = (async () => {
+    try { await loadMediaOnce(); }
+    finally { _mediaLoading = null; }
+    if (_mediaReloadPending){ _mediaReloadPending = false; await loadMedia(); }
+  })();
+  return _mediaLoading;
+}
+
+async function loadMediaOnce(){
   try{
     const d = await api('/admin/media');
     const ms = d.media || [];
@@ -1316,33 +1434,31 @@ async function loadMedia(){
     $('mediaCount').textContent = ms.length;
     $('sMedia').textContent = ms.length;
     if (!ms.length){
+      _mediaSig = ''; _mediaShown = 0;
       $('mediaGrid').innerHTML = '<div class="empty">还没有生成任何媒体文件</div>';
       updateMediaSelectionUI();
       return;
     }
-    $('mediaGrid').innerHTML = ms.map(m => {
-      const isSel = _selectedMedia.has(m.name);
-      return `
-      <div class="tile ${isSel ? 'selected' : ''}" data-name="${esc(m.name)}">
-        <label class="check-tag" title="勾选以批量操作" onclick="event.stopPropagation()">
-          <input type="checkbox" class="tile-check" ${isSel ? 'checked' : ''} onchange="toggleMediaSelect('${esc(m.name)}')">
-        </label>
-        <div class="thumb">${m.kind === 'video'
-          ? `<video src="${esc(m.url)}" muted playsinline preload="metadata"></video>`
-          : `<img src="${esc(m.url)}" loading="lazy" alt="">`}</div>
-        <div class="meta">
-          <div class="nm" title="${esc(m.name)}">${esc(m.name)}</div>
-          <div style="margin-top:3px">${fmtBytes(m.bytes)} · ${fmtTime(m.mtime)}</div>
-          <div class="ac">
-            <a class="badge info" href="${esc(m.url)}" target="_blank">打开</a>
-            <a class="badge mute" href="${esc(m.url)}" download>下载</a>
-            <a class="badge bad" href="javascript:void(0)" onclick="delSingleMedia('${esc(m.name)}')">删除</a>
-          </div>
-        </div>
-      </div>`;
-    }).join('');
+    // 列表没变化 → 不重建网格（避免切换页签时所有视频重新加载）
+    const sig = JSON.stringify(ms.map(m => [m.name, m.mtime, m.bytes, m.url]));
+    if (sig === _mediaSig && $('mediaGrid').querySelector('.tile[data-name]')){
+      updateMediaSelectionUI();
+      return;
+    }
+    _mediaSig = sig;
+    if (_mediaVideoObs) _mediaVideoObs.disconnect();
+    if (_mediaMoreObs) _mediaMoreObs.disconnect();
+    // 重新加载时保留用户已展开的数量（至少一页）
+    const count = Math.min(ms.length, Math.max(MEDIA_PAGE, _mediaShown));
+    $('mediaGrid').innerHTML = ms.slice(0, count).map(mediaTileHtml).join('');
+    _mediaShown = count;
+    observeMediaVideos($('mediaGrid'));
+    renderMediaMore();
     updateMediaSelectionUI();
-  }catch(e){ $('mediaGrid').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  }catch(e){
+    _mediaSig = '';
+    $('mediaGrid').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
 }
 
 /* ================= 在线测试 ================= */
@@ -1394,24 +1510,44 @@ async function runVideo(){
   try{
     const t = await api('/v1/videos', {method:'POST', body: JSON.stringify({
       prompt, duration: parseInt($('vidDur').value) || 5, size: $('vidSize').value})});
+    const deadline = Date.now() + 20 * 60 * 1000;
+    let failures = 0;
+    const resetBtn = () => { btn.disabled = false; btn.textContent = '开始生成视频'; };
     const tick = async () => {
-      const s = await api('/v1/videos/' + t.id);
-      const el = ((Date.now()-t0)/1000).toFixed(0);
-      if (s.status === 'succeeded' || s.status === 'completed'){
-        const vurl = (s.result && s.result.url) || s.url || '';
-        const vbytes = (s.result && s.result.bytes) || 0;
-        box.innerHTML = `<b style="color:var(--ok)">✓ 生成成功</b>
-          <span class="mono" style="color:var(--muted);margin-left:10px">${el}s · ${fmtBytes(vbytes)}</span>
-          <video src="${esc(vurl)}" controls playsinline></video>
-          <pre class="out">${esc(JSON.stringify(s, null, 2))}</pre>`;
-        btn.disabled = false; btn.textContent = '开始生成视频';
-        loadMedia(); loadTasks();
-      }else if (s.status === 'failed'){
-        box.innerHTML = `<b style="color:var(--bad)">✗ 生成失败</b><pre class="out">${esc(s.error||'')}</pre>`;
-        btn.disabled = false; btn.textContent = '开始生成视频';
-      }else{
-        box.innerHTML = `<span class="spin"></span>任务 ${esc(s.status)} · 已等待 ${el}s（视频通常 60–120 秒）…`;
-        setTimeout(tick, 4000);
+      try{
+        let s;
+        try{
+          s = await api('/v1/videos/' + encodeURIComponent(t.id));
+          failures = 0;
+        }catch(pe){
+          // 401 或连续多次查询失败 → 停止轮询；偶发网络错误则继续重试
+          if (authOK === false || ++failures >= 6) throw new Error('状态查询失败：' + pe.message + '（请在任务记录查看，勿重复提交）');
+          if (Date.now() >= deadline) throw new Error('等待超过 20 分钟，请在任务记录查看结果，勿重复提交');
+          setTimeout(tick, 4000);
+          return;
+        }
+        const el = ((Date.now()-t0)/1000).toFixed(0);
+        if (s.status === 'succeeded' || s.status === 'completed'){
+          const vurl = (s.result && s.result.url) || s.url || '';
+          const vbytes = (s.result && s.result.bytes) || 0;
+          box.innerHTML = `<b style="color:var(--ok)">✓ 生成成功</b>
+            <span class="mono" style="color:var(--muted);margin-left:10px">${el}s · ${fmtBytes(vbytes)}</span>
+            <video src="${esc(vurl)}" controls playsinline></video>
+            <pre class="out">${esc(JSON.stringify(s, null, 2))}</pre>`;
+          resetBtn();
+          loadMedia(); loadTasks();
+        }else if (s.status === 'failed'){
+          box.innerHTML = `<b style="color:var(--bad)">✗ 生成失败</b><pre class="out">${esc(s.error||'')}</pre>`;
+          resetBtn();
+        }else if (Date.now() >= deadline){
+          throw new Error('等待超过 20 分钟，请在任务记录查看结果，勿重复提交');
+        }else{
+          box.innerHTML = `<span class="spin"></span>任务 ${esc(s.status)} · 已等待 ${el}s（视频通常 60–120 秒）…`;
+          setTimeout(tick, 4000);
+        }
+      }catch(e){
+        box.innerHTML = `<b style="color:var(--bad)">✗ 生成失败</b><pre class="out">${esc(e.message)}</pre>`;
+        resetBtn();
       }
     };
     tick();
@@ -1425,6 +1561,9 @@ async function runVideo(){
 let _notifiedSha = localStorage.getItem('muse2api_notified_sha') || '';
 let _dismissedSha = localStorage.getItem('muse2api_dismissed_sha') || '';
 let _lastRepoStatus = null;
+const REPO_POLL_MS = 30 * 60 * 1000;   // 仓库更新检测间隔：30 分钟
+let _lastRepoCheckAt = 0;
+let _ghDirectCache = null;              // {at, commits}：浏览器直连 GitHub 的结果缓存 30 分钟
 
 function toggleRepoPanel(){
   const el = $('repoPanel');
@@ -1443,14 +1582,23 @@ function dismissUpdateBanner(){
 }
 
 async function loadRepoStatus(force){
+  _lastRepoCheckAt = Date.now();
   try{
     let s = await api('/admin/update/check' + (force ? '?force=true' : ''));
     // 若服务端网络无法直连 GitHub API，则由用户浏览器端直接请求 GitHub API 兜底检测
     if (!s.remote_sha){
       try{
-        const gr = await fetch('https://api.github.com/repos/czg86389-hub/muse2api/commits?sha=main&per_page=5');
-        if (gr.ok){
-          const commits = await gr.json();
+        let commits = null;
+        if (!force && _ghDirectCache && Date.now() - _ghDirectCache.at < REPO_POLL_MS){
+          commits = _ghDirectCache.commits;
+        } else {
+          const gr = await fetch('https://api.github.com/repos/czg86389-hub/muse2api/commits?sha=main&per_page=5');
+          if (gr.ok){
+            commits = await gr.json();
+            _ghDirectCache = {at: Date.now(), commits};
+          }
+        }
+        if (commits){
           if (Array.isArray(commits) && commits.length){
             s.remote_sha = (commits[0].sha || '').slice(0, 7);
             s.remote_msg = ((commits[0].commit || {}).message || '').split('\n')[0];
@@ -1573,13 +1721,33 @@ async function loadStatus(){
 function refreshAll(){ loadStatus(); loadPool(); loadApikey(); loadRepoStatus(false); }
 
 refreshAll();
-setInterval(() => {
+
+/* 轮询：页面隐藏时暂停；401（未登录 / Key 错误）时退避到 60s 一次；切回页面立即刷新 */
+const POLL_MS = 8000;
+const POLL_UNAUTH_BACKOFF_MS = 60000;
+let _lastPollAt = Date.now();
+function pollTick(force){
+  if (document.hidden) return;
+  if (!force && authOK === false && Date.now() - _lastPollAt < POLL_UNAUTH_BACKOFF_MS) return;
+  _lastPollAt = Date.now();
   loadStatus(); loadPool();
   if ($('tab-tasks').classList.contains('active')) loadTasks();
-}, 8000);
-setInterval(() => {
+}
+setInterval(() => pollTick(false), POLL_MS);
+
+/* 仓库更新检测：每 30 分钟一次，页面隐藏 / 未登录时跳过（每分钟检查一次是否到期） */
+function repoTick(){
+  if (document.hidden || authOK === false) return;
+  if (Date.now() - _lastRepoCheckAt < REPO_POLL_MS) return;
   loadRepoStatus(false);
-}, 60000);
+}
+setInterval(repoTick, 60000);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  pollTick(authOK !== false);
+  repoTick();
+});
 </script>
 </body>
 </html>

@@ -9,7 +9,11 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import mimetypes
+import socket
+import urllib.error
+import urllib.parse
 import urllib.request
 import json
 import logging
@@ -29,6 +33,241 @@ ATT_SEL = '[data-testid^="hatch-chat-attachment-presentation-"]'
 
 # 远程参考图大小上限
 MAX_REFERENCE_IMAGE_BYTES = 20 << 20
+
+# Python 直连下载生成结果的大小上限（防止异常响应把内存吃满）
+MAX_DIRECT_DOWNLOAD_BYTES = 1 << 30
+# 经 CDP 分块取回 blob 时每次 Runtime.evaluate 读取的最大字节数
+CDP_EXTRACT_CHUNK_BYTES = 8 << 20
+
+
+# ---------------- SSRF 防护（远程参考图） ----------------
+def _check_public_http_url(url: str) -> str | None:
+    """校验 URL 只指向公网地址。合法返回 None，否则返回拒绝原因。
+
+    解析主机名的全部地址，任一地址落在回环/私网/链路本地/保留/组播/非全局段即拒绝，
+    防止调用方借参考图下载探测或访问服务器内网（SSRF）。
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "URL 无法解析"
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return "仅允许 http(s) URL"
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return "端口非法"
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OSError) as exc:
+        return f"域名解析失败 ({type(exc).__name__})"
+    if not infos:
+        return "域名解析失败"
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except ValueError:
+            return "解析到非法地址"
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if (ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified or not ip.is_global):
+            return f"目标地址 {ip} 不是公网地址"
+    return None
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """每一跳重定向都重新做公网地址校验，避免 302 跳到内网绕过检查。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        why = _check_public_http_url(newurl)
+        if why:
+            raise urllib.error.URLError(f"重定向目标被拒绝: {why}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# ---------------- 聊天滚动容器查找（带缓存） ----------------
+# 原实现每次都 querySelectorAll('*') + getComputedStyle 全量扫描，chat_stream 高频轮询时开销很大。
+# 现在把找到的容器缓存在 window.__m2aScroller（不可枚举属性，{el, ts}），
+# 只有缓存失效（节点已脱离 DOM / 不再可滚动 / 超过有效期）时才全量重扫；
+# 有效期保证页面中途出现更大的滚动容器时最多 1.5s 后仍会切换过去，选取语义与原来一致
+# （overflowY 为 auto/scroll 且 scrollHeight > clientHeight+100 中 scrollHeight 最大者）。
+# 执行后局部变量 __sc 为滚动容器（可能为 null），并已滚到底部。
+_SCROLLER_JS = (
+    "var __sc=(function(){"
+    "var now=Date.now();var c=window.__m2aScroller;"
+    "function ok(e){if(!e||!e.isConnected)return false;var s=getComputedStyle(e);"
+    "return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;}"
+    "if(c&&c.el&&(now-c.ts)<1500&&ok(c.el))return c.el;"
+    "if(c&&!c.el&&(now-c.ts)<500)return null;"
+    "var els=[...document.querySelectorAll('*')].filter(function(e){"
+    "var s=getComputedStyle(e);"
+    "return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});"
+    "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
+    "var v={el:els[0]||null,ts:now};"
+    "try{Object.defineProperty(window,'__m2aScroller',{value:v,writable:true,configurable:true,enumerable:false});}"
+    "catch(e){window.__m2aScroller=v;}"
+    "return v.el;})();"
+    "if(__sc)__sc.scrollTop=__sc.scrollHeight;"
+)
+
+_SCROLL_BOTTOM_JS = (
+    "(function(){"
+    + _SCROLLER_JS +
+    "var s=document.scrollingElement||document.body;"
+    "s.scrollTop=s.scrollHeight;"
+    "var el=document.querySelector('textarea');"
+    "if(el)el.scrollIntoView({block:'end'});return 1;})()"
+)
+
+
+# ---------------- 生成结果取字节（分块 CDP / Python 直连） ----------------
+# 第 1 步：页面内 fetch 成 Blob，挂到 window 上一个唯一的不可枚举 key，只返回大小与 mime
+_EXTRACT_PREP_JS = r"""
+(async function(src, key){
+  try{
+    if(!src) return JSON.stringify({ok:false,err:'no-media-src'});
+    var r = await fetch(src);
+    if(!r.ok) return JSON.stringify({ok:false,err:'media-http-'+r.status});
+    var b = await r.blob();
+    Object.defineProperty(window, key, {value:b, writable:true, configurable:true, enumerable:false});
+    return JSON.stringify({ok:true, mime:b.type||'', size:b.size, url:src});
+  }catch(e){
+    return JSON.stringify({ok:false, err:String(e)});
+  }
+})(%s, %s)
+"""
+
+# 第 2 步：按 [start, end) 读取一个切片的 base64（每次 <= CDP_EXTRACT_CHUNK_BYTES）
+_EXTRACT_SLICE_JS = r"""
+(async function(key, start, end){
+  try{
+    var b = window[key];
+    if(!b) return JSON.stringify({ok:false, err:'blob-missing'});
+    var part = b.slice(start, end);
+    var b64 = await new Promise(function(resolve, reject){
+      var reader = new FileReader();
+      reader.onloadend = function(){
+        var res = reader.result || '';
+        var comma = res.indexOf(',');
+        resolve(comma >= 0 ? res.slice(comma + 1) : res);
+      };
+      reader.onerror = function(e){ reject(e); };
+      reader.readAsDataURL(part);
+    });
+    return JSON.stringify({ok:true, b64:b64});
+  }catch(e){
+    return JSON.stringify({ok:false, err:String(e)});
+  }
+})(%s, %d, %d)
+"""
+
+# 第 3 步：释放 window 上的 Blob 引用
+_EXTRACT_FREE_JS = "(function(k){try{delete window[k];}catch(e){}return 1;})(%s)"
+
+
+def _parse_js_json(raw) -> dict:
+    try:
+        info = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "err": f"解析失败 {str(raw)[:150]}"}
+    if not isinstance(info, dict):
+        return {"ok": False, "err": f"解析失败 {str(raw)[:150]}"}
+    return info
+
+
+def _cdp_extract_media(page: CDP, src: str) -> dict:
+    """经 CDP 分块取回页面内媒体字节。
+
+    返回 {"ok": True, "data": bytes, "mime": str, "url": str} 或 {"ok": False, "err": str}。
+    大文件不再一次性 base64 塞进单条 CDP 消息，而是每次最多读取 CDP_EXTRACT_CHUNK_BYTES。
+    """
+    key = "__m2aBlob_" + uuid.uuid4().hex
+    try:
+        info = _parse_js_json(page.js(_EXTRACT_PREP_JS % (json.dumps(src), json.dumps(key)),
+                                      await_promise=True, timeout=600))
+        if not info.get("ok"):
+            return {"ok": False, "err": info.get("err", "未知")}
+        try:
+            size = int(info.get("size") or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "err": "blob-size-invalid"}
+        if size > MAX_DIRECT_DOWNLOAD_BYTES:
+            return {"ok": False, "err": f"blob-too-large ({size} bytes)"}
+        buf = bytearray()
+        off = 0
+        while off < size:
+            end = min(off + CDP_EXTRACT_CHUNK_BYTES, size)
+            part = _parse_js_json(page.js(_EXTRACT_SLICE_JS % (json.dumps(key), off, end),
+                                          await_promise=True, timeout=300))
+            if not part.get("ok"):
+                return {"ok": False, "err": part.get("err", "slice-failed")}
+            chunk = base64.b64decode(part.get("b64") or "")
+            if len(chunk) != end - off:
+                return {"ok": False, "err": f"slice-size-mismatch {len(chunk)}/{end - off}"}
+            buf += chunk
+            off = end
+        return {"ok": True, "data": bytes(buf), "mime": info.get("mime", "") or "",
+                "url": info.get("url", "") or ""}
+    finally:
+        try:
+            page.js(_EXTRACT_FREE_JS % json.dumps(key), timeout=20)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _page_cookie_header(page: CDP | None, url: str) -> str:
+    """从浏览器读取该 URL 适用的 cookie（与浏览器自己请求时发送的一致）。"""
+    if page is None:
+        return ""
+    try:
+        msg = page.send("Network.getCookies", {"urls": [url]}, timeout=10)
+    except Exception:  # noqa: BLE001
+        return ""
+    pairs = []
+    for c in (msg.get("result", {}).get("cookies") or []):
+        name = c.get("name")
+        if name:
+            pairs.append(f"{name}={c.get('value', '')}")
+    return "; ".join(pairs)
+
+
+def _http_download_media(url: str, proxies: dict | None, cookie_header: str = "",
+                         timeout: int = 60) -> tuple[bytes | None, str]:
+    """流式下载媒体，带大小上限与状态/类型校验。失败返回 (None, 原因)。"""
+    import requests
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://muse.ai/",
+        "Accept": "*/*",
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    with requests.get(url, headers=headers, proxies=proxies, timeout=timeout, stream=True) as resp:
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        mime = resp.headers.get("content-type") or ""
+        base_mime = mime.split(";", 1)[0].strip().lower()
+        # 登录页/错误页不是媒体：交给 CDP 兜底，避免把 HTML 当成品保存
+        if base_mime.startswith("text/") or base_mime in (
+                "application/json", "application/xml", "application/xhtml+xml"):
+            return None, f"非媒体响应 ({base_mime})"
+        try:
+            clen = int(resp.headers.get("content-length") or 0)
+        except ValueError:
+            clen = 0
+        if clen > MAX_DIRECT_DOWNLOAD_BYTES:
+            return None, f"超过大小上限 ({clen} bytes)"
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=1 << 20):
+            if not chunk:
+                continue
+            buf += chunk
+            if len(buf) > MAX_DIRECT_DOWNLOAD_BYTES:
+                return None, "超过大小上限"
+        if len(buf) <= 1024:
+            return None, f"内容过小 ({len(buf)} bytes)"
+        return bytes(buf), mime
 
 # 决定账号生死的核心 cookie（缺失或过期 = 会话失效）
 ESSENTIAL_COOKIES = ("hatch_sess", "hatch_gw", "hatch_vml",
@@ -156,7 +395,10 @@ class MuseEngine:
             "--autoplay-policy=no-user-gesture-required",
             "--window-size=1440,2400",
             f"--remote-debugging-port={self.cfg.cdp_port}",
-            "--remote-allow-origins=*",
+            # 仅允许本机 DevTools 客户端（cdp.py 会显式发送匹配的 Origin），
+            # 不再用 "*"：否则任意网页都可借浏览器连上 CDP。
+            f"--remote-allow-origins=http://127.0.0.1:{self.cfg.cdp_port},"
+            f"http://localhost:{self.cfg.cdp_port}",
             f"--user-data-dir={self.cfg.profile_dir}",
             "--disable-blink-features=AutomationControlled",
             "--webrtc-ip-handling-policy=disable_non_proxied_udp",
@@ -786,18 +1028,8 @@ class MuseEngine:
         """滚到聊天底部。muse.ai 的聊天滚动容器是内层 div（不是 document），
         虚拟列表按滚动位置渲染节点 —— 不滚到底，新消息根本不在 DOM 里。"""
         try:
-            self.page.js(
-                "(function(){"
-                "var els=[...document.querySelectorAll('*')].filter(function(e){"
-                "var s=getComputedStyle(e);"
-                "return (s.overflowY==='auto'||s.overflowY==='scroll')"
-                "&&e.scrollHeight>e.clientHeight+100;});"
-                "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
-                "if(els[0])els[0].scrollTop=els[0].scrollHeight;"
-                "var s=document.scrollingElement||document.body;"
-                "s.scrollTop=s.scrollHeight;"
-                "var el=document.querySelector('textarea');"
-                "if(el)el.scrollIntoView({block:'end'});return 1;})()")
+            # 滚动容器查找带缓存（见模块级 _SCROLLER_JS），避免每次全量扫描 DOM
+            self.page.js(_SCROLL_BOTTOM_JS)
         except Exception:  # noqa: BLE001
             pass
 
@@ -912,6 +1144,8 @@ class MuseEngine:
         return None
 
     # ---------------- 取字节 ----------------
+    # 单次整块 base64 版本：保留供测试/外部工具兼容使用。
+    # 生产路径（extract_bytes）已改为 http(s) 先走 Python 直连、再走 _cdp_extract_media 分块读取。
     _EXTRACT_JS = r"""
     (async function(src, expect){
       try{
@@ -963,13 +1197,12 @@ class MuseEngine:
         "if(/hatch-agent-bubble-bg/.test(bs[i].className||''))n++;}"
         "return String(n);})()"
     )
+    # chat_stream 轮询间隔：原 0.06s 每次都要跑一遍 DOM 查询，CPU 占用高；0.15s 仍足够流畅
+    _CHAT_POLL_INTERVAL = 0.15
     _POLL_CHAT_JS = (
         "(function(){"
-        "var els=[...document.querySelectorAll('*')].filter(function(e){"
-        "var s=getComputedStyle(e);"
-        "return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});"
-        "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
-        "if(els[0])els[0].scrollTop=els[0].scrollHeight;"
+        # 滚到底：滚动容器带缓存，只在缓存失效时才全量扫描（见模块级 _SCROLLER_JS）
+        + _SCROLLER_JS +
         "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
         "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
         ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
@@ -1026,11 +1259,11 @@ class MuseEngine:
         sent, last, stable = "", None, 0
         got_first = False
 
-        # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
+        # 1. 等待助手生成并开始吐字（每 _CHAT_POLL_INTERVAL 采样一次，捕获到首批增量文字瞬间 yield 出去）
         while time.time() < first_token_deadline:
             if stop_event is not None and stop_event.is_set():
                 return
-            time.sleep(0.06)
+            time.sleep(self._CHAT_POLL_INTERVAL)
             cnt, cur, has_stop = self._poll_chat()
             if not cur or (cnt <= base_agent and cur == base_text):
                 if time.time() - t_sent > 14.0:
@@ -1057,7 +1290,7 @@ class MuseEngine:
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return
-            time.sleep(0.06)
+            time.sleep(self._CHAT_POLL_INTERVAL)
             cnt, cur, has_stop = self._poll_chat()
             if not cur:
                 continue
@@ -1070,11 +1303,11 @@ class MuseEngine:
                 last, stable = cur, 0
             else:
                 stable += 1
-                # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
+                # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.45s）无新文本即正常退出
                 if not has_stop and stable >= 3:
                     return
-                # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
-                if has_stop and stable >= 80:
+                # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 32（约 5s）防卡死
+                if has_stop and stable >= 32:
                     return
 
         raise MuseGenerationError("等待助手回复超时")
@@ -1088,16 +1321,20 @@ class MuseEngine:
         return out
 
     def extract_bytes(self, src: str, expect: str = "image", retries: int = 4):
+        # http(s)：先用 Python 直连（带浏览器里该 URL 的 cookie），避免大文件整块 base64 走 CDP
+        if src and src.startswith(("http://", "https://")):
+            data, mime, url = self._direct_python_download(src)
+            if data:
+                return data, mime, url
+        # blob:/data: 或直连失败：经 CDP 分块读取
         last = "未知"
         for _ in range(retries):
-            raw = self.page.js(self._EXTRACT_JS % (json.dumps(src), json.dumps(expect)),
-                               await_promise=True, timeout=600)
             try:
-                info = json.loads(raw) if isinstance(raw, str) else raw
-            except Exception:  # noqa: BLE001
-                info = {"ok": False, "err": f"解析失败 {str(raw)[:150]}"}
+                info = _cdp_extract_media(self.page, src)
+            except Exception as exc:  # noqa: BLE001
+                info = {"ok": False, "err": f"{type(exc).__name__}: {str(exc)[:150]}"}
             if info.get("ok"):
-                return base64.b64decode(info["b64"]), info.get("mime", ""), info.get("url", "")
+                return info["data"], info.get("mime", ""), info.get("url", "")
             last = info.get("err", "未知")
             time.sleep(2)
         raise MuseGenerationError(f"未能取回生成结果: {last}")
@@ -1106,7 +1343,6 @@ class MuseEngine:
         """Tải trực tiếp byte media từ URL qua Python requests (bỏ qua CORS trình duyệt)."""
         if not url or not url.startswith(("http://", "https://")):
             return None, "", ""
-        import requests
         proxies = None
         forwarder_port = getattr(self, "forwarder_port", None)
         if forwarder_port:
@@ -1114,19 +1350,13 @@ class MuseEngine:
                 "http": f"http://127.0.0.1:{forwarder_port}",
                 "https": f"http://127.0.0.1:{forwarder_port}",
             }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Referer": "https://muse.ai/",
-            "Accept": "*/*",
-        }
         try:
-            resp = requests.get(url, headers=headers, proxies=proxies, timeout=60, stream=True)
-            if resp.status_code == 200:
-                content = resp.content
-                if len(content) > 1024:
-                    mime = resp.headers.get("content-type") or ""
-                    log.info("📥 [Direct Python Download] Đã tải %d bytes thành công từ %s", len(content), url[:80])
-                    return content, mime, url
+            cookie_header = _page_cookie_header(getattr(self, "page", None), url)
+            content, info = _http_download_media(url, proxies, cookie_header, timeout=60)
+            if content:
+                log.info("📥 [Direct Python Download] Đã tải %d bytes thành công từ %s", len(content), url[:80])
+                return content, info, url
+            log.info("Direct python download bỏ qua %s: %s", url[:80], info)
         except Exception as e:
             log.warning("Direct python download error for %s: %s", url[:80], e)
         return None, "", ""
@@ -1192,9 +1422,15 @@ class MuseEngine:
                 mime = parts[0].split(";")[0].replace("data:", "").strip()
             return (parts[1].strip() if len(parts) > 1 else ""), mime
         if img.startswith("http://") or img.startswith("https://"):
+            # SSRF 防护：只允许解析到公网地址的 URL（重定向的每一跳也会校验）
+            why = _check_public_http_url(img)
+            if why:
+                log.warning("拒绝下载远程参考图（%s）", why)
+                return "", "image/png"
             try:
                 req = urllib.request.Request(img, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=20) as resp:
+                opener = urllib.request.build_opener(_SafeRedirectHandler)
+                with opener.open(req, timeout=20) as resp:
                     mime = resp.headers.get_content_type() or "image/png"
                     if not mime.startswith("image/"):
                         log.warning("参考图 URL 返回的不是图片 (%s)，已忽略", mime)
@@ -1511,11 +1747,50 @@ class MuseEngine:
                                  proxy_str=proxy_str, forwarder_port=forwarder_port,
                                  ttl_seconds=ttl_seconds, max_tasks=max_tasks)
 
+    def _pool_condition(self) -> threading.Condition:
+        """与 _pool_lock 绑定的 Condition（懒创建，兼容未走 __init__ 的测试替身）。"""
+        cond = getattr(self, "_pool_cond", None)
+        if cond is None:
+            cond = threading.Condition(self._pool_lock)
+            self._pool_cond = cond
+        if getattr(self, "_creating", None) is None:
+            self._creating = set()
+        return cond
+
     def acquire_session(self, account_id: str, cookies: dict, expires: dict | None = None, timeout: int = 40) -> "MuseWorkerSession":
-        """Lấy Browser Session còn hạn TTL từ pool hoặc tạo phiên mới toanh qua HomeProxy."""
-        with self._pool_lock:
+        """Lấy Browser Session còn hạn TTL từ pool hoặc tạo phiên mới toanh qua HomeProxy.
+
+        并发约定：
+          * _pool_lock 内只做字典快照/标记，任何 CDP / 代理探测等慢 I/O 都在锁外执行；
+          * 被取出的 session 标记 in_use=True，release 时清除 —— 同一页面绝不会被两个请求同时驱动；
+          * 同一账号同一时刻只允许一个线程创建 session（_creating），其它线程等待其完成/释放；
+          * 等待超过 timeout 仍被占用时，创建一个不入池的临时 session（release 时直接关闭）。
+        """
+        cond = self._pool_condition()
+        wait_deadline = time.time() + max(5, int(timeout or 0))
+        with cond:
+            while True:
+                existing = self._session_pool.get(account_id)
+                busy = account_id in self._creating or (existing is not None and existing.in_use)
+                if not busy:
+                    break
+                remaining = wait_deadline - time.time()
+                if remaining <= 0:
+                    break
+                cond.wait(min(remaining, 1.0))
             existing = self._session_pool.get(account_id)
-            if existing:
+            if account_id in self._creating or (existing is not None and existing.in_use):
+                mode = "ephemeral"
+            elif existing is not None:
+                existing.in_use = True
+                mode = "reuse"
+            else:
+                self._creating.add(account_id)
+                mode = "create"
+
+        if mode == "reuse":
+            reused = False
+            try:
                 if not existing.is_expired() and existing.is_alive():
                     age = int(time.time() - existing.created_at)
                     log.info("⚡ [Session Pool] Tái sử dụng session còn hạn TTL cho TK %s (Tuổi: %ds/%ds, Task: %d/%d)",
@@ -1523,25 +1798,75 @@ class MuseEngine:
                     existing.reset_thread(for_chat=False)
                     existing.last_used_at = time.time()
                     existing.task_count += 1
+                    reused = True
                     return existing
-                else:
-                    age = int(time.time() - existing.created_at)
-                    log.info("♻️ [TTL Expiry] Session của TK %s đã hết hạn TTL (Tuổi: %ds/%ds, Tasks: %d/%d) -> Tự động hủy và tạo phiên sạch mới qua HomeProxy để tránh bị phát hiện!",
-                             account_id, age, existing.ttl_seconds, existing.task_count, existing.max_tasks)
-                    existing.close()
-                    self._session_pool.pop(account_id, None)
+                age = int(time.time() - existing.created_at)
+                log.info("♻️ [TTL Expiry] Session của TK %s đã hết hạn TTL (Tuổi: %ds/%ds, Tasks: %d/%d) -> Tự động hủy và tạo phiên sạch mới qua HomeProxy để tránh bị phát hiện!",
+                         account_id, age, existing.ttl_seconds, existing.task_count, existing.max_tasks)
+            finally:
+                if not reused:
+                    # 过期/失活：移出池并直接转入「创建中」，避免别的线程在间隙里抢到旧 session
+                    with cond:
+                        existing.in_use = False
+                        if self._session_pool.get(account_id) is existing:
+                            self._session_pool.pop(account_id, None)
+                        self._creating.add(account_id)
+                        cond.notify_all()
+            try:
+                existing.close()
+            except Exception:  # noqa: BLE001
+                pass
+            mode = "create"
 
-        session = self.create_worker_session(
-            cookies=cookies,
-            expires=expires,
-            account_id=account_id,
-            timeout=timeout,
-            ttl_seconds=self.browser_ttl_seconds,
-            max_tasks=self.browser_max_tasks
-        )
+        if mode == "ephemeral":
+            log.warning("⏳ [Session Pool] Session của TK %s đang bận quá %ds -> tạo phiên tạm thời (không đưa vào pool)",
+                        account_id, max(5, int(timeout or 0)))
+            session = self.create_worker_session(
+                cookies=cookies,
+                expires=expires,
+                account_id=account_id,
+                timeout=timeout,
+                ttl_seconds=self.browser_ttl_seconds,
+                max_tasks=self.browser_max_tasks
+            )
+            session.task_count += 1
+            session.in_use = True
+            session.pooled = False
+            return session
+
+        # mode == "create"：本线程持有该账号的创建权
+        try:
+            session = self.create_worker_session(
+                cookies=cookies,
+                expires=expires,
+                account_id=account_id,
+                timeout=timeout,
+                ttl_seconds=self.browser_ttl_seconds,
+                max_tasks=self.browser_max_tasks
+            )
+        except BaseException:
+            with cond:
+                self._creating.discard(account_id)
+                cond.notify_all()
+            raise
         session.task_count += 1
-        with self._pool_lock:
+        session.in_use = True
+        stale = None
+        with cond:
+            self._creating.discard(account_id)
+            old = self._session_pool.get(account_id)
+            if old is not None and old is not session:
+                if old.in_use:
+                    old.close_requested = True
+                else:
+                    stale = old
             self._session_pool[account_id] = session
+            cond.notify_all()
+        if stale is not None:
+            try:
+                stale.close()
+            except Exception:  # noqa: BLE001
+                pass
         return session
 
     def release_session(self, session: "MuseWorkerSession", error: bool = False):
@@ -1550,51 +1875,92 @@ class MuseEngine:
             if session:
                 session.close()
             return
-        with self._pool_lock:
-            if error or session.is_expired() or not session.is_alive():
-                log.info("♻️ [TTL/Release] Giải phóng phiên của TK %s (Lỗi: %s, Hết hạn: %s, Tasks: %d)",
-                         session.account_id, error, session.is_expired(), session.task_count)
-                session.close()
-                self._session_pool.pop(session.account_id, None)
+        cond = self._pool_condition()
+        # 慢 I/O（代理探测 / CDP 存活检查）放在锁外
+        expired = False
+        alive = True
+        close_requested = getattr(session, "close_requested", False)
+        pooled = getattr(session, "pooled", True)
+        if not error and not close_requested and pooled:
+            expired = session.is_expired()
+            alive = (not expired) and session.is_alive()
+        close_it = error or close_requested or not pooled or expired or not alive
+        with cond:
+            session.in_use = False
+            cur = self._session_pool.get(session.account_id)
+            if not close_it and getattr(session, "close_requested", False):
+                close_it = True  # 检查期间被要求关闭
+            if not close_it and cur is not None and cur is not session:
+                close_it = True  # 槽位已被新 session 占用，旧的直接关闭
+            if close_it:
+                if cur is session:
+                    self._session_pool.pop(session.account_id, None)
             else:
                 self._session_pool[session.account_id] = session
+            cond.notify_all()
+        if close_it:
+            log.info("♻️ [TTL/Release] Giải phóng phiên của TK %s (Lỗi: %s, Hết hạn: %s, Tasks: %d)",
+                     session.account_id, error, expired, session.task_count)
+            session.close()
 
     def close_session_for_account(self, account_id: str):
-        """Hủy phiên trình duyệt đang chạy của tài khoản (dùng khi xoay proxy hoặc đổi cookie)."""
-        with self._pool_lock:
+        """Hủy phiên trình duyệt đang chạy của tài khoản (dùng khi xoay proxy hoặc đổi cookie).
+
+        正在被使用的 session 不会被强行关闭：标记 close_requested，在 release 时关闭。"""
+        cond = self._pool_condition()
+        with cond:
             s = self._session_pool.pop(account_id, None)
-            if s:
-                s.close()
+            if s is not None and s.in_use:
+                s.close_requested = True
+                s = None
+            cond.notify_all()
+        if s:
+            s.close()
 
     def close_all_sessions(self):
-        """Hủy tất cả các phiên trình duyệt đang chạy trong pool."""
-        with self._pool_lock:
+        """Hủy tất cả các phiên trình duyệt đang chạy trong pool.
+
+        空闲 session 立即关闭；使用中的标记 close_requested，在 release 时关闭。"""
+        cond = self._pool_condition()
+        with cond:
+            idle = []
             for s in list(self._session_pool.values()):
-                try:
-                    s.close()
-                except Exception:
-                    pass
+                if s.in_use:
+                    s.close_requested = True
+                else:
+                    idle.append(s)
             self._session_pool.clear()
+            cond.notify_all()
+        for s in idle:
+            try:
+                s.close()
+            except Exception:
+                pass
 
     def get_pool_status(self) -> list[dict]:
         """Trả về thông tin chi tiết các session và thời gian TTL còn lại."""
         now = time.time()
         out = []
+        # 锁内只做快照，is_expired（代理探测）/ is_alive（CDP）放到锁外
         with self._pool_lock:
-            for aid, s in self._session_pool.items():
-                age = int(now - s.created_at)
-                ttl_left = max(0, s.ttl_seconds - age)
-                out.append({
-                    "account_id": aid,
-                    "age_seconds": age,
-                    "ttl_seconds": s.ttl_seconds,
-                    "ttl_remaining_seconds": ttl_left,
-                    "tasks_completed": s.task_count,
-                    "max_tasks": s.max_tasks,
-                    "proxy": s.proxy_str,
-                    "is_expired": s.is_expired(),
-                    "is_alive": s.is_alive()
-                })
+            snapshot = list(self._session_pool.items())
+        for aid, s in snapshot:
+            age = int(now - s.created_at)
+            ttl_left = max(0, s.ttl_seconds - age)
+            in_use = bool(getattr(s, "in_use", False))
+            out.append({
+                "account_id": aid,
+                "age_seconds": age,
+                "ttl_seconds": s.ttl_seconds,
+                "ttl_remaining_seconds": ttl_left,
+                "tasks_completed": s.task_count,
+                "max_tasks": s.max_tasks,
+                "proxy": s.proxy_str,
+                "is_expired": s.is_expired(),
+                # 使用中的页面不去打 CDP（会与正在执行的任务抢同一连接），按未关闭视为存活
+                "is_alive": (not s.is_closed) if in_use else s.is_alive(),
+                "in_use": in_use,
+            })
         return out
 
 
@@ -1618,6 +1984,9 @@ class MuseWorkerSession:
         self.ttl_seconds = ttl_seconds
         self.max_tasks = max_tasks
         self.is_closed = False
+        self.in_use = False
+        self.pooled = True
+        self.close_requested = False
 
     def is_expired(self) -> bool:
         """Kiểm tra session đã quá hạn TTL (thời gian sống) hoặc vượt quá số task cho phép chưa."""

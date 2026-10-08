@@ -966,6 +966,10 @@
       z-index: 1000;
     }
 
+    .modal-overlay.active {
+      display: flex !important;
+    }
+
     .modal-content {
       background: var(--bg-card);
       border: 1px solid var(--border);
@@ -1429,56 +1433,61 @@
       <!-- ==================== TAB SHOPEE DATABASE & BATCH ==================== -->
       <section id="tab-shopee" class="tab-content">
         <!-- Card 0: Bảo vệ Trình Duyệt & Anti-Detect (HomeProxy & TTL Lifecycle) -->
-        <div class="shopee-card" style="border: 1px solid rgba(59, 130, 246, 0.35); background: linear-gradient(180deg, rgba(30, 41, 59, 0.65) 0%, rgba(15, 23, 42, 0.85) 100%); margin-bottom:12px;">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-            <div class="shopee-card-title" style="margin-bottom:0; color:#60a5fa; font-size:13px; font-weight:700;">
+        <div class="shopee-card" id="cardBrowserProtection" style="border: 1px solid rgba(59, 130, 246, 0.35); background: linear-gradient(180deg, rgba(30, 41, 59, 0.65) 0%, rgba(15, 23, 42, 0.85) 100%); margin-bottom:12px; transition: all 0.2s ease;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="shopee-card-title" onclick="toggleBrowserProtectionCard()" style="margin-bottom:0; color:#60a5fa; font-size:13px; font-weight:700; cursor:pointer; user-select:none; display:flex; align-items:center; gap:6px;" title="Bấm để thu nhỏ hoặc mở rộng phần này">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-right:4px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-              🛡️ BẢO VỆ TRÌNH DUYỆT & CHỐNG PHÁT HIỆN BOT (HOMEPROXY + TTL LIFECYCLE)
+              <span>🛡️ BẢO VỆ TRÌNH DUYỆT &amp; CHỐNG PHÁT HIỆN BOT (HOMEPROXY + TTL LIFECYCLE)</span>
             </div>
-            <div style="display:flex; gap:8px;">
-              <button type="button" class="shopee-btn" onclick="syncThinAptmProxy()" style="background:#2563eb; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;">
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button type="button" class="shopee-btn" onclick="event.stopPropagation(); syncThinAptmProxy();" style="background:#2563eb; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;">
                 🌐 Nạp Proxy ThinAptm
               </button>
-              <button type="button" class="shopee-btn" onclick="recycleBrowserSessions()" style="background:#475569; color:#f8fafc; font-size:11px; padding:4px 10px; font-weight:600;" title="Giải phóng RAM và tái sinh phiên trình duyệt sạch">
+              <button type="button" class="shopee-btn" onclick="event.stopPropagation(); recycleBrowserSessions();" style="background:#475569; color:#f8fafc; font-size:11px; padding:4px 10px; font-weight:600;" title="Giải phóng RAM và tái sinh phiên trình duyệt sạch">
                 ♻️ Làm Mới / Dọn RAM Trình Duyệt
+              </button>
+              <button type="button" class="shopee-btn" id="btnToggleBrowserProtection" onclick="event.stopPropagation(); toggleBrowserProtectionCard();" style="background:#1e293b; color:#93c5fd; border:1px solid #3b82f6; font-size:11px; padding:4px 10px; font-weight:700;" title="Thu nhỏ / Mở rộng phần này">
+                <span id="iconToggleBrowserProtection">▲ Thu nhỏ</span>
               </button>
             </div>
           </div>
 
-          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-bottom:10px;">
-            <div style="background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.06);">
-              <div style="font-size:11px; color:var(--text-dim); margin-bottom:2px;">🌐 HomeProxy Sticky</div>
-              <div id="spHomeProxyStatus" style="font-size:13px; font-weight:600; color:#38bdf8;">Đang nạp dữ liệu...</div>
+          <div id="bodyBrowserProtection" style="margin-top:10px;">
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-bottom:10px;">
+              <div style="background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.06);">
+                <div style="font-size:11px; color:var(--text-dim); margin-bottom:2px;">🌐 HomeProxy Sticky</div>
+                <div id="spHomeProxyStatus" style="font-size:13px; font-weight:600; color:#38bdf8;">Đang nạp dữ liệu...</div>
+              </div>
+              <div style="background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.06);">
+                <div style="font-size:11px; color:var(--text-dim); margin-bottom:2px;">⏱️ TTL Phiên Trình Duyệt</div>
+                <div id="spBrowserTtlStatus" style="font-size:13px; font-weight:600; color:#4ade80;">30 phút / 5 tác vụ</div>
+              </div>
+              <div style="background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.06);">
+                <div style="font-size:11px; color:var(--text-dim); margin-bottom:2px;">🛡️ Anti-Detect Stealth</div>
+                <div style="font-size:13px; font-weight:600; color:#a78bfa;">WebRTC Lock + GPU Spoof (Bật)</div>
+              </div>
             </div>
-            <div style="background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.06);">
-              <div style="font-size:11px; color:var(--text-dim); margin-bottom:2px;">⏱️ TTL Phiên Trình Duyệt</div>
-              <div id="spBrowserTtlStatus" style="font-size:13px; font-weight:600; color:#4ade80;">30 phút / 5 tác vụ</div>
+
+            <div class="shopee-row" style="margin-bottom:0; flex-wrap:wrap; gap:8px; align-items:center;">
+              <span class="shopee-lbl">Thời gian sống TTL:</span>
+              <select class="shopee-select" id="sp_browser_ttl" onchange="changeBrowserTtl(this.value)">
+                <option value="900">15 phút (900s)</option>
+                <option value="1800" selected>30 phút (1800s - Khuyên dùng)</option>
+                <option value="3600">60 phút (3600s)</option>
+                <option value="7200">120 phút (7200s)</option>
+              </select>
+
+              <span class="shopee-lbl" style="margin-left:8px;">Giới hạn Task trước khi Reset:</span>
+              <select class="shopee-select" id="sp_browser_max_tasks" onchange="changeBrowserMaxTasks(this.value)">
+                <option value="3">3 task / phiên</option>
+                <option value="5" selected>5 task / phiên (Khuyên dùng)</option>
+                <option value="10">10 task / phiên</option>
+              </select>
+
+              <span style="font-size:11px; color:var(--text-dim); margin-left:6px;">
+                💡 Tự động hủy và tạo mới Browser Context sạch sẽ sau khi đạt hạn TTL, chống tràn RAM và tránh bị Muse phát hiện bot.
+              </span>
             </div>
-            <div style="background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.06);">
-              <div style="font-size:11px; color:var(--text-dim); margin-bottom:2px;">🛡️ Anti-Detect Stealth</div>
-              <div style="font-size:13px; font-weight:600; color:#a78bfa;">WebRTC Lock + GPU Spoof (Bật)</div>
-            </div>
-          </div>
-
-          <div class="shopee-row" style="margin-bottom:0; flex-wrap:wrap; gap:8px; align-items:center;">
-            <span class="shopee-lbl">Thời gian sống TTL:</span>
-            <select class="shopee-select" id="sp_browser_ttl" onchange="changeBrowserTtl(this.value)">
-              <option value="900">15 phút (900s)</option>
-              <option value="1800" selected>30 phút (1800s - Khuyên dùng)</option>
-              <option value="3600">60 phút (3600s)</option>
-              <option value="7200">120 phút (7200s)</option>
-            </select>
-
-            <span class="shopee-lbl" style="margin-left:8px;">Giới hạn Task trước khi Reset:</span>
-            <select class="shopee-select" id="sp_browser_max_tasks" onchange="changeBrowserMaxTasks(this.value)">
-              <option value="3">3 task / phiên</option>
-              <option value="5" selected>5 task / phiên (Khuyên dùng)</option>
-              <option value="10">10 task / phiên</option>
-            </select>
-
-            <span style="font-size:11px; color:var(--text-dim); margin-left:6px;">
-              💡 Tự động hủy và tạo mới Browser Context sạch sẽ sau khi đạt hạn TTL, chống tràn RAM và tránh bị Muse phát hiện bot.
-            </span>
           </div>
         </div>
 
@@ -1650,12 +1659,20 @@
               📥 Nhận SP
             </button>
 
-            <button type="button" class="shopee-btn" id="btnImportLinks" style="background:#ea580c;color:white;border:1px solid #f97316;font-weight:700;" onclick="openImportLinksModal()" title="Nhập danh sách link Shopee từ file .txt hoặc dán trực tiếp để tạo video">
-              🔗 Import URL (TXT)
+            <button type="button" class="shopee-btn shopee-btn-red" onclick="releaseStuckShopeeJobs()" title="Giải phóng các sản phẩm Shopee đang bị treo/kẹt trong cơ sở dữ liệu">
+              🔄 Giải phóng SP kẹt
             </button>
 
-            <button type="button" class="shopee-btn shopee-btn-red" onclick="releaseStuckShopeeJobs()">
-              🔄 Giải phóng SP kẹt
+            <button type="button" class="shopee-btn" id="btnAutoStitchTemp" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%);color:white;border:1px solid #34d399;font-weight:700;" onclick="triggerAutoStitchTemp()" title="Tự động quét và ghép tất cả các cặp Clip A + Clip B đang có sẵn trong folder temp thành video 16s hoàn chỉnh">
+              ⚡ Ghép Clip Temp (16s)
+            </button>
+
+            <button type="button" class="shopee-btn" id="btnCleanTemp" style="background:#334155;color:#cbd5e1;border:1px solid #475569;" onclick="triggerCleanTempClips()" title="Dọn dẹp các clip tạm trong temp đã hoàn thành để giải phóng dung lượng ổ cứng">
+              🧹 Dọn Dẹp Temp
+            </button>
+
+            <button type="button" class="shopee-btn" id="btnImportLinks" style="background:#ea580c;color:white;border:1px solid #f97316;font-weight:700;" onclick="triggerImportShopeeTxt()" title="Mở file .txt chứa danh sách link Shopee hoặc dán trực tiếp để tạo video">
+              🔗 Import URL (TXT)
             </button>
 
             <button type="button" class="shopee-btn shopee-btn-lightred" onclick="clearPolicyViolations()">
@@ -1900,6 +1917,7 @@
     await loadAccounts();
     await loadGallery();
     await loadShopeeSettings();
+    initBrowserProtectionCollapse();
 
     // Setup paste listener for clipboard image
     window.addEventListener("paste", handlePasteEvent);
@@ -2791,6 +2809,7 @@
       }
       if (data.del_img !== undefined) document.getElementById("sp_del_img").checked = !!data.del_img;
       if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
+      updateTempStitchButtonStatus();
     } catch (e) {
       console.warn("Lỗi tải cài đặt Shopee:", e);
     }
@@ -2983,9 +3002,65 @@
       const comm = p.commission_rate ? (p.commission_rate * 100).toFixed(0) : (p.commission ?? "0");
       const price = p.price_min ?? p.price ?? 0;
       const isImportedBadge = p._is_imported ? `<span style="background:rgba(234,88,12,0.25);color:#fb923c;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(234,88,12,0.4);margin-right:4px;">TXT</span>` : '';
-      const line = `${statusIcon} [${idx + 1}] ${isImportedBadge}ID: ${p.item_id} | ${p.name || ''} | ${sym}${price} | Sold: ${sold} | Comm: ${comm}%`;
+      let clipHint = "";
+      if (p._has_final || (p._final_video && p._status === "completed")) {
+        clipHint = ` <span style="background:rgba(52,211,153,0.2);color:#34d399;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(52,211,153,0.3);">[Đã có Video]</span>`;
+      } else if (p._clipA && p._clipB) {
+        clipHint = ` <span style="background:rgba(56,189,248,0.2);color:#38bdf8;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(56,189,248,0.3);">[Có sẵn Clip A+B]</span>`;
+      } else if (p._clipA) {
+        clipHint = ` <span style="background:rgba(251,191,36,0.2);color:#fbbf24;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(251,191,36,0.3);">[Có sẵn Clip A]</span>`;
+      } else if (p._clipB) {
+        clipHint = ` <span style="background:rgba(251,191,36,0.2);color:#fbbf24;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(251,191,36,0.3);">[Có sẵn Clip B]</span>`;
+      }
+      const line = `${statusIcon} [${idx + 1}] ${isImportedBadge}ID: ${p.item_id} | ${p.name || ''} | ${sym}${price} | Sold: ${sold} | Comm: ${comm}%${clipHint}`;
       return `<div style="margin-bottom:3px;${p._status === 'completed' ? 'color:#34d399;' : (p._status === 'failed' ? 'color:#f87171;' : '')}">${line}</div>`;
     }).join("");
+  }
+
+  async function batchCheckClipsForConsole() {
+    if (!shopeeClaimedProducts || shopeeClaimedProducts.length === 0) return;
+    const form = getShopeeFormData();
+    const outDir = form.out_dir || "F:/Video AI/PH/shopapi";
+    try {
+      const res = await fetch("/api/shopee/batch-check-clips", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({
+          out_dir: outDir,
+          item_ids: shopeeClaimedProducts.map(p => p.item_id)
+        })
+      });
+      if (res.ok) {
+        const d = await res.json();
+        const results = d.results || {};
+        let countFinal = 0, countBoth = 0, countA = 0, countB = 0;
+        shopeeClaimedProducts.forEach(p => {
+          const r = results[String(p.item_id)];
+          if (r) {
+            if (r.has_final) {
+              p._final_video = r.final_video;
+              p._has_final = true;
+              p._status = "completed";
+              countFinal++;
+            }
+            if (r.has_a) p._clipA = r.clip_a;
+            if (r.has_b) p._clipB = r.clip_b;
+            if (r.has_both && !r.has_final) countBoth++;
+            else if (r.has_a && !r.has_b && !r.has_final) countA++;
+            else if (r.has_b && !r.has_a && !r.has_final) countB++;
+          }
+        });
+        renderShopeeProductsConsole();
+        const notices = [];
+        if (countFinal > 0) notices.push(`${countFinal} đã có video hoàn chỉnh`);
+        if (countBoth > 0) notices.push(`${countBoth} đã có sẵn cả Clip A+B`);
+        if (countA > 0) notices.push(`${countA} đã có Clip A`);
+        if (countB > 0) notices.push(`${countB} đã có Clip B`);
+        if (notices.length > 0) {
+          appendShopeeLog(`⚡ [Kiểm tra thư mục temp/output]: Tìm thấy ${notices.join(", ")} -> Sẽ tận dụng ngay, không tạo lại!`);
+        }
+      }
+    } catch (_) {}
   }
 
   async function claimShopeeProducts() {
@@ -3012,6 +3087,7 @@
       const data = await res.json();
       shopeeClaimedProducts = data.products || [];
       renderShopeeProductsConsole();
+      batchCheckClipsForConsole();
       appendShopeeLog(`✓ Đã nhận thành công ${shopeeClaimedProducts.length} sản phẩm từ Database!`);
       if (data.blacklisted_count > 0) {
         appendShopeeLog(`🛡️ Blacklist: Đã tự động phát hiện và loại bỏ ${data.blacklisted_count} sản phẩm vi phạm chính sách / từ khóa cấm!`);
@@ -3027,7 +3103,6 @@
   }
 
   async function releaseStuckShopeeJobs() {
-    if (!confirm("Bạn có chắc muốn giải phóng tất cả các job đang ở trạng thái 'processing' của máy này trên Database?")) return;
     appendShopeeLog("Đang gửi lệnh giải phóng sản phẩm kẹt về Database...");
     try {
       const res = await fetch("/api/shopee/release", {
@@ -3200,6 +3275,115 @@
 
     appendShopeeLog(`[Luồng ${workerId}] [${idx + 1}/${shopeeClaimedProducts.length}] Bắt đầu xử lý SP ${prod.item_id}: ${prod.name || ''}...`);
 
+    let targetFileName = `${prod.item_id}.mp4`;
+    if (form.naming && form.naming.includes("15 ký tự")) {
+      const safeName = (prod.name || "video").slice(0, 15).replace(/[^a-zA-Z0-9_-]/g, "_");
+      targetFileName = `${safeName}_${prod.item_id}.mp4`;
+    } else if (form.naming && form.naming.includes("Số thứ tự")) {
+      targetFileName = `${String(idx + 1).padStart(4, "0")}_${prod.item_id}.mp4`;
+    }
+
+    // 1. KIỂM TRA NGAY: Video hoàn chỉnh hoặc clip thô -a, -b đã có sẵn trong folder temp hoặc folder xuất chưa
+    let clipAFile = prod._clipA || null;
+    let clipBFile = prod._clipB || null;
+    let finalVideoFile = prod._final_video || null;
+
+    try {
+      const checkRes = await fetch(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}`, { headers: getHeaders() });
+      if (checkRes.ok) {
+        const chk = await checkRes.json();
+        if (chk.final_video) finalVideoFile = chk.final_video;
+        if (chk.clip_a) clipAFile = chk.clip_a;
+        if (chk.clip_b) clipBFile = chk.clip_b;
+      }
+    } catch (_) {}
+
+    // TRƯỜNG HỢP 1: ĐÃ CÓ VIDEO HOÀN CHỈNH TRONG THƯ MỤC XUẤT
+    if (finalVideoFile) {
+      appendShopeeLog(`⚡ [Luồng ${workerId}] SP ${prod.item_id}: ĐÃ TỒN TẠI VIDEO HOÀN CHỈNH (${finalVideoFile}) -> Bỏ qua toàn bộ, không tạo lại!`);
+      prod._status = "completed";
+      prod._final_video = finalVideoFile;
+      renderShopeeProductsConsole();
+      if (!prod._is_imported) {
+        try {
+          await fetch("/api/shopee/complete", {
+            method: "POST",
+            headers: getHeaders(),
+            body: JSON.stringify({ item_id: prod.item_id, status: "completed", video_path: finalVideoFile })
+          });
+        } catch (_) {}
+      }
+      return;
+    }
+
+    const durStr = String(form.duration || "").toLowerCase();
+    const promptChoice = String(form.ai_prompt || "").toLowerCase();
+    const is16s = durStr.includes("16") || promptChoice.includes("a + b");
+
+    let ar = "9:16";
+    if (form.aspect.includes("16:9")) ar = "16:9";
+    else if (form.aspect.includes("1:1")) ar = "1:1";
+
+    let finishedVideoFilename = null;
+
+    // TRƯỜNG HỢP 2: CHẾ ĐỘ 16S VÀ ĐÃ CÓ ĐỦ CẢ CLIP A & B TRONG FOLDER TEMP
+    if (is16s && clipAFile && clipBFile) {
+      appendShopeeLog(`⚡ [Luồng ${workerId}] SP ${prod.item_id}: ĐÃ CÓ ĐỦ CẢ CLIP A & CLIP B TRONG TEMP:`);
+      appendShopeeLog(`   + Clip A: ${clipAFile}`);
+      appendShopeeLog(`   + Clip B: ${clipBFile}`);
+      appendShopeeLog(`> [Luồng ${workerId}] Bỏ qua gọi Muse.ai, ghép Clip A + Clip B thành video 16s qua FFmpeg ngay...`);
+
+      const concatRes = await fetch("/api/shopee/concat-videos", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({
+          clip_filenames: [clipAFile, clipBFile],
+          out_filename: `shopee_16s_${prod.item_id}_${Date.now()}.mp4`
+        })
+      });
+      if (!concatRes.ok) {
+        throw new Error(await concatRes.text() || "Lỗi ghép Clip A + Clip B bằng FFmpeg");
+      }
+      const concatData = await concatRes.json();
+      finishedVideoFilename = concatData.filename;
+      appendShopeeLog(`✓ [Luồng ${workerId}] Ghép video 16s từ 2 clip có sẵn thành công!`);
+
+      if (form.ghep_anh) {
+        appendShopeeLog(`> [Luồng ${workerId}] Đang ghép ảnh Outro sản phẩm để tạo video 12s bằng FFmpeg...`);
+      }
+
+      const saveRes = await fetch("/api/shopee/save-rendered-video", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({
+          filename: finishedVideoFilename,
+          out_dir: outDir,
+          target_name: targetFileName,
+          ghep_anh: form.ghep_anh,
+          del_img: form.del_img,
+          image_url: prod.image || (prod.images && prod.images[0]) || "",
+          image_data_url: null,
+          duration: form.duration
+        })
+      });
+      const saveData = await saveRes.json();
+      const finalSavedPath = saveData.saved_path || `${outDir}/${targetFileName}`;
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video vào: ${finalSavedPath}`);
+
+      if (!prod._is_imported) {
+        await fetch("/api/shopee/complete", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({ item_id: prod.item_id, status: "completed", video_path: finalSavedPath })
+        });
+        appendShopeeLog(`✓ [Luồng ${workerId}] Đã báo cáo hoàn tất Job ID: ${prod.item_id} về Database Shopee.`);
+      } else {
+        appendShopeeLog(`✓ [Luồng ${workerId}] Hoàn tất xuất video cho Link Shopee: ${prod.item_id} (Lưu tại: ${finalSavedPath})`);
+      }
+      return;
+    }
+
+    // TRƯỜNG HỢP 3: CẦN RENDER CLIP (THIẾU CLIP A HOẶC CLIP B HOẶC LÀ 8S)
     let refImageDataUrl = null;
     const imgUrl = prod.image || (prod.images && prod.images[0]) || "";
     if (imgUrl) {
@@ -3234,44 +3418,14 @@
       })
     });
     const promptData = await promptRes.json();
-    const is16s = promptData.is_16s && promptData.prompts && promptData.prompts.length === 2;
+    const effectiveIs16s = promptData.is_16s && promptData.prompts && promptData.prompts.length === 2;
 
-    let ar = "9:16";
-    if (form.aspect.includes("16:9")) ar = "16:9";
-    else if (form.aspect.includes("1:1")) ar = "1:1";
+    if (effectiveIs16s) {
+      appendShopeeLog(`> [Luồng ${workerId}] Chế độ 16s (Prompt A + B): Đang kiểm tra và tạo các clip còn thiếu...`);
 
-    let finishedVideoFilename = null;
-
-    if (is16s) {
-      appendShopeeLog(`> [Luồng ${workerId}] Chế độ 16s (Prompt A + B): Kiểm tra tiến độ clip A / B...`);
-
-      let clipAFile = null;
-      let clipBFile = null;
-
-      // 1. Kiểm tra xem file clip thô đã có sẵn trong folder outDir/temp chưa
-      try {
-        const checkRes = await fetch(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}`, { headers: getHeaders() });
-        if (checkRes.ok) {
-          const chk = await checkRes.json();
-          clipAFile = chk.clip_a;
-          clipBFile = chk.clip_b;
-        }
-      } catch (_) {}
-
-      // 2. Nếu chưa tìm thấy, kiểm tra cache tiến độ của item_id
-      if (!clipAFile || !clipBFile) {
-        try {
-          const cacheRes = await fetch(`/api/shopee/clip-cache/${prod.item_id}`, { headers: getHeaders() });
-          if (cacheRes.ok) {
-            const cachedClips = await cacheRes.json();
-            if (!clipAFile) clipAFile = cachedClips.clip_a || prod._clipA;
-            if (!clipBFile) clipBFile = cachedClips.clip_b || prod._clipB;
-          }
-        } catch (_) {}
-      }
-
+      // Xử lý Clip A
       if (clipAFile) {
-        appendShopeeLog(`⚡ [Luồng ${workerId}] ĐÃ CÓ SẴN CLIP A: temp/${prod.item_id}-a.mp4 -> Bỏ qua, không cần tạo lại!`);
+        appendShopeeLog(`⚡ [Luồng ${workerId}] SP ${prod.item_id}: ĐÃ CÓ SẴN CLIP A (${clipAFile}) -> Bỏ qua, không cần tạo lại!`);
       } else {
         appendShopeeLog(`> [Luồng ${workerId}] Đang tạo Clip A (0-8s)...`);
         const rawA = await renderSingleVideoClip(promptData.prompts[0], refImageDataUrl, ar, 8, workerId, "Clip A (0-8s)");
@@ -3285,20 +3439,21 @@
           if (saveResA.ok) {
             const sDataA = await saveResA.json();
             clipAFile = sDataA.path || rawA;
+            prod._clipA = clipAFile;
             appendShopeeLog(`✓ [Luồng ${workerId}] Clip A hoàn tất: ${prod.item_id}-a.mp4 (Lưu tại: temp/${prod.item_id}-a.mp4)`);
           } else {
-            const errA = await saveResA.text();
             clipAFile = rawA;
-            appendShopeeLog(`✓ [Luồng ${workerId}] Clip A hoàn tất: ${prod.item_id}-a.mp4 (Cảnh báo lưu temp: ${errA})`);
+            appendShopeeLog(`✓ [Luồng ${workerId}] Clip A hoàn tất: ${prod.item_id}-a.mp4`);
           }
         } catch (eA) {
           clipAFile = rawA;
-          appendShopeeLog(`✓ [Luồng ${workerId}] Clip A hoàn tất: ${prod.item_id}-a.mp4 (Lỗi kết nối lưu temp: ${eA.message})`);
+          appendShopeeLog(`✓ [Luồng ${workerId}] Clip A hoàn tất: ${prod.item_id}-a.mp4`);
         }
       }
 
+      // Xử lý Clip B
       if (clipBFile) {
-        appendShopeeLog(`⚡ [Luồng ${workerId}] ĐÃ CÓ SẴN CLIP B: temp/${prod.item_id}-b.mp4 -> Bỏ qua, không cần tạo lại!`);
+        appendShopeeLog(`⚡ [Luồng ${workerId}] SP ${prod.item_id}: ĐÃ CÓ SẴN CLIP B (${clipBFile}) -> Bỏ qua, không cần tạo lại!`);
       } else {
         appendShopeeLog(`> [Luồng ${workerId}] Đang tạo Clip B (8-16s)...`);
         const rawB = await renderSingleVideoClip(promptData.prompts[1], refImageDataUrl, ar, 8, workerId, "Clip B (8-16s)");
@@ -3312,15 +3467,15 @@
           if (saveResB.ok) {
             const sDataB = await saveResB.json();
             clipBFile = sDataB.path || rawB;
+            prod._clipB = clipBFile;
             appendShopeeLog(`✓ [Luồng ${workerId}] Clip B hoàn tất: ${prod.item_id}-b.mp4 (Lưu tại: temp/${prod.item_id}-b.mp4)`);
           } else {
-            const errB = await saveResB.text();
             clipBFile = rawB;
-            appendShopeeLog(`✓ [Luồng ${workerId}] Clip B hoàn tất: ${prod.item_id}-b.mp4 (Cảnh báo lưu temp: ${errB})`);
+            appendShopeeLog(`✓ [Luồng ${workerId}] Clip B hoàn tất: ${prod.item_id}-b.mp4`);
           }
         } catch (eB) {
           clipBFile = rawB;
-          appendShopeeLog(`✓ [Luồng ${workerId}] Clip B hoàn tất: ${prod.item_id}-b.mp4 (Lỗi kết nối lưu temp: ${eB.message})`);
+          appendShopeeLog(`✓ [Luồng ${workerId}] Clip B hoàn tất: ${prod.item_id}-b.mp4`);
         }
       }
 
@@ -3351,14 +3506,6 @@
           body: JSON.stringify({ filename: finishedVideoFilename, out_dir: outDir, item_id: prod.item_id, part: "raw" })
         });
       } catch (_) {}
-    }
-
-    let targetFileName = `${prod.item_id}.mp4`;
-    if (form.naming.includes("15 ký tự")) {
-      const safeName = (prod.name || "video").slice(0, 15).replace(/[^a-zA-Z0-9_-]/g, "_");
-      targetFileName = `${safeName}_${prod.item_id}.mp4`;
-    } else if (form.naming.includes("Số thứ tự")) {
-      targetFileName = `${String(idx + 1).padStart(4, "0")}_${prod.item_id}.mp4`;
     }
 
     if (form.ghep_anh) {
@@ -3480,9 +3627,24 @@
       appendShopeeLog(`🚀 BẮT ĐẦU CHẠY BATCH RENDER CHO ${shopeeClaimedProducts.length} SẢN PHẨM VỚI ${maxWorkers} LUỒNG SONG SONG (${aliveAccounts} TÀI KHOẢN KHẢ DỤNG)...`);
     }
 
+    // Rà soát trước toàn bộ danh sách sản phẩm trong thư mục temp và outDir
+    appendShopeeLog("🔍 Đang rà soát thư mục xuất và thư mục temp để nhận diện các clip/video đã tạo sẵn...");
+    await batchCheckClipsForConsole();
+
     let nextIndex = 0;
     let completedCount = shopeeClaimedProducts.filter(p => p._status === "completed").length;
     let failedCount = 0;
+
+    if (completedCount >= shopeeClaimedProducts.length) {
+      appendShopeeLog(`✓ TẤT CẢ ${shopeeClaimedProducts.length} SẢN PHẨM ĐÃ CÓ VIDEO HOÀN CHỈNH! Không cần tạo thêm.`);
+      showToast("Tất cả sản phẩm đã có video hoàn chỉnh!", "success");
+      clearInterval(shopeeBatchTimer);
+      isShopeeBatchRunning = false;
+      document.getElementById("btnStartBatch").disabled = false;
+      document.getElementById("btnStopBatch").disabled = true;
+      document.getElementById("btnClaimShopee").disabled = false;
+      return;
+    }
 
     function updateProgressText() {
       const inProgress = shopeeClaimedProducts.filter(p => p._status === "processing").length;
@@ -3666,6 +3828,13 @@
   }
 
   // ==================== IMPORT LINKS (TXT) ====================
+  async function triggerImportShopeeTxt() {
+    // 1. Hiển thị modal để người dùng xem trước nội dung và các tùy chọn cào link
+    openImportLinksModal();
+    // 2. Tự động kích hoạt ngay hộp thoại chọn file của Windows
+    await handlePickShopeeTxtFile();
+  }
+
   function openImportLinksModal() {
     const modal = document.getElementById("importLinksModal");
     if (!modal) return;
@@ -3681,6 +3850,9 @@
 
   async function handlePickShopeeTxtFile() {
     const statusEl = document.getElementById("importFileStatus");
+    if (statusEl) statusEl.innerText = "⏳ Đang mở hộp thoại chọn file TXT...";
+    
+    // Nếu chạy trong ứng dụng Desktop Windows (pywebview)
     if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_text_file_dialog) {
       try {
         const res = await window.pywebview.api.pick_text_file_dialog("Chọn file TXT chứa link Shopee");
@@ -3688,12 +3860,18 @@
           document.getElementById("importLinksTextarea").value = res.content;
           if (statusEl) statusEl.innerText = `✓ Đã nạp file: ${res.name || 'file.txt'}`;
           updateImportLinksCount();
+          showToast(`Đã nạp file: ${res.name || 'file.txt'}`, "success");
+          return;
+        } else if (res && res.cancelled) {
+          if (statusEl) statusEl.innerText = "";
           return;
         }
       } catch (err) {
         console.warn("pick_text_file_dialog error:", err);
       }
     }
+
+    // Fallback cho trình duyệt web (khi chạy trên Chrome/Edge thông thường)
     const fi = document.getElementById("spTxtFileInput");
     if (fi) {
       fi.value = "";
@@ -3711,8 +3889,102 @@
       document.getElementById("importLinksTextarea").value = text;
       if (statusEl) statusEl.innerText = `✓ Đã đọc: ${file.name}`;
       updateImportLinksCount();
+      showToast(`Đã đọc ${file.name} thành công!`, "success");
     };
     reader.readAsText(file);
+  }
+
+  // ==================== AUTO STITCH TEMP CLIPS (GHÉP CLIP TẠM) ====================
+  async function triggerAutoStitchTemp() {
+    const btn = document.getElementById("btnAutoStitchTemp");
+    const oldHtml = btn ? btn.innerHTML : "";
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = "⏳ Đang quét & ghép clip...";
+    }
+    appendShopeeLog("⚡ Bắt đầu quét thư mục temp để ghép các cặp Clip A + Clip B thành video 16s...");
+
+    try {
+      const outDir = (document.getElementById("sp_out_dir") ? document.getElementById("sp_out_dir").value : "").trim();
+      const res = await fetch("/api/shopee/auto-stitch-temp", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ out_dir: outDir })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || "Lỗi ghép clip temp");
+      }
+
+      appendShopeeLog(`✓ [Auto Stitch] ${data.message}`);
+      if (data.stitched && data.stitched.length > 0) {
+        data.stitched.forEach(item => {
+          appendShopeeLog(`   + Đã ghép xong SP ${item.item_id}: ${item.filename}`);
+        });
+        showToast(data.message, "success");
+      } else {
+        appendShopeeLog(`i [Auto Stitch] Không có cặp clip A/B nào tồn đọng cần ghép.`);
+        showToast("Không có cặp clip A/B nào cần ghép trong temp!", "info");
+      }
+
+      // Cập nhật lại số liệu trên nút và console
+      await updateTempStitchButtonStatus();
+      if (typeof batchCheckClipsForConsole === "function") {
+        batchCheckClipsForConsole();
+      }
+    } catch (err) {
+      appendShopeeLog(`✗ [Auto Stitch] Lỗi: ${err.message}`);
+      showToast(`Lỗi ghép clip temp: ${err.message}`, "danger");
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = oldHtml;
+      }
+    }
+  }
+
+  async function updateTempStitchButtonStatus() {
+    const btn = document.getElementById("btnAutoStitchTemp");
+    if (!btn) return;
+    try {
+      const outDir = (document.getElementById("sp_out_dir") ? document.getElementById("sp_out_dir").value : "").trim();
+      const res = await fetch(`/api/shopee/temp-stitch-summary?out_dir=${encodeURIComponent(outDir)}`, {
+        headers: getHeaders()
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data && data.waiting_to_stitch > 0) {
+        btn.innerHTML = `⚡ Ghép Clip Temp (${data.waiting_to_stitch} chờ ghép)`;
+        btn.style.boxShadow = "0 0 12px rgba(16, 185, 129, 0.6)";
+        btn.title = `Có ${data.waiting_to_stitch} cặp clip A/B đang chờ ghép thành video 16s trong temp! Bấm để ghép ngay.`;
+      } else {
+        btn.innerHTML = `⚡ Ghép Clip Temp (16s)`;
+        btn.style.boxShadow = "none";
+        btn.title = `Tự động ghép tất cả các cặp Clip A + Clip B đang có sẵn trong folder temp thành video 16s hoàn chỉnh`;
+      }
+    } catch (_) {}
+  }
+
+  async function triggerCleanTempClips() {
+    if (!confirm("Bạn có muốn dọn dẹp các clip tạm trong folder temp đã có video hoàn chỉnh để giải phóng dung lượng ổ cứng?")) return;
+    try {
+      const outDir = (document.getElementById("sp_out_dir") ? document.getElementById("sp_out_dir").value : "").trim();
+      const res = await fetch("/api/shopee/clean-temp-clips", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ out_dir: outDir })
+      });
+      const data = await res.json();
+      if (data && data.success) {
+        showToast(data.message, "success");
+        appendShopeeLog(`✓ [Clean Temp] ${data.message}`);
+        await updateTempStitchButtonStatus();
+      } else {
+        showToast("Không có file clip tạm nào cần xóa.", "info");
+      }
+    } catch (e) {
+      showToast(`Lỗi dọn temp: ${e.message}`, "danger");
+    }
   }
 
   function updateImportLinksCount() {
@@ -3771,6 +4043,7 @@
       }
 
       renderShopeeProductsConsole();
+      batchCheckClipsForConsole();
       appendShopeeLog(`✓ Đã nạp thành công ${newProducts.length} link sản phẩm Shopee từ file TXT!`);
       showToast(`Đã nạp ${newProducts.length} sản phẩm Shopee! Tổng: ${shopeeClaimedProducts.length} SP`, "success");
       
@@ -3948,6 +4221,38 @@
     loadGallery();
     fetchBrowserTtlStatus();
     showToast("Đã làm mới dữ liệu!", "info");
+  }
+
+  // ==================== BROWSER PROTECTION CARD COLLAPSE ====================
+  function toggleBrowserProtectionCard() {
+    const body = document.getElementById("bodyBrowserProtection");
+    const icon = document.getElementById("iconToggleBrowserProtection");
+    const btn = document.getElementById("btnToggleBrowserProtection");
+    if (!body || !icon) return;
+    const isHidden = body.style.display === "none";
+    if (isHidden) {
+      body.style.display = "block";
+      icon.innerText = "▲ Thu nhỏ";
+      if (btn) btn.title = "Thu nhỏ phần cấu hình này";
+      localStorage.setItem("shopee_browser_protection_collapsed", "false");
+    } else {
+      body.style.display = "none";
+      icon.innerText = "▼ Mở rộng";
+      if (btn) btn.title = "Mở rộng xem chi tiết phần này";
+      localStorage.setItem("shopee_browser_protection_collapsed", "true");
+    }
+  }
+
+  function initBrowserProtectionCollapse() {
+    const saved = localStorage.getItem("shopee_browser_protection_collapsed");
+    if (saved === "true") {
+      const body = document.getElementById("bodyBrowserProtection");
+      const icon = document.getElementById("iconToggleBrowserProtection");
+      const btn = document.getElementById("btnToggleBrowserProtection");
+      if (body) body.style.display = "none";
+      if (icon) icon.innerText = "▼ Mở rộng";
+      if (btn) btn.title = "Mở rộng xem chi tiết phần này";
+    }
   }
 </script>
 </body>

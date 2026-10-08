@@ -129,19 +129,40 @@ class DesktopAPI:
 
     def pick_text_file_dialog(self, title: str = "Chọn file TXT chứa link Shopee") -> dict:
         """Mở hộp thoại chọn file text chuẩn Windows (Native OpenFileDialog)."""
-        if not self._window:
-            return {"success": False, "error": "Cửa sổ chưa sẵn sàng"}
-        try:
-            res = self._window.create_file_dialog(
-                webview.OPEN_DIALOG,
-                allow_multiple=False,
-                file_types=(
-                    "Tệp văn bản (*.txt)",
-                    "Tất cả tệp (*.*)",
-                ),
-            )
-            if res and len(res) > 0:
-                file_path = res[0]
+        file_path = None
+        if self._window:
+            try:
+                res = self._window.create_file_dialog(
+                    webview.OPEN_DIALOG,
+                    allow_multiple=False,
+                    file_types=(
+                        "Text Files (*.txt)",
+                        "All Files (*.*)",
+                    ),
+                )
+                if res and len(res) > 0:
+                    file_path = res[0]
+            except Exception as e:
+                print(f"[DesktopAPI] webview create_file_dialog error: {e}")
+
+        # Fallback bằng tkinter nếu webview không mở được hộp thoại
+        if not file_path:
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                file_path = filedialog.askopenfilename(
+                    title=title,
+                    filetypes=[("Text Files (*.txt)", "*.txt"), ("All Files (*.*)", "*.*")]
+                )
+                root.destroy()
+            except Exception as e:
+                print(f"[DesktopAPI] tkinter filedialog fallback error: {e}")
+
+        if file_path and os.path.isfile(file_path):
+            try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
                 return {
@@ -150,9 +171,9 @@ class DesktopAPI:
                     "name": os.path.basename(file_path),
                     "content": content
                 }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-        return {"success": False}
+            except Exception as e:
+                return {"success": False, "error": f"Không thể đọc file: {e}"}
+        return {"success": False, "cancelled": True}
 
     def open_folder_path(self, folder_path: str) -> dict:
         """Mở thư mục bất kỳ trên Windows Explorer."""

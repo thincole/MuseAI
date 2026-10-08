@@ -58,6 +58,24 @@ class _TeeStream:
         return getattr(self.original_stream, name)
 
 
+def _silence_proactor_winerror10054():
+    """Bỏ qua thông báo lỗi ConnectionResetError (WinError 10054) vô hại của Windows asyncio Proactor khi client ngắt kết nối."""
+    if sys.platform == "win32":
+        try:
+            from asyncio.proactor_events import _ProactorBasePipeTransport
+            _orig_lost = _ProactorBasePipeTransport._call_connection_lost
+
+            def _clean_lost(self, exc):
+                try:
+                    _orig_lost(self, exc)
+                except (ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+
+            _ProactorBasePipeTransport._call_connection_lost = _clean_lost
+        except Exception:
+            pass
+
+
 def setup_logging():
     """Khởi tạo file log.txt, xóa trắng dữ liệu cũ và thiết lập handler ghi log liên tục."""
     global _initialized
@@ -65,8 +83,18 @@ def setup_logging():
         return
     _initialized = True
 
-    # 1. Xóa trắng file log.txt khi khởi chạy phiên mới
+    _silence_proactor_winerror10054()
+
+    # 1. Sao lưu log phiên trước sang log.txt.1 nếu có
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    backup_file = os.path.join(BASE_DIR, "log.txt.1")
+    try:
+        if os.path.isfile(LOG_FILE) and os.path.getsize(LOG_FILE) > 0:
+            import shutil
+            shutil.copy2(LOG_FILE, backup_file)
+    except Exception:
+        pass
+
     header = (
         "================================================================================\n"
         f"        MuseAI Video Studio Pro - Nhật Ký Hoạt Động Hệ Thống (log.txt)\n"
