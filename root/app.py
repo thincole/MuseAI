@@ -2315,6 +2315,39 @@ def complete_shopee_job(req: dict):
     return {"success": res}
 
 
+@app.post("/api/shopee/job-status")
+def shopee_job_status(req: dict):
+    """Trước khi render: SP còn thuộc máy này không?
+
+    Server Shopee giao lại SP 'processing' giữ quá lâu (~2 giờ) cho máy khác khi máy đó nhận lô mới, nên hai máy
+    có thể cùng có 1 SP trong danh sách. SP đã completed hoặc đang thuộc máy khác -> bỏ qua để không render trùng.
+    Không kết nối được Database thì KHÔNG chặn (render như cũ)."""
+    item_id = str(req.get("item_id") or "").strip()
+    cfg = _get_shopee_settings()
+    me = str(req.get("client_id") or cfg.get("sv_client_id") or shopee_engine.DEFAULT_CLIENT_ID)
+    if not item_id.isdigit():
+        return {"skip": False, "reason": "item_id không phải số"}
+    try:
+        conn = _shopee_db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT claimed_by, video_status FROM shopee_products WHERE item_id = %s", (int(item_id),))
+            row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("Không kiểm tra được trạng thái SP %s trên Database: %s", item_id, exc)
+        return {"skip": False, "reason": f"không kiểm tra được Database: {exc}"}
+    if not row:
+        return {"skip": False, "reason": "SP không có trong Database"}
+    owner, status = str(row[0] or ""), str(row[1] or "")
+    if status == "completed":
+        return {"skip": True, "owner": owner, "status": status, "reason": f"đã completed trên Database (máy {owner or '?'})"}
+    if owner and owner != me:
+        return {"skip": True, "owner": owner, "status": status, "reason": f"đã được giao cho máy {owner}"}
+    return {"skip": False, "owner": owner, "status": status, "me": me}
+
+
 @app.post("/api/shopee/import-links")
 def import_shopee_links(req: dict):
     """Nhập danh sách link Shopee từ nội dung file text hoặc mảng link."""
@@ -2665,20 +2698,24 @@ def batch_check_shopee_clips(req: dict):
     return {"success": True, "results": {sid: index.inspect(sid) for sid in ids}}
 
 
+def _shopee_db_connect():
+    import psycopg2
+    return psycopg2.connect(
+        host="100.79.170.67",
+        port=5432,
+        dbname="shopee_db",
+        user="postgres",
+        password="postgres123",
+        connect_timeout=4
+    )
+
+
 def query_shopee_db_images(item_ids: list[str], market: str = "PH") -> dict[str, str]:
     """Truy vấn trực tiếp link ảnh sản phẩm từ PostgreSQL shopee_products theo ItemID."""
     results = {}
     try:
-        import psycopg2
         import psycopg2.extras
-        conn = psycopg2.connect(
-            host="100.79.170.67",
-            port=5432,
-            dbname="shopee_db",
-            user="postgres",
-            password="postgres123",
-            connect_timeout=4
-        )
+        conn = _shopee_db_connect()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         num_ids = [int(i) for i in item_ids if str(i).isdigit()]
         if num_ids:

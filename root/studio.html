@@ -3044,7 +3044,7 @@
     const sym = symMap[m] || "₱";
     countEl.innerText = `${shopeeClaimedProducts.length} SP`;
     const rows = shopeeClaimedProducts.map((p, idx) => {
-      const statusIcon = p._status === "completed" ? "✅" : (p._status === "processing" ? "🔄" : (p._status === "failed" ? "❌" : "⏳"));
+      const statusIcon = p._status === "completed" ? "✅" : (p._status === "processing" ? "🔄" : (p._status === "failed" ? "❌" : (p._status === "skipped" ? "⏭" : "⏳")));
       const sold = p.historical_sold ?? p.sold ?? 0;
       const comm = p.commission_rate ? (p.commission_rate * 100).toFixed(0) : (p.commission ?? "0");
       const price = p.price_min ?? p.price ?? 0;
@@ -3060,7 +3060,7 @@
         clipHint = ` <span style="background:rgba(251,191,36,0.2);color:#fbbf24;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(251,191,36,0.3);">[Có sẵn Clip B]</span>`;
       }
       const line = `${statusIcon} [${idx + 1}] ${isImportedBadge}ID: ${_escHtml(p.item_id)} | ${_escHtml(p.name || '')} | ${sym}${_escHtml(price)} | Sold: ${_escHtml(sold)} | Comm: ${_escHtml(comm)}%${clipHint}`;
-      return `<div style="margin-bottom:3px;${p._status === 'completed' ? 'color:#34d399;' : (p._status === 'failed' ? 'color:#f87171;' : '')}">${line}</div>`;
+      return `<div style="margin-bottom:3px;${p._status === 'completed' ? 'color:#34d399;' : (p._status === 'failed' ? 'color:#f87171;' : (p._status === 'skipped' ? 'color:#64748b;' : ''))}">${line}</div>`;
     });
 
     const sameShape = rows.length === _shopeeConsoleRowsHtml.length && consoleEl.childElementCount === rows.length;
@@ -3381,8 +3381,25 @@
     return promptRes.json();
   }
 
+  // Server Shopee giao lại SP giữ quá lâu cho máy khác -> hỏi Database xem SP còn là của máy này không.
+  // Trả về {skip, reason}; lỗi mạng thì không chặn.
+  async function checkShopeeJobOwnership(prod) {
+    if (prod._is_imported) return { skip: false };
+    try {
+      const res = await fetch("/api/shopee/job-status", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ item_id: prod.item_id })
+      });
+      if (res.ok) return await res.json();
+    } catch (_) {}
+    return { skip: false };
+  }
+
   // Chạy nền: chuẩn bị dữ liệu cho sản phẩm sắp tới. Lỗi ở đây không làm hỏng SP — lúc render sẽ tự làm lại phần còn thiếu.
   async function prepareShopeeProduct(prod, form) {
+    const own = await checkShopeeJobOwnership(prod);
+    if (own.skip) return { skip: true, reason: own.reason };
     await fetchShopeeLinkInfo(prod, "Chuẩn bị trước");
     const prep = { name: prod.name, imgUrl: shopeeProductImageUrl(prod), dataUrl: null, promptData: null };
     if (prep.imgUrl) {
@@ -3406,7 +3423,7 @@
   }
 
   function startShopeePrefetch(prod, form) {
-    if (!prod || prod._status === "completed" || prod._status === "processing" || prod._prepPromise) return;
+    if (!prod || prod._status === "completed" || prod._status === "skipped" || prod._status === "processing" || prod._prepPromise) return;
     prod._prepPromise = prepareShopeeProduct(prod, form).catch(() => null);
   }
 
@@ -3422,10 +3439,17 @@
   }
 
   async function renderShopeeProductItem(prod, idx, form, outDir, workerId) {
-    appendShopeeLog(`----------------------------------------`);
-
     // Dữ liệu đã chuẩn bị sẵn trong lúc luồng render SP trước (nếu có)
     const prep = await takeShopeePrep(prod);
+
+    // SP đã completed hoặc đã được giao cho máy khác trên Database -> bỏ qua, không render trùng
+    const own = (prep && prep.skip) ? prep : await checkShopeeJobOwnership(prod);
+    if (own.skip) {
+      appendShopeeLog(`⏭ [Luồng ${workerId}] Bỏ qua SP ${prod.item_id}: ${own.reason}`);
+      return { skipped: true, reason: own.reason };
+    }
+
+    appendShopeeLog(`----------------------------------------`);
 
     // 0. Nếu là sản phẩm import từ TXT mà chưa có ảnh hoặc tên (chưa cào trước)
     await fetchShopeeLinkInfo(prod, `Luồng ${workerId}`);
@@ -3827,6 +3851,7 @@
     let nextIndex = 0;
     let completedCount = shopeeClaimedProducts.filter(p => p._status === "completed").length;
     let failedCount = 0;
+    let skippedCount = 0; // SP đã completed / thuộc máy khác trên Database -> bỏ qua
 
     if (completedCount >= shopeeClaimedProducts.length) {
       appendShopeeLog(`✓ TẤT CẢ ${shopeeClaimedProducts.length} SẢN PHẨM ĐÃ CÓ VIDEO HOÀN CHỈNH! Không cần tạo thêm.`);
@@ -3853,7 +3878,7 @@
         if (p && p._status === "processing") { if (p._finalizing) saving++; else rendering++; }
       }
       document.getElementById("batchProgressText").innerText =
-        `Đang chạy (${rendering} luồng${saving ? `, ${saving} đang lưu/ghép` : ""}) | Xong: ${completedCount}/${seqBase + shopeeClaimedProducts.length} | Lỗi: ${failedCount}`;
+        `Đang chạy (${rendering} luồng${saving ? `, ${saving} đang lưu/ghép` : ""}) | Xong: ${completedCount}/${seqBase + shopeeClaimedProducts.length} | Lỗi: ${failedCount}${skippedCount ? ` | Bỏ qua (máy khác/đã xong): ${skippedCount}` : ""}`;
     }
 
     updateProgressText();
@@ -3862,7 +3887,7 @@
       let n = 0;
       for (let i = nextIndex; i < shopeeClaimedProducts.length; i++) {
         const p = shopeeClaimedProducts[i];
-        if (p && p._status !== "completed") n++;
+        if (p && p._status !== "completed" && p._status !== "skipped") n++;
       }
       return n;
     }
@@ -3873,7 +3898,7 @@
       let removed = 0;
       for (let i = 0; i < nextIndex; i++) {
         const p = shopeeClaimedProducts[i];
-        if (!p || p._status === "completed" || p._status === "failed") removed++;
+        if (!p || p._status === "completed" || p._status === "failed" || p._status === "skipped") removed++;
         else keep.push(p);
       }
       if (!removed) return;
@@ -3986,7 +4011,7 @@
       let slots = SHOPEE_PREFETCH_AHEAD;
       for (let i = nextIndex; i < shopeeClaimedProducts.length && slots > 0; i++) {
         const p = shopeeClaimedProducts[i];
-        if (!p || p._status === "completed") continue;
+        if (!p || p._status === "completed" || p._status === "skipped") continue;
         startShopeePrefetch(p, form);
         slots--;
       }
@@ -4002,7 +4027,7 @@
         }
         const currentIdx = nextIndex++;
         const prod = shopeeClaimedProducts[currentIdx];
-        if (!prod || prod._status === "completed") continue;
+        if (!prod || prod._status === "completed" || prod._status === "skipped") continue;
 
         prod._status = "processing";
         renderShopeeProductsConsole();
@@ -4012,7 +4037,11 @@
 
         try {
           const finalize = await renderShopeeProductItem(prod, seqBase + currentIdx, form, outDir, workerId);
-          if (typeof finalize === "function") {
+          if (finalize && finalize.skipped) {
+            // Không báo gì về Database: SP đã xong hoặc đang là việc của máy khác
+            prod._status = "skipped";
+            skippedCount++;
+          } else if (typeof finalize === "function") {
             if (pendingFinalize) await pendingFinalize;
             prod._finalizing = true;
             pendingFinalize = (async () => {
@@ -4060,8 +4089,8 @@
     btnStopFinal.style.background = "";
     btnStopFinal.style.borderColor = "";
     document.getElementById("btnClaimShopee").disabled = false;
-    document.getElementById("batchProgressText").innerText = `Hoàn tất batch: ${completedCount} thành công, ${failedCount} lỗi`;
-    appendShopeeLog(`🎉 KẾT THÚC BATCH: ${completedCount} thành công, ${failedCount} lỗi.`);
+    document.getElementById("batchProgressText").innerText = `Hoàn tất batch: ${completedCount} thành công, ${failedCount} lỗi, ${skippedCount} bỏ qua`;
+    appendShopeeLog(`🎉 KẾT THÚC BATCH: ${completedCount} thành công, ${failedCount} lỗi, ${skippedCount} bỏ qua (máy khác/đã xong).`);
     showToast(`Đã hoàn tất tiến trình Batch! (${completedCount} thành công, ${failedCount} lỗi)`, "success");
     loadGallery();
   }

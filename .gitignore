@@ -87,3 +87,6 @@ root/data/stuck_debug/
 
 # Anh tam khi ghep Outro 12s
 root/data/temp_outro_*
+
+# File tam luc ghi du lieu
+root/data/*.tmp
