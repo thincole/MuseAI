@@ -35,6 +35,11 @@ if sys.platform == "win32":
         pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Lấy mã OTP trên DongVanFB: số lần đọc hòm thư và số giây chờ giữa 2 lần (trang đôi khi phải đọc lại mới có thư)
+OTP_READ_ATTEMPTS = 10
+OTP_READ_INTERVAL = 5
+
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
@@ -190,6 +195,39 @@ class LoginWorker(threading.Thread):
                 pass
             self.controller.log(f"[Luồng {self.worker_id}] Đã đóng trình duyệt.")
 
+    @staticmethod
+    def _find_dongvan_otp(dongvan_tab, email: str) -> str | None:
+        """Dò bảng hòm thư DongVanFB: trả về mã OTP 6 số của thư mới (hôm nay) gửi cho đúng email, không có thì None."""
+        rows = dongvan_tab.run_js("""
+            let trs = Array.from(document.querySelectorAll('table tr'));
+            return trs.map(r => Array.from(r.querySelectorAll('th, td')).map(c => c.innerText.trim()));
+        """)
+        if not rows or len(rows) <= 1:
+            return None
+        for row in rows[1:]:
+            # Bỏ qua dòng đang tải dữ liệu
+            if len(row) > 2 and row[2] == '...':
+                continue
+            # Bỏ qua nếu dòng này không thuộc về tài khoản hiện tại
+            if len(row) > 0 and email.lower() not in row[0].lower():
+                continue
+
+            row_text = " ".join(row)
+            time_col = row[3] if len(row) > 3 else ""
+            # Kiểm tra xem thư này có phải thư mới nhận hôm nay hay không
+            if not is_recent_dongvan_time(time_col):
+                continue
+
+            m = re.search(r'(?:use\s+code|login\s+code|mã\s+xác\s+nhận|code)\s*[:\-]?\s*(\d{6})', row_text, re.IGNORECASE)
+            if not m:
+                if len(row) >= 6 and re.search(r'^\d{6}', row[5]):
+                    m = re.search(r'(\d{6})', row[5])
+                elif re.search(r'\b\d{6}\b', row_text):
+                    m = re.search(r'\b\d{6}\b', row_text)
+            if m:
+                return m.group(1)
+        return None
+
     def process_single_account(self, page: ChromiumPage, dongvan_tab, row_idx: int, acc_line: str, email: str):
         if not self.controller.is_running:
             return
@@ -283,53 +321,30 @@ class LoginWorker(threading.Thread):
             if (btn) btn.click();
         """, acc_line)
 
+        # DongVanFB đôi khi phải đọc lại vài lần mới thấy thư OTP -> thử tối đa OTP_READ_ATTEMPTS lần,
+        # mỗi lần bấm "Đọc hòm thư" rồi chờ OTP_READ_INTERVAL giây (vẫn dò bảng mỗi giây, thấy mã là dừng ngay).
         otp_code = None
-        start_t = time.time()
-        last_refresh = time.time()
-
-        while time.time() - start_t < 60 and self.controller.is_running:
-            time.sleep(1)
-            rows = dongvan_tab.run_js("""
-                let trs = Array.from(document.querySelectorAll('table tr'));
-                return trs.map(r => Array.from(r.querySelectorAll('th, td')).map(c => c.innerText.trim()));
-            """)
-            if rows and len(rows) > 1:
-                for row in rows[1:]:
-                    # Bỏ qua dòng đang tải dữ liệu
-                    if len(row) > 2 and row[2] == '...':
-                        continue
-                    # Bỏ qua nếu dòng này không thuộc về tài khoản hiện tại
-                    if len(row) > 0 and email.lower() not in row[0].lower():
-                        continue
-
-                    row_text = " ".join(row)
-                    time_col = row[3] if len(row) > 3 else ""
-                    # Kiểm tra xem thư này có phải thư mới nhận hôm nay hay không
-                    if not is_recent_dongvan_time(time_col):
-                        continue
-
-                    m = re.search(r'(?:use\s+code|login\s+code|mã\s+xác\s+nhận|code)\s*[:\-]?\s*(\d{6})', row_text, re.IGNORECASE)
-                    if not m:
-                        if len(row) >= 6 and re.search(r'^\d{6}', row[5]):
-                            m = re.search(r'(\d{6})', row[5])
-                        elif re.search(r'\b\d{6}\b', row_text):
-                            m = re.search(r'\b\d{6}\b', row_text)
-                    if m:
-                        otp_code = m.group(1)
-                        break
-            if otp_code:
+        for attempt in range(1, OTP_READ_ATTEMPTS + 1):
+            if not self.controller.is_running:
                 break
-
-            # Bấm lại Đọc hòm thư mỗi 7 giây để cập nhật
-            if time.time() - last_refresh > 7:
-                last_refresh = time.time()
+            if attempt > 1:
                 dongvan_tab.run_js("""
                     let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
                     if (btn) btn.click();
                 """)
+            self.controller.update_status(row_idx, f"Đang lấy OTP DongVanFB (lần {attempt}/{OTP_READ_ATTEMPTS})...", "#fbbf24")
+            deadline = time.time() + OTP_READ_INTERVAL
+            while time.time() < deadline and self.controller.is_running:
+                time.sleep(1)
+                otp_code = self._find_dongvan_otp(dongvan_tab, email)
+                if otp_code:
+                    break
+            if otp_code:
+                break
+            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chưa thấy mã OTP (lần {attempt}/{OTP_READ_ATTEMPTS}), đọc lại hòm thư...")
 
         if not otp_code:
-            self.controller.update_status(row_idx, "Hết giờ chờ OTP", "#ef4444")
+            self.controller.update_status(row_idx, f"Không lấy được OTP sau {OTP_READ_ATTEMPTS} lần", "#ef4444")
             self.controller.record_result(False)
             return
 
