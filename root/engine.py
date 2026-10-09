@@ -1446,7 +1446,8 @@ class MuseEngine:
                 return "", "image/png"
             try:
                 req = urllib.request.Request(img, headers={"User-Agent": "Mozilla/5.0"})
-                opener = urllib.request.build_opener(_SafeRedirectHandler)
+                import ssl_ctx  # thêm bộ CA certifi: máy có kho chứng chỉ Windows thiếu gốc vẫn tải được ảnh
+                opener = urllib.request.build_opener(_SafeRedirectHandler, ssl_ctx.https_handler())
                 with opener.open(req, timeout=20) as resp:
                     mime = resp.headers.get_content_type() or "image/png"
                     if not mime.startswith("image/"):

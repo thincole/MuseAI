@@ -22,6 +22,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
+import ssl_ctx
 from config import CFG
 
 log = logging.getLogger("shopee_engine")
@@ -904,7 +905,7 @@ def call_seed_api(server_url: str, api_key: str, method: str, path: str, data: d
     else:
         body = json.dumps(data or {}).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx.SSL_CONTEXT) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -1113,7 +1114,8 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_IMAGE_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
+# https_handler: thêm bộ CA certifi — máy có kho chứng chỉ Windows thiếu gốc vẫn tải được ảnh Shopee
+_IMAGE_OPENER = urllib.request.build_opener(_SafeRedirectHandler(), ssl_ctx.https_handler())
 
 
 def _read_capped(resp, cap: int = MAX_IMAGE_BYTES) -> bytes:
