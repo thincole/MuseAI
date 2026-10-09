@@ -1151,6 +1151,7 @@ def download_image_as_data_url(image_url: str, retries: int = 3) -> str | None:
     if not image_url:
         return None
     _validate_public_http_url(image_url)
+    last_err: Exception | None = None
     for attempt in range(retries):
         try:
             data, content_type = _fetch_image_bytes(image_url, timeout=15, require_image_type=True)
@@ -1160,9 +1161,12 @@ def download_image_as_data_url(image_url: str, retries: int = 3) -> str | None:
         except ValueError:
             raise
         except Exception as e:
+            last_err = e
             log.debug("Tải ảnh thất bại (lần %d/%d) %s: %s", attempt + 1, retries, image_url, e)
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
+    # Ghi rõ lý do (trước đây chỉ ở mức debug -> máy tải ảnh hỏng hàng loạt mà log không có gì để tra)
+    log.warning("⚠️ Không tải được ảnh SP sau %d lần: %s -> %s", retries, image_url, last_err)
     return None
 
 
@@ -1173,6 +1177,7 @@ def download_image_to_file(image_url: str, target_path: str, retries: int = 3) -
         return False
     _validate_public_http_url(image_url)
     os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+    last_err: Exception | None = None
     for attempt in range(retries):
         try:
             data, _ctype = _fetch_image_bytes(image_url, timeout=15, require_image_type=False)
@@ -1183,9 +1188,11 @@ def download_image_to_file(image_url: str, target_path: str, retries: int = 3) -
         except ValueError:
             raise
         except Exception as e:
+            last_err = e
             log.debug("Tải ảnh ra file thất bại (lần %d/%d) %s: %s", attempt + 1, retries, image_url, e)
             if attempt < retries - 1:
                 time.sleep(1.0 * (attempt + 1))
+    log.warning("⚠️ Không tải được ảnh SP ra file sau %d lần: %s -> %s", retries, image_url, last_err)
     return False
 
 

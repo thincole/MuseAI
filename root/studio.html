@@ -3588,20 +3588,34 @@
       appendShopeeLog(`⚡ [Luồng ${workerId}] Dùng ảnh SP đã tải sẵn.`);
     } else if (imgUrl) {
       appendShopeeLog(`> [Luồng ${workerId}] Đang tải ảnh SP từ Shopee CDN...`);
-      try {
-        const imgRes = await fetch("/api/shopee/download-image", {
-          method: "POST",
-          headers: getHeaders(),
-          body: JSON.stringify({ image_url: imgUrl })
-        });
-        if (imgRes.ok) {
-          const imgData = await imgRes.json();
-          refImageDataUrl = imgData.data_url;
-          appendShopeeLog(`✓ [Luồng ${workerId}] Tải ảnh thành công.`);
+      for (let attempt = 1; attempt <= 2 && !refImageDataUrl; attempt++) {
+        if (attempt > 1) await new Promise(r => setTimeout(r, 2000));
+        try {
+          const imgRes = await fetch("/api/shopee/download-image", {
+            method: "POST",
+            headers: getHeaders(),
+            body: JSON.stringify({ image_url: imgUrl })
+          });
+          const imgData = await readJsonSafe(imgRes);
+          if (imgRes.ok && imgData.data_url) {
+            refImageDataUrl = imgData.data_url;
+            appendShopeeLog(`✓ [Luồng ${workerId}] Tải ảnh thành công.`);
+          } else {
+            appendShopeeLog(`⚠️ [Luồng ${workerId}] Tải ảnh SP lỗi (lần ${attempt}): ${imgData.detail || imgData.message || `HTTP ${imgRes.status}`}`);
+          }
+        } catch (ie) {
+          appendShopeeLog(`⚠️ [Luồng ${workerId}] Lỗi tải ảnh (lần ${attempt}): ${ie.message}`);
         }
-      } catch (ie) {
-        appendShopeeLog(`⚠️ [Luồng ${workerId}] Lỗi tải ảnh: ${ie.message}`);
       }
+    }
+
+    // KHÔNG có ảnh sản phẩm -> không gửi sang Muse: video làm từ chữ sẽ không giống sản phẩm và không ghép được
+    // Outro 12s (09/10: một máy không tải được ảnh Shopee đã âm thầm làm ~1000 video như vậy).
+    // Không báo gì về Database; nhiều SP liên tiếp không có ảnh thì workerLoop tự dừng batch.
+    if (!refImageDataUrl) {
+      const why = imgUrl ? "không tải được ảnh sản phẩm" : "SP không có link ảnh";
+      appendShopeeLog(`⛔ [Luồng ${workerId}] Bỏ qua SP ${prod.item_id}: ${why} -> KHÔNG render (tránh video không đúng sản phẩm)`);
+      return { skipped: true, noImage: true, reason: why };
     }
 
     const promptData = (prep && prep.promptData && prep.name === prod.name)
@@ -3863,7 +3877,10 @@
     let nextIndex = 0;
     let completedCount = shopeeClaimedProducts.filter(p => p._status === "completed").length;
     let failedCount = 0;
-    let skippedCount = 0; // SP đã completed / thuộc máy khác trên Database -> bỏ qua
+    let skippedCount = 0; // SP đã completed / thuộc máy khác trên Database / không có ảnh -> bỏ qua
+    // Nhiều SP liên tiếp không tải được ảnh = lỗi của cả máy (mạng/proxy) chứ không phải từng SP -> tự dừng batch
+    const NO_IMAGE_STOP_AFTER = 5;
+    let noImageStreak = 0;
 
     if (completedCount >= shopeeClaimedProducts.length) {
       appendShopeeLog(`✓ TẤT CẢ ${shopeeClaimedProducts.length} SẢN PHẨM ĐÃ CÓ VIDEO HOÀN CHỈNH! Không cần tạo thêm.`);
@@ -3890,7 +3907,7 @@
         if (p && p._status === "processing") { if (p._finalizing) saving++; else rendering++; }
       }
       document.getElementById("batchProgressText").innerText =
-        `Đang chạy (${rendering} luồng${saving ? `, ${saving} đang lưu/ghép` : ""}) | Xong: ${completedCount}/${seqBase + shopeeClaimedProducts.length} | Lỗi: ${failedCount}${skippedCount ? ` | Bỏ qua (máy khác/đã xong): ${skippedCount}` : ""}`;
+        `Đang chạy (${rendering} luồng${saving ? `, ${saving} đang lưu/ghép` : ""}) | Xong: ${completedCount}/${seqBase + shopeeClaimedProducts.length} | Lỗi: ${failedCount}${skippedCount ? ` | Bỏ qua (máy khác/đã xong/không ảnh): ${skippedCount}` : ""}`;
     }
 
     updateProgressText();
@@ -4050,10 +4067,20 @@
         try {
           const finalize = await renderShopeeProductItem(prod, seqBase + currentIdx, form, outDir, workerId);
           if (finalize && finalize.skipped) {
-            // Không báo gì về Database: SP đã xong hoặc đang là việc của máy khác
+            // Không báo gì về Database: SP đã xong, đang là việc của máy khác, hoặc không có ảnh sản phẩm
             prod._status = "skipped";
             skippedCount++;
+            if (finalize.noImage) {
+              noImageStreak++;
+              if (noImageStreak >= NO_IMAGE_STOP_AFTER && !shopeeStopRequested) {
+                appendShopeeLog(`⛔⛔ DỪNG BATCH: ${noImageStreak} SP liên tiếp không tải được ảnh sản phẩm -> máy này đang lỗi mạng/proxy khi tải ảnh Shopee. ` +
+                  `Chạy "python tools\\check_image_download.py" trong thư mục root để kiểm tra, sửa xong mới chạy lại.`);
+                showToast(`Đã tự dừng: ${noImageStreak} SP liên tiếp không tải được ảnh Shopee. Kiểm tra mạng/proxy của máy này!`, "danger");
+                stopShopeeBatch();
+              }
+            }
           } else if (typeof finalize === "function") {
+            noImageStreak = 0;
             if (pendingFinalize) await pendingFinalize;
             prod._finalizing = true;
             pendingFinalize = (async () => {
@@ -4102,7 +4129,7 @@
     btnStopFinal.style.borderColor = "";
     document.getElementById("btnClaimShopee").disabled = false;
     document.getElementById("batchProgressText").innerText = `Hoàn tất batch: ${completedCount} thành công, ${failedCount} lỗi, ${skippedCount} bỏ qua`;
-    appendShopeeLog(`🎉 KẾT THÚC BATCH: ${completedCount} thành công, ${failedCount} lỗi, ${skippedCount} bỏ qua (máy khác/đã xong).`);
+    appendShopeeLog(`🎉 KẾT THÚC BATCH: ${completedCount} thành công, ${failedCount} lỗi, ${skippedCount} bỏ qua (máy khác/đã xong/không ảnh).`);
     showToast(`Đã hoàn tất tiến trình Batch! (${completedCount} thành công, ${failedCount} lỗi)`, "success");
     loadGallery();
   }
