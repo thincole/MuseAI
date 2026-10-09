@@ -1254,7 +1254,7 @@
             </div>
             <div style="display:flex;gap:8px;">
               <button class="btn-header" id="btnToggleProxyModeAcc" onclick="toggleProxyMode()" style="background:rgba(59,130,246,0.15);border:1px solid #3b82f6;color:#60a5fa;" title="Bật hoặc Tắt Fake Proxy / HomeProxy">
-                🌐 Proxy: BẬT
+                🌐 Proxy: đang kiểm tra...
               </button>
               <button class="btn-header" onclick="syncThinAptmProxy()" style="background:rgba(59,130,246,0.15);border:1px solid #3b82f6;color:#60a5fa;" title="Tự động nạp danh sách HomeProxy từ E:\ThinAptm0707 và gán cố định cho từng tài khoản">
                 🌐 Nạp Proxy ThinAptm
@@ -1368,7 +1368,7 @@
             </div>
             <div style="display:flex; gap:8px; align-items:center;">
               <button type="button" class="shopee-btn" id="btnToggleProxyMode" onclick="event.stopPropagation(); toggleProxyMode();" style="background:#2563eb; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;" title="Bấm để bật hoặc tắt Fake Proxy / HomeProxy">
-                🌐 Proxy: BẬT
+                🌐 Proxy: đang kiểm tra...
               </button>
               <button type="button" class="shopee-btn" onclick="event.stopPropagation(); syncThinAptmProxy();" style="background:#0f766e; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;">
                 🌐 Nạp Proxy ThinAptm
@@ -1912,6 +1912,7 @@
     await loadGallery();
     await loadShopeeSettings();
     initBrowserProtectionCollapse();
+    fetchBrowserTtlStatus(); // gồm cả trạng thái Proxy thật -> nút Proxy không hiện sai lúc mới mở
 
     // Setup paste listener for clipboard image
     window.addEventListener("paste", handlePasteEvent);
@@ -4462,7 +4463,7 @@
     }
   }
 
-  let isProxyEnabled = true;
+  let isProxyEnabled = null; // null = chưa đọc được trạng thái thật từ backend
 
   async function fetchProxyStatus() {
     try {
@@ -4526,8 +4527,13 @@
   }
 
   async function toggleProxyMode() {
-    const nextState = !isProxyEnabled;
-    await changeProxyMode(nextState ? "enabled" : "disabled");
+    // Luôn đọc trạng thái thật từ backend trước khi đảo (nút có thể đang hiện trạng thái cũ)
+    await fetchProxyStatus();
+    if (isProxyEnabled === null) {
+      showToast("Chưa đọc được trạng thái Proxy từ máy chủ, vui lòng thử lại sau giây lát", "warning");
+      return;
+    }
+    await changeProxyMode(isProxyEnabled ? "disabled" : "enabled");
   }
 
   async function changeProxyMode(val) {

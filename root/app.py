@@ -3118,11 +3118,14 @@ def toggle_proxy_mode(req: dict):
     import proxy_manager
     enabled = bool(req.get("enabled", True))
     ok = proxy_manager.set_proxy_enabled(enabled)
-    # Tái sinh session pool nếu tắt proxy để các phiên mới mở trực tiếp
+    # Đóng các phiên trình duyệt đang mở theo chế độ cũ để phiên mới mở đúng chế độ proxy:
+    # phiên rảnh đóng ngay, phiên đang render được đóng khi render xong (không cắt ngang video).
     try:
-        engine.recycle_sessions()
-    except Exception:
-        pass
+        engine.close_all_sessions()
+        log.info("♻️ [Proxy Manager] Đã làm mới toàn bộ phiên trình duyệt theo chế độ Proxy mới (%s)",
+                 "BẬT" if proxy_manager.is_proxy_enabled() else "TẮT")
+    except Exception as exc:
+        log.warning("Không làm mới được phiên trình duyệt sau khi đổi chế độ Proxy: %s", exc)
     return {
         "success": ok,
         "enabled": proxy_manager.is_proxy_enabled(),

@@ -2036,9 +2036,15 @@ class MuseWorkerSession:
         if self.account_id:
             try:
                 import proxy_manager
-                p = proxy_manager.ensure_alive_proxy_for_account(self.account_id)
-                if p and self.proxy_str and p != self.proxy_str:
-                    return True
+                if not proxy_manager.is_proxy_enabled():
+                    # Đã TẮT proxy mà phiên vẫn đi qua proxy -> mở lại phiên chạy trực tiếp
+                    if self.proxy_str:
+                        return True
+                else:
+                    # Đã BẬT proxy (phiên đang chạy trực tiếp) hoặc proxy của TK đã đổi -> mở lại qua proxy đúng
+                    p = proxy_manager.ensure_alive_proxy_for_account(self.account_id)
+                    if p and p != self.proxy_str:
+                        return True
             except Exception:
                 pass
         return False
