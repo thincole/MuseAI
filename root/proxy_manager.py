@@ -3,6 +3,7 @@ gán mỗi tài khoản 1 proxy cố định (Sticky Proxy), tự động kiểm
 """
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import logging
@@ -10,6 +11,8 @@ import os
 import random
 import re
 import socket
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -133,112 +136,166 @@ def test_proxy(proxy_str: str, timeout: float = 6.0) -> tuple[bool, str]:
         return False, str(e)[:60]
 
 
+FORWARDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_forwarder.py")
+_forwarder_procs: dict[str, subprocess.Popen] = {}
+
+
 def start_local_forwarder(proxy_str: str) -> int:
-    """Khởi chạy một forwarder TCP siêu nhẹ trên 127.0.0.1 để nạp Basic Auth tự động cho Chrome CDP."""
+    """Forwarder 127.0.0.1 tự chèn Basic Auth cho Chrome (Chrome không tự đăng nhập proxy user/pass).
+
+    Mỗi proxy chạy 1 tiến trình asyncio riêng (proxy_forwarder.py): toàn bộ lưu lượng của các trình duyệt
+    không còn đi qua luồng Python trong app (trước đây ~2 luồng/kết nối giành GIL làm cả app chậm).
+    Không chạy được tiến trình riêng -> dùng forwarder luồng trong app như cũ."""
     p = parse_proxy_str(proxy_str)
     if not p:
         raise ValueError(f"Proxy không hợp lệ: {proxy_str}")
 
     clean_key = f"{p['host']}:{p['port']}:{p['user']}:{p['pass']}"
     with _forwarder_lock:
-        if clean_key in _forwarders:
+        proc = _forwarder_procs.get(clean_key)
+        if clean_key in _forwarders and (proc is None or proc.poll() is None):
             return _forwarders[clean_key]
+        if proc is not None:
+            log.warning("🔌 Forwarder tiến trình của %s:%s đã dừng (mã %s) -> khởi động lại",
+                        p["host"], p["port"], proc.poll())
+            _forwarder_procs.pop(clean_key, None)
+            _forwarders.pop(clean_key, None)
+        try:
+            local_port = _spawn_forwarder_process(clean_key, p)
+            log.info("🔌 Khởi động Proxy Forwarder (tiến trình riêng) 127.0.0.1:%d -> %s:%d",
+                     local_port, p["host"], p["port"])
+            return local_port
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Không chạy được forwarder tiến trình riêng (%s) -> dùng forwarder trong app", exc)
+            return _start_inprocess_forwarder(clean_key, p)
 
-        remote_host = p["host"]
-        remote_port = p["port"]
-        username = p["user"]
-        password = p["pass"]
-        auth_b64 = base64.b64encode(f"{username}:{password}".encode()).decode() if (username and password) else ""
 
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.bind(("127.0.0.1", 0))
-        server.listen(100)
-        local_port = server.getsockname()[1]
+def _spawn_forwarder_process(clean_key: str, p: dict) -> int:
+    """Gọi trong _forwarder_lock. Trả về cổng local của tiến trình forwarder vừa chạy."""
+    if not os.path.isfile(FORWARDER_SCRIPT):
+        raise FileNotFoundError(FORWARDER_SCRIPT)
+    flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+    proc = subprocess.Popen([sys.executable, "-u", FORWARDER_SCRIPT], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=flags)
+    try:
+        cfg = {"host": p["host"], "port": int(p["port"]), "user": p["user"] or "", "pass": p["pass"] or ""}
+        proc.stdin.write((json.dumps(cfg) + "\n").encode())
+        proc.stdin.flush()
+        result: list[bytes] = []
+        reader = threading.Thread(target=lambda: result.append(proc.stdout.readline()), daemon=True)
+        reader.start()
+        reader.join(15)
+        line = (result[0] if result else b"").decode(errors="replace").strip()
+        if not line.startswith("PORT "):
+            raise RuntimeError(f"forwarder không báo cổng (nhận: {line!r})")
+        local_port = int(line.split()[1])
+    except BaseException:
+        proc.kill()
+        raise
+    _forwarder_procs[clean_key] = proc
+    _forwarders[clean_key] = local_port
+    return local_port
 
-        def handle_client(client_sock):
-            try:
-                req = client_sock.recv(4096)
-                if not req:
+
+def _start_inprocess_forwarder(clean_key: str, p: dict) -> int:
+    """Forwarder dự phòng bằng luồng Python trong app (cách cũ). Gọi trong _forwarder_lock."""
+    if clean_key in _forwarders:
+        return _forwarders[clean_key]
+    remote_host = p["host"]
+    remote_port = p["port"]
+    username = p["user"]
+    password = p["pass"]
+    auth_b64 = base64.b64encode(f"{username}:{password}".encode()).decode() if (username and password) else ""
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(100)
+    local_port = server.getsockname()[1]
+
+    def handle_client(client_sock):
+        try:
+            req = client_sock.recv(4096)
+            if not req:
+                client_sock.close()
+                return
+            first_line = req.split(b"\r\n")[0]
+            words = first_line.split()
+            if len(words) < 2:
+                client_sock.close()
+                return
+            method = words[0].upper()
+            target = words[1].decode("latin1")
+
+            remote_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote_sock.settimeout(20)
+            remote_sock.connect((remote_host, remote_port))
+
+            if method == b"CONNECT":
+                connect_lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
+                if auth_b64:
+                    connect_lines.append(f"Proxy-Authorization: Basic {auth_b64}")
+                connect_lines.append("Proxy-Connection: Keep-Alive")
+                raw_req = "\r\n".join(connect_lines) + "\r\n\r\n"
+                remote_sock.sendall(raw_req.encode("latin1"))
+
+                resp = remote_sock.recv(4096)
+                if b"200" not in resp.split(b"\r\n")[0]:
                     client_sock.close()
+                    remote_sock.close()
                     return
-                first_line = req.split(b"\r\n")[0]
-                words = first_line.split()
-                if len(words) < 2:
-                    client_sock.close()
-                    return
-                method = words[0].upper()
-                target = words[1].decode("latin1")
-
-                remote_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                remote_sock.settimeout(20)
-                remote_sock.connect((remote_host, remote_port))
-
-                if method == b"CONNECT":
-                    connect_lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
-                    if auth_b64:
-                        connect_lines.append(f"Proxy-Authorization: Basic {auth_b64}")
-                    connect_lines.append("Proxy-Connection: Keep-Alive")
-                    raw_req = "\r\n".join(connect_lines) + "\r\n\r\n"
-                    remote_sock.sendall(raw_req.encode("latin1"))
-
-                    resp = remote_sock.recv(4096)
-                    if b"200" not in resp.split(b"\r\n")[0]:
-                        client_sock.close()
-                        remote_sock.close()
-                        return
-                    client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            else:
+                headers_end = req.find(b"\r\n\r\n")
+                if headers_end != -1 and auth_b64:
+                    auth_header = f"Proxy-Authorization: Basic {auth_b64}\r\n".encode("latin1")
+                    new_req = req[:headers_end + 2] + auth_header + req[headers_end + 2:]
+                    remote_sock.sendall(new_req)
                 else:
-                    headers_end = req.find(b"\r\n\r\n")
-                    if headers_end != -1 and auth_b64:
-                        auth_header = f"Proxy-Authorization: Basic {auth_b64}\r\n".encode("latin1")
-                        new_req = req[:headers_end + 2] + auth_header + req[headers_end + 2:]
-                        remote_sock.sendall(new_req)
-                    else:
-                        remote_sock.sendall(req)
+                    remote_sock.sendall(req)
 
-                # QUAN TRỌNG: Gỡ bỏ timeout sau khi bắt tay thành công để không làm đứt kết nối streaming/video
+            # QUAN TRỌNG: Gỡ bỏ timeout sau khi bắt tay thành công để không làm đứt kết nối streaming/video
+            try:
+                client_sock.settimeout(None)
+                remote_sock.settimeout(None)
+                client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                remote_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except Exception:
+                pass
+
+            def pipe(src, dst):
                 try:
-                    client_sock.settimeout(None)
-                    remote_sock.settimeout(None)
-                    client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                    remote_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    while True:
+                        data = src.recv(16384)
+                        if not data:
+                            break
+                        dst.sendall(data)
                 except Exception:
                     pass
+                finally:
+                    try: src.close()
+                    except: pass
+                    try: dst.close()
+                    except: pass
 
-                def pipe(src, dst):
-                    try:
-                        while True:
-                            data = src.recv(16384)
-                            if not data:
-                                break
-                            dst.sendall(data)
-                    except Exception:
-                        pass
-                    finally:
-                        try: src.close()
-                        except: pass
-                        try: dst.close()
-                        except: pass
+            threading.Thread(target=pipe, args=(client_sock, remote_sock), daemon=True).start()
+            threading.Thread(target=pipe, args=(remote_sock, client_sock), daemon=True).start()
+        except Exception:
+            try: client_sock.close()
+            except: pass
 
-                threading.Thread(target=pipe, args=(client_sock, remote_sock), daemon=True).start()
-                threading.Thread(target=pipe, args=(remote_sock, client_sock), daemon=True).start()
+    def listen_loop():
+        while True:
+            try:
+                sock, _ = server.accept()
+                threading.Thread(target=handle_client, args=(sock,), daemon=True).start()
             except Exception:
-                try: client_sock.close()
-                except: pass
+                break
 
-        def listen_loop():
-            while True:
-                try:
-                    sock, _ = server.accept()
-                    threading.Thread(target=handle_client, args=(sock,), daemon=True).start()
-                except Exception:
-                    break
-
-        threading.Thread(target=listen_loop, daemon=True).start()
-        _forwarders[clean_key] = local_port
-        _forwarder_servers.append(server)
-        log.info("🔌 Khởi động Local Proxy Forwarder 127.0.0.1:%d -> %s:%d", local_port, remote_host, remote_port)
-        return local_port
+    threading.Thread(target=listen_loop, daemon=True).start()
+    _forwarders[clean_key] = local_port
+    _forwarder_servers.append(server)
+    log.info("🔌 Khởi động Local Proxy Forwarder 127.0.0.1:%d -> %s:%d", local_port, remote_host, remote_port)
+    return local_port
 
 
 def stop_all_forwarders():
@@ -249,9 +306,27 @@ def stop_all_forwarders():
                 s.close()
             except Exception:
                 pass
+        for proc in _forwarder_procs.values():
+            try:
+                proc.kill()
+            except Exception:
+                pass
         _forwarder_servers.clear()
+        _forwarder_procs.clear()
         _forwarders.clear()
         log.info("🔌 Đã đóng toàn bộ Local Proxy Forwarders.")
+
+
+def _kill_forwarder_procs():
+    for proc in list(_forwarder_procs.values()):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+# Tiến trình con cũng tự thoát khi app đóng stdin; atexit để chắc chắn khi app thoát bình thường
+atexit.register(_kill_forwarder_procs)
 
 
 POOL_SOURCE_HOMEPROXY = "homeproxy_api"
