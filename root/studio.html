@@ -1648,6 +1648,11 @@
                 <span id="sp_threads_alive_hint" style="font-size:11px;font-weight:600;margin-left:4px;"></span>
               </div>
 
+              <label style="display:flex;align-items:center;gap:5px;font-size:12px;font-weight:700;color:#a78bfa;cursor:pointer;" title="Khi hàng đợi sắp hết, tự nhận thêm lô SP mới từ Database (cùng bộ lọc) để batch chạy liên tục không phải bấm Nhận SP">
+                <input type="checkbox" id="sp_auto_claim" checked onchange="saveShopeeSettings()">
+                🔄 Tự nhận thêm SP
+              </label>
+
               <span id="shopeeSpeedText" style="font-size:12.5px;color:#fbbf24;font-weight:700;display:none;background:rgba(251,191,36,0.1);padding:3px 8px;border-radius:6px;border:1px solid rgba(251,191,36,0.3);">⚡ -- video/phút</span>
               <span id="batchProgressText" style="font-size:12px;color:#34d399;font-weight:600;"></span>
 
@@ -2800,6 +2805,7 @@
       }
       if (data.del_img !== undefined) document.getElementById("sp_del_img").checked = !!data.del_img;
       if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
+      if (data.auto_claim !== undefined) document.getElementById("sp_auto_claim").checked = !!data.auto_claim;
       onShopeeDurationChange();
       updateTempStitchButtonStatus();
     } catch (e) {
@@ -2861,6 +2867,7 @@
       ai_prompt: document.getElementById("sp_ai_prompt").value,
       del_img: document.getElementById("sp_del_img").checked,
       ghep_anh: document.getElementById("sp_ghep_anh").checked,
+      auto_claim: !!document.getElementById("sp_auto_claim")?.checked,
       naming: document.getElementById("sp_naming").value,
       out_dir: document.getElementById("sp_out_dir").value.trim(),
       limit: parseInt(document.getElementById("sp_limit").value) || 2000,
@@ -3322,36 +3329,107 @@
     throw new Error("Hết thời gian chờ render clip video (đã chờ quá 10 phút)");
   }
 
+  // Số sản phẩm kế tiếp trong hàng đợi được chuẩn bị sẵn (cào link TXT, tải ảnh, tạo prompt) trong lúc các luồng đang render
+  const SHOPEE_PREFETCH_AHEAD = 3;
+
+  function shopeeProductImageUrl(prod) {
+    return prod.image_url || prod.image || (prod.images && prod.images[0]) || "";
+  }
+
+  // Sản phẩm import từ TXT mà chưa có ảnh hoặc tên (chưa cào trước)
+  async function fetchShopeeLinkInfo(prod, who) {
+    if (!(prod._need_fetch || (!prod.image && prod.url))) return;
+    appendShopeeLog(`> [${who}] Đang cào thông tin & ảnh từ Shopee URL: ${prod.url}...`);
+    try {
+      const fetchRes = await fetch("/api/shopee/fetch-single-link", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ url: prod.url })
+      });
+      if (fetchRes.ok) {
+        const fd = await fetchRes.json();
+        if (fd.product) {
+          prod.name = fd.product.name || prod.name;
+          prod.image = fd.product.image || prod.image;
+          prod.images = fd.product.images || (prod.image ? [prod.image] : []);
+          prod.item_id = fd.product.item_id || prod.item_id;
+          delete prod._need_fetch;
+          renderShopeeProductsConsole();
+          appendShopeeLog(`✓ [${who}] Lấy dữ liệu thành công: "${prod.name}" (ID: ${prod.item_id})`);
+        }
+      }
+    } catch (fe) {
+      appendShopeeLog(`⚠️ [${who}] Lỗi cào dữ liệu Shopee: ${fe.message}`);
+    }
+  }
+
+  async function fetchShopeePrompt(prod, form) {
+    const promptRes = await fetch("/api/shopee/test-prompt", {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify({
+        product_name: prod.name || "Product",
+        lang: form.lang,
+        market: form.market,
+        review_style: form.review_style,
+        duration: form.duration,
+        ai_prompt: form.ai_prompt,
+        scene: form.scene
+      })
+    });
+    return promptRes.json();
+  }
+
+  // Chạy nền: chuẩn bị dữ liệu cho sản phẩm sắp tới. Lỗi ở đây không làm hỏng SP — lúc render sẽ tự làm lại phần còn thiếu.
+  async function prepareShopeeProduct(prod, form) {
+    await fetchShopeeLinkInfo(prod, "Chuẩn bị trước");
+    const prep = { name: prod.name, imgUrl: shopeeProductImageUrl(prod), dataUrl: null, promptData: null };
+    if (prep.imgUrl) {
+      try {
+        const imgRes = await fetch("/api/shopee/download-image", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({ image_url: prep.imgUrl })
+        });
+        if (imgRes.ok) prep.dataUrl = (await imgRes.json()).data_url || null;
+      } catch (_) {}
+    }
+    try {
+      const pd = await fetchShopeePrompt(prod, form);
+      if (pd && (pd.prompt || (pd.prompts && pd.prompts.length))) prep.promptData = pd;
+    } catch (_) {}
+    if (prep.dataUrl || prep.promptData) {
+      appendShopeeLog(`📦 [Chuẩn bị trước] SP ${prod.item_id}: ${prep.dataUrl ? "ảnh ✓" : "ảnh ✗"} | ${prep.promptData ? "prompt ✓" : "prompt ✗"}`);
+    }
+    return prep;
+  }
+
+  function startShopeePrefetch(prod, form) {
+    if (!prod || prod._status === "completed" || prod._status === "processing" || prod._prepPromise) return;
+    prod._prepPromise = prepareShopeeProduct(prod, form).catch(() => null);
+  }
+
+  async function takeShopeePrep(prod) {
+    const p = prod._prepPromise;
+    delete prod._prepPromise;
+    if (!p) return null;
+    try { return await p; } catch (_) { return null; }
+  }
+
+  function clearShopeePrefetch() {
+    (shopeeClaimedProducts || []).forEach(p => { if (p) delete p._prepPromise; });
+  }
+
   async function renderShopeeProductItem(prod, idx, form, outDir, workerId) {
     appendShopeeLog(`----------------------------------------`);
 
-    // 0. Nếu là sản phẩm import từ TXT mà chưa có ảnh hoặc tên (chưa cào trước)
-    if (prod._need_fetch || (!prod.image && prod.url)) {
-      appendShopeeLog(`> [Luồng ${workerId}] Đang cào thông tin & ảnh từ Shopee URL: ${prod.url}...`);
-      try {
-        const fetchRes = await fetch("/api/shopee/fetch-single-link", {
-          method: "POST",
-          headers: getHeaders(),
-          body: JSON.stringify({ url: prod.url })
-        });
-        if (fetchRes.ok) {
-          const fd = await fetchRes.json();
-          if (fd.product) {
-            prod.name = fd.product.name || prod.name;
-            prod.image = fd.product.image || prod.image;
-            prod.images = fd.product.images || (prod.image ? [prod.image] : []);
-            prod.item_id = fd.product.item_id || prod.item_id;
-            delete prod._need_fetch;
-            renderShopeeProductsConsole();
-            appendShopeeLog(`✓ [Luồng ${workerId}] Lấy dữ liệu thành công: "${prod.name}" (ID: ${prod.item_id})`);
-          }
-        }
-      } catch (fe) {
-        appendShopeeLog(`⚠️ [Luồng ${workerId}] Lỗi cào dữ liệu Shopee: ${fe.message}`);
-      }
-    }
+    // Dữ liệu đã chuẩn bị sẵn trong lúc luồng render SP trước (nếu có)
+    const prep = await takeShopeePrep(prod);
 
-    appendShopeeLog(`[Luồng ${workerId}] [${idx + 1}/${shopeeClaimedProducts.length}] Bắt đầu xử lý SP ${prod.item_id}: ${prod.name || ''}...`);
+    // 0. Nếu là sản phẩm import từ TXT mà chưa có ảnh hoặc tên (chưa cào trước)
+    await fetchShopeeLinkInfo(prod, `Luồng ${workerId}`);
+
+    appendShopeeLog(`[Luồng ${workerId}] [#${idx + 1}] Bắt đầu xử lý SP ${prod.item_id}: ${prod.name || ''}...`);
 
     let targetFileName = `${prod.item_id}.mp4`;
     if (form.naming && form.naming.includes("15 ký tự")) {
@@ -3467,8 +3545,11 @@
 
     // TRƯỜNG HỢP 3: CẦN RENDER CLIP (THIẾU CLIP A HOẶC CLIP B HOẶC LÀ 8S)
     let refImageDataUrl = null;
-    const imgUrl = prod.image_url || prod.image || (prod.images && prod.images[0]) || "";
-    if (imgUrl) {
+    const imgUrl = shopeeProductImageUrl(prod);
+    if (imgUrl && prep && prep.dataUrl && prep.imgUrl === imgUrl) {
+      refImageDataUrl = prep.dataUrl;
+      appendShopeeLog(`⚡ [Luồng ${workerId}] Dùng ảnh SP đã tải sẵn.`);
+    } else if (imgUrl) {
       appendShopeeLog(`> [Luồng ${workerId}] Đang tải ảnh SP từ Shopee CDN...`);
       try {
         const imgRes = await fetch("/api/shopee/download-image", {
@@ -3486,20 +3567,9 @@
       }
     }
 
-    const promptRes = await fetch("/api/shopee/test-prompt", {
-      method: "POST",
-      headers: getHeaders(),
-      body: JSON.stringify({
-        product_name: prod.name || "Product",
-        lang: form.lang,
-        market: form.market,
-        review_style: form.review_style,
-        duration: form.duration,
-        ai_prompt: form.ai_prompt,
-        scene: form.scene
-      })
-    });
-    const promptData = await promptRes.json();
+    const promptData = (prep && prep.promptData && prep.name === prod.name)
+      ? prep.promptData
+      : await fetchShopeePrompt(prod, form);
     const effectiveIs16s = promptData.is_16s && promptData.prompts && promptData.prompts.length === 2;
 
     if (effectiveIs16s) {
@@ -3561,6 +3631,16 @@
         }
       }
 
+    } else {
+      const dur = parseInt(form.duration) || 8;
+      finishedVideoFilename = await renderSingleVideoClip(promptData.prompt, refImageDataUrl, ar, dur, workerId, `${dur}s`);
+      appendShopeeLog(`✓ [Luồng ${workerId}] Muse.ai đã render xong: ${finishedVideoFilename}`);
+    }
+
+    // Muse đã trả clip (tài khoản đã được nhả). Phần lưu/ghép/báo DB trả về dạng hàm để luồng chạy nền,
+    // trong lúc đó luồng gửi render SP kế tiếp ngay.
+    return async () => {
+    if (effectiveIs16s) {
       appendShopeeLog(`> [Luồng ${workerId}] Đang ghép Clip A + Clip B thành video 16s qua FFmpeg...`);
       const concatRes = await fetch("/api/shopee/concat-videos", {
         method: "POST",
@@ -3578,9 +3658,6 @@
       finishedVideoFilename = concatData.filename;
       appendShopeeLog(`✓ [Luồng ${workerId}] Ghép video 16s thành công!`);
     } else {
-      const dur = parseInt(form.duration) || 8;
-      finishedVideoFilename = await renderSingleVideoClip(promptData.prompt, refImageDataUrl, ar, dur, workerId, `${dur}s`);
-      appendShopeeLog(`✓ [Luồng ${workerId}] Muse.ai đã render xong: ${finishedVideoFilename}`);
       try {
         const sRes = await fetch("/api/shopee/save-temp-clip", {
           method: "POST",
@@ -3643,6 +3720,7 @@
     } else {
       appendShopeeLog(`✓ [Luồng ${workerId}] Hoàn tất xuất video cho Link Shopee: ${prod.item_id} (Lưu tại: ${finalSavedPath})`);
     }
+    };
   }
 
   async function startShopeeBatch() {
@@ -3683,6 +3761,7 @@
 
     const form = getShopeeFormData();
     const outDir = form.out_dir || "F:/Video AI/PH/shopapi";
+    clearShopeePrefetch(); // bỏ dữ liệu chuẩn bị từ batch trước (có thể khác cài đặt)
     const requestedWorkers = Math.max(1, parseInt(document.getElementById("sp_threads").value) || 2);
 
     // Truy vấn trạng thái tài khoản mới nhất để biết chính xác số tài khoản còn sống
@@ -3741,17 +3820,167 @@
       return;
     }
 
+    // Số SP đã bị gỡ khỏi đầu danh sách khi tự nhận thêm SP (giữ số thứ tự đặt tên file liên tục)
+    let seqBase = 0;
+    const seenItemIds = new Set(shopeeClaimedProducts.map(p => String(p && p.item_id)));
+    const autoClaim = !!form.auto_claim;
+    const autoClaimThreshold = Math.max(100, maxWorkers * 5);
+    let autoClaimPromise = null;
+    let autoClaimEmptyAt = 0;
+
     function updateProgressText() {
-      const inProgress = shopeeClaimedProducts.filter(p => p._status === "processing").length;
-      document.getElementById("batchProgressText").innerText = 
-        `Đang chạy (${inProgress} luồng) | Xong: ${completedCount}/${shopeeClaimedProducts.length} | Lỗi: ${failedCount}`;
+      let rendering = 0, saving = 0;
+      for (const p of shopeeClaimedProducts) {
+        if (p && p._status === "processing") { if (p._finalizing) saving++; else rendering++; }
+      }
+      document.getElementById("batchProgressText").innerText =
+        `Đang chạy (${rendering} luồng${saving ? `, ${saving} đang lưu/ghép` : ""}) | Xong: ${completedCount}/${seqBase + shopeeClaimedProducts.length} | Lỗi: ${failedCount}`;
     }
 
     updateProgressText();
 
+    function remainingShopeeProducts() {
+      let n = 0;
+      for (let i = nextIndex; i < shopeeClaimedProducts.length; i++) {
+        const p = shopeeClaimedProducts[i];
+        if (p && p._status !== "completed") n++;
+      }
+      return n;
+    }
+
+    // Gỡ các SP đã xong/lỗi ở đầu danh sách để danh sách không phình mãi khi chạy liên tục nhiều lô
+    function compactShopeeQueue() {
+      const keep = [];
+      let removed = 0;
+      for (let i = 0; i < nextIndex; i++) {
+        const p = shopeeClaimedProducts[i];
+        if (!p || p._status === "completed" || p._status === "failed") removed++;
+        else keep.push(p);
+      }
+      if (!removed) return;
+      shopeeClaimedProducts = keep.concat(shopeeClaimedProducts.slice(nextIndex));
+      nextIndex = keep.length;
+      seqBase += removed;
+    }
+
+    // Trả về số SP mới thêm vào hàng đợi (0 = Database hết SP phù hợp, -1 = lỗi)
+    async function autoClaimShopeeProducts() {
+      appendShopeeLog(`📥 [Tự nhận SP] Hàng đợi còn ${remainingShopeeProducts()} SP -> đang nhận thêm lô mới từ Database...`);
+      try {
+        const res = await fetch("/api/shopee/claim", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify(form)
+        });
+        if (!res.ok) {
+          let err = `Lỗi (${res.status})`;
+          try { const ej = await res.json(); err = ej.detail || err; } catch (_) {}
+          throw new Error(err);
+        }
+        const data = await res.json();
+        // Database trả lại cả SP mình đã nhận mà chưa làm xong -> chỉ thêm SP chưa có trong batch này
+        const fresh = (data.products || []).filter(p => p && p.item_id && !seenItemIds.has(String(p.item_id)));
+        fresh.forEach(p => seenItemIds.add(String(p.item_id)));
+        compactShopeeQueue();
+        if (fresh.length) shopeeClaimedProducts = shopeeClaimedProducts.concat(fresh);
+        else autoClaimEmptyAt = Date.now();
+        renderShopeeProductsConsole();
+        updateProgressText();
+        appendShopeeLog(fresh.length
+          ? `✓ [Tự nhận SP] Đã thêm ${fresh.length} SP mới vào hàng đợi (${remainingShopeeProducts()} SP chờ làm).`
+          : `⚠️ [Tự nhận SP] Database không còn SP mới phù hợp bộ lọc.`);
+        return fresh.length;
+      } catch (e) {
+        appendShopeeLog(`❌ [Tự nhận SP] Lỗi nhận thêm SP: ${e.message}`);
+        return -1;
+      }
+    }
+
+    function runAutoClaim() {
+      if (!autoClaimPromise) {
+        autoClaimPromise = autoClaimShopeeProducts().finally(() => { autoClaimPromise = null; });
+      }
+      return autoClaimPromise;
+    }
+
+    // Gọi mỗi khi nhận SP: hàng đợi sắp cạn thì nhận thêm lô mới chạy nền (luồng không phải chờ)
+    function maybeAutoClaim() {
+      if (!autoClaim || autoClaimPromise || shopeeStopRequested || shopeeForceStopRequested) return;
+      if (Date.now() - autoClaimEmptyAt < 5 * 60 * 1000) return;
+      if (remainingShopeeProducts() >= autoClaimThreshold) return;
+      runAutoClaim();
+    }
+
+    // Luồng thấy hàng đợi trống: chờ lô mới (thử lại khi lỗi mạng). false = thật sự hết SP -> luồng kết thúc.
+    async function waitForMoreProducts() {
+      if (!autoClaim) return false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (shopeeStopRequested || shopeeForceStopRequested) return false;
+        if (nextIndex < shopeeClaimedProducts.length) return true;
+        if (!autoClaimPromise && Date.now() - autoClaimEmptyAt < 5 * 60 * 1000) return false;
+        const added = await runAutoClaim();
+        if (nextIndex < shopeeClaimedProducts.length) return true;
+        if (added === 0) return false;
+        await new Promise(r => setTimeout(r, 30000));
+      }
+      return nextIndex < shopeeClaimedProducts.length;
+    }
+
+    function markShopeeCompleted(prod) {
+      prod._status = "completed";
+      completedCount++;
+      recordShopeeCompletion();
+    }
+
+    async function markShopeeFailed(prod, err, workerId) {
+      prod._status = "failed";
+      failedCount++;
+      appendShopeeLog(`❌ [Luồng ${workerId}] Lỗi SP ${prod.item_id}: ${err.message}`);
+
+      // Tự động kiểm tra và thêm vào Blacklist nếu vi phạm chính sách an toàn
+      const msgLow = (err.message || "").toLowerCase();
+      if (msgLow.includes("safety") || msgLow.includes("policy") || msgLow.includes("vi phạm") || msgLow.includes("nsfw") || msgLow.includes("prohibited")) {
+        try {
+          await fetch("/api/shopee/add-to-blacklist", {
+            method: "POST",
+            headers: getHeaders(),
+            body: JSON.stringify({ item_id: prod.item_id, reason: err.message })
+          });
+          appendShopeeLog(`🛡️ [Luồng ${workerId}] Đã tự động thêm SP ${prod.item_id} vào Blacklist (vi phạm chính sách Muse.ai)!`);
+        } catch (_) {}
+      }
+
+      if (!prod._is_imported) {
+        try {
+          await fetch("/api/shopee/complete", {
+            method: "POST",
+            headers: getHeaders(),
+            body: JSON.stringify({ item_id: prod.item_id, status: "failed" })
+          });
+        } catch (_) {}
+      }
+    }
+
+    // Chuẩn bị sẵn vài SP kế tiếp chưa có luồng nhận, để khi luồng rảnh là gửi render ngay
+    function prefetchUpcoming() {
+      if (shopeeStopRequested || shopeeForceStopRequested) return;
+      let slots = SHOPEE_PREFETCH_AHEAD;
+      for (let i = nextIndex; i < shopeeClaimedProducts.length && slots > 0; i++) {
+        const p = shopeeClaimedProducts[i];
+        if (!p || p._status === "completed") continue;
+        startShopeePrefetch(p, form);
+        slots--;
+      }
+    }
+
     async function workerLoop(workerId) {
+      // Mỗi luồng có tối đa 1 SP đang lưu/ghép chạy nền, song song với SP kế tiếp đang render trên Muse
+      let pendingFinalize = null;
       while (!shopeeStopRequested && !shopeeForceStopRequested) {
-        if (nextIndex >= shopeeClaimedProducts.length) break;
+        if (nextIndex >= shopeeClaimedProducts.length) {
+          if (!(await waitForMoreProducts())) break;
+          continue;
+        }
         const currentIdx = nextIndex++;
         const prod = shopeeClaimedProducts[currentIdx];
         if (!prod || prod._status === "completed") continue;
@@ -3759,43 +3988,36 @@
         prod._status = "processing";
         renderShopeeProductsConsole();
         updateProgressText();
+        prefetchUpcoming();
+        maybeAutoClaim();
 
         try {
-          await renderShopeeProductItem(prod, currentIdx, form, outDir, workerId);
-          prod._status = "completed";
-          completedCount++;
-          recordShopeeCompletion();
+          const finalize = await renderShopeeProductItem(prod, seqBase + currentIdx, form, outDir, workerId);
+          if (typeof finalize === "function") {
+            if (pendingFinalize) await pendingFinalize;
+            prod._finalizing = true;
+            pendingFinalize = (async () => {
+              try {
+                await finalize();
+                markShopeeCompleted(prod);
+              } catch (err) {
+                await markShopeeFailed(prod, err, workerId);
+              } finally {
+                delete prod._finalizing;
+                renderShopeeProductsConsole();
+                updateProgressText();
+              }
+            })();
+          } else {
+            markShopeeCompleted(prod);
+          }
         } catch (err) {
-          prod._status = "failed";
-          failedCount++;
-          appendShopeeLog(`❌ [Luồng ${workerId}] Lỗi SP ${prod.item_id}: ${err.message}`);
-
-          // Tự động kiểm tra và thêm vào Blacklist nếu vi phạm chính sách an toàn
-          const msgLow = (err.message || "").toLowerCase();
-          if (msgLow.includes("safety") || msgLow.includes("policy") || msgLow.includes("vi phạm") || msgLow.includes("nsfw") || msgLow.includes("prohibited")) {
-            try {
-              await fetch("/api/shopee/add-to-blacklist", {
-                method: "POST",
-                headers: getHeaders(),
-                body: JSON.stringify({ item_id: prod.item_id, reason: err.message })
-              });
-              appendShopeeLog(`🛡️ [Luồng ${workerId}] Đã tự động thêm SP ${prod.item_id} vào Blacklist (vi phạm chính sách Muse.ai)!`);
-            } catch (_) {}
-          }
-
-          if (!prod._is_imported) {
-            try {
-              await fetch("/api/shopee/complete", {
-                method: "POST",
-                headers: getHeaders(),
-                body: JSON.stringify({ item_id: prod.item_id, status: "failed" })
-              });
-            } catch (_) {}
-          }
+          await markShopeeFailed(prod, err, workerId);
         }
         renderShopeeProductsConsole();
         updateProgressText();
       }
+      if (pendingFinalize) await pendingFinalize;
     }
 
     const workerPromises = [];
@@ -3808,6 +4030,7 @@
       }
     }
     await Promise.all(workerPromises);
+    clearShopeePrefetch();
 
     clearInterval(shopeeBatchTimer);
     isShopeeBatchRunning = false;

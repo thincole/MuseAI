@@ -29,14 +29,14 @@ log = logging.getLogger("shopee_engine")
 
 def _ffmpeg_concurrency() -> int:
     try:
-        n = int(os.environ.get("MUSE2API_FFMPEG_CONCURRENCY", "2").strip() or "2")
+        n = int(os.environ.get("MUSE2API_FFMPEG_CONCURRENCY", "4").strip() or "4")
     except (TypeError, ValueError):
-        n = 2
+        n = 4
     return max(1, min(n, 16))
 
 
 # Concurrency Limiter: giới hạn số tiến trình FFmpeg encode/ghép video chạy đồng thời
-# (mặc định 2, chỉnh qua biến môi trường MUSE2API_FFMPEG_CONCURRENCY).
+# (mặc định 4 — đủ cho ~40 luồng render; chỉnh qua biến môi trường MUSE2API_FFMPEG_CONCURRENCY).
 # Các luồng worker vượt quá giới hạn sẽ xếp hàng chờ. Tác vụ stream-copy thường chỉ mất <1-2s, nhưng
 # re-encode / ghép Outro có thể mất hàng chục giây (timeout tới 240s), nên KHÔNG dùng 1 khóa toàn cục
 # (sẽ chặn mọi job khác tới vài phút). Giới hạn nhỏ vẫn giúp tránh nghẽn I/O ổ đĩa và quá tải CPU

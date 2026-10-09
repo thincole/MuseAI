@@ -3965,6 +3965,14 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(admin_auth
 
 @app.on_event("startup")
 async def _startup():
+    # Các endpoint đồng bộ (poll /v1/videos, lưu/ghép video, check temp...) chạy trong threadpool của anyio (mặc định 40).
+    # Chạy 40+ luồng Shopee thì các request đang chờ FFmpeg có thể chiếm hết chỗ và làm nghẽn cả việc poll -> nới rộng.
+    try:
+        import anyio.to_thread
+        anyio.to_thread.current_default_thread_limiter().total_tokens = max(
+            200, anyio.to_thread.current_default_thread_limiter().total_tokens)
+    except Exception as exc:
+        log.warning("Không nới được threadpool anyio: %s", exc)
     # Luồng xử lý (ảnh lẫn video) đã chết khi tắt app: đóng các task còn treo để không bị đếm/kẹt mãi.
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
