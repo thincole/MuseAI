@@ -38,11 +38,13 @@ def _origin_for(ws_url: str) -> str | None:
 class CDP:
     def __init__(self, ws_url: str, timeout: float = 90.0, max_size: int = 256 << 20):
         origin = _origin_for(ws_url)
+        # skip_utf8_validation: websocket-client kiểm tra UTF-8 từng byte bằng Python thuần (không có wsaccel) —
+        # đo bằng py-spy chiếm ~45% CPU của app khi chạy 20-30 trình duyệt (khung base64 video, sự kiện...).
+        # Chrome luôn gửi JSON UTF-8 hợp lệ nên bỏ qua bước này an toàn.
+        kw = {"timeout": timeout, "max_size": max_size, "skip_utf8_validation": True}
         if origin:
-            self.ws = websocket.create_connection(ws_url, timeout=timeout, max_size=max_size,
-                                                  origin=origin)
-        else:
-            self.ws = websocket.create_connection(ws_url, timeout=timeout, max_size=max_size)
+            kw["origin"] = origin
+        self.ws = websocket.create_connection(ws_url, **kw)
         self.timeout = timeout
         self._id = 0
         # 同一 CDP 对象可能被多个线程同时调用：send+recv 必须串行，

@@ -526,9 +526,10 @@ class MuseEngine:
             f"http://127.0.0.1:{self.cfg.cdp_port}/json/new?about:blank",
             timeout=10).json()
         page = CDP(tgt["webSocketDebuggerUrl"], timeout=180)
-        page.send("Network.enable")
+        # Chỉ bật Page (cần cho script chống phát hiện). KHÔNG bật Network/Runtime: code không dùng sự kiện của chúng,
+        # mà trang Muse đẩy về liên tục (khung websocket, request...) -> mỗi lệnh CDP phải giải mã cả đống sự kiện
+        # tồn đọng, làm app ngốn CPU khi chạy nhiều luồng. Cookie / evaluate / screenshot không cần các domain này.
         page.send("Page.enable")
-        page.send("Runtime.enable")
         page.send("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
         page.send("Browser.setDownloadBehavior",
                   {"behavior": "allow", "downloadPath": self.cfg.download_dir})
@@ -1735,9 +1736,10 @@ class MuseEngine:
 
         ws_url = f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}"
         page = CDP(ws_url, timeout=180)
-        page.send("Network.enable")
+        # Chỉ bật Page (cần cho script chống phát hiện). KHÔNG bật Network/Runtime: code không dùng sự kiện của chúng,
+        # mà trang Muse đẩy về liên tục (khung websocket, request...) -> mỗi lệnh CDP phải giải mã cả đống sự kiện
+        # tồn đọng, làm app ngốn CPU khi chạy nhiều luồng. Cookie / evaluate / screenshot không cần các domain này.
         page.send("Page.enable")
-        page.send("Runtime.enable")
         page.send("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
         page.send("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.cfg.download_dir})
 
