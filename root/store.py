@@ -18,6 +18,10 @@ TASK_PERSIST_INTERVAL = 5.0
 TASKS_KEEP = max(50, int(os.environ.get("MUSE2API_TASKS_KEEP", "500") or 500))
 _TERMINAL_STATUSES = ("completed", "succeeded", "success", "done", "failed")
 
+# Kẹt VM bao nhiêu lần liên tiếp thì cho TK nghỉ, và nghỉ bao lâu (phút, chỉnh qua .env).
+STUCK_COOLDOWN_AFTER = 2
+STUCK_COOLDOWN_SECONDS = max(60, int(float(os.environ.get("MUSE2API_STUCK_COOLDOWN_MIN", "60") or 60) * 60))
+
 # 决定账号生死的核心 cookie（与 engine.ESSENTIAL_COOKIES 保持一致）
 ESSENTIAL_COOKIES = ("hatch_sess", "hatch_gw", "hatch_vml",
                      "hatch_native_auth_device")
@@ -266,16 +270,40 @@ class Store:
 
     _BUSY_ACCOUNTS = set()
     _COND = threading.Condition(_LOCK)
+    # Cooldown (trong RAM, mở lại app là xóa): TK kẹt VM liên tiếp thì cho nghỉ, hết giờ nghỉ được thử lại 1 lần.
+    _STUCK_STREAK: dict[str, int] = {}
+    _COOLDOWN_UNTIL: dict[str, float] = {}
+
+    def in_cooldown(self, aid: str) -> bool:
+        return self._COOLDOWN_UNTIL.get(aid, 0.0) > time.time()
+
+    def record_vm_stuck(self, aid: str) -> bool:
+        """Ghi nhận 1 lần TK không kết nối được VM. Trả về True nếu TK vừa bị cho nghỉ."""
+        with self._COND:
+            n = self._STUCK_STREAK.get(aid, 0) + 1
+            self._STUCK_STREAK[aid] = n
+            if n >= STUCK_COOLDOWN_AFTER:
+                self._COOLDOWN_UNTIL[aid] = time.time() + STUCK_COOLDOWN_SECONDS
+                return True
+            return False
+
+    def record_vm_ok(self, aid: str):
+        """TK vừa render thành công: xóa chuỗi kẹt và giờ nghỉ."""
+        with self._COND:
+            self._STUCK_STREAK.pop(aid, None)
+            self._COOLDOWN_UNTIL.pop(aid, None)
+            self._COND.notify_all()
 
     def acquire_account(self, preferred_id: str | None = None, exclude_id: str | None = None,
                         timeout: float = 60.0) -> dict | None:
-        """Thuê tài khoản cho luồng render worker. Đảm bảo mỗi tài khoản chỉ phục vụ tối đa 1 luồng cùng lúc."""
+        """Thuê tài khoản cho luồng render worker. Đảm bảo mỗi tài khoản chỉ phục vụ tối đa 1 luồng cùng lúc
+        và bỏ qua TK đang nghỉ (cooldown) vì kẹt VM."""
         deadline = time.monotonic() + timeout
         with self._COND:
             while True:
                 self._sync_from_disk()
                 live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
-                available = [a for a in live if a["id"] not in self._BUSY_ACCOUNTS]
+                available = [a for a in live if a["id"] not in self._BUSY_ACCOUNTS and not self.in_cooldown(a["id"])]
                 if exclude_id and len(available) > 1:
                     available = [a for a in available if a["id"] != exclude_id] or available
 

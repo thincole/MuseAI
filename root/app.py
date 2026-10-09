@@ -50,8 +50,8 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from pydantic import BaseModel, Field
 
 from config import CFG
-from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError
-from store import Store, account_expiry, min_expiry
+from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError, MuseVMUnavailableError
+from store import STUCK_COOLDOWN_SECONDS, Store, account_expiry, min_expiry
 
 import sys
 import logger_setup
@@ -863,6 +863,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     reference_image=reference_image
                 )
                 store.touch_keepalive(cur_acc["id"], True, "Phiên hợp lệ · Sẵn sàng")
+                store.record_vm_ok(cur_acc["id"])
                 engine.release_session(session, error=False)
                 session = None
                 return res, cur_acc["id"]
@@ -880,6 +881,10 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 last_exc = exc
                 log.warning("✗ [Video Gen] Lỗi tạo video với TK %s: %s", cur_acc["id"], exc)
                 store.mark(cur_acc["id"], True, f"Tác vụ gián đoạn: {str(exc)[:60]}")
+                if isinstance(exc, MuseVMUnavailableError) and store.record_vm_stuck(cur_acc["id"]):
+                    log.warning("😴 [Cooldown] TK %s (%s) kẹt VM %d lần liên tiếp -> cho nghỉ %d phút, các luồng dùng TK khác",
+                                cur_acc["id"], cur_acc.get("label"), store._STUCK_STREAK.get(cur_acc["id"], 0),
+                                STUCK_COOLDOWN_SECONDS // 60)
                 if session:
                     try:
                         engine.release_session(session, error=True)

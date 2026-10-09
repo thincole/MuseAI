@@ -360,6 +360,18 @@ class MuseGenerationError(RuntimeError):
     pass
 
 
+class MuseVMUnavailableError(MuseGenerationError):
+    """Máy ảo Muse của tài khoản không nhận prompt / không mở được phiên — dùng để cho tài khoản nghỉ (cooldown)."""
+
+
+# Để trình duyệt tự quản lý kết nối VM như người dùng thật: không bơm cookie hatch_gw (token cổng VM) lấy từ
+# Python vào trình duyệt và không gọi /api/hatch/vm/wake từ Python khi mở phiên (trang muse.ai tự xin token + tự
+# đánh thức VM). Log 09/10: 4/5 TK luôn render được KHÔNG có hatch_gw, 57/58 TK luôn kẹt "Connecting..." CÓ hatch_gw.
+# Muốn quay lại cách cũ: đặt MUSE2API_BROWSER_MANAGES_VM=0 trong .env.
+BROWSER_MANAGES_VM = os.environ.get("MUSE2API_BROWSER_MANAGES_VM", "1").strip() != "0"
+_BROWSER_SKIP_COOKIES = ("hatch_gw",)
+
+
 class MuseEngine:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -1696,7 +1708,8 @@ class MuseEngine:
         if not account_id or (now_ts - self._last_http_renew.get(account_id, 0) > 600):
             try:
                 renew_proxy = f"http://127.0.0.1:{forwarder_port}" if forwarder_port else None
-                renewed = self.renew_session_http(cookies, expires, wake_vm=True, proxy_url=renew_proxy)
+                renewed = self.renew_session_http(cookies, expires, wake_vm=not BROWSER_MANAGES_VM,
+                                                  proxy_url=renew_proxy)
                 if renewed.get("cookies"):
                     cookies = renewed["cookies"]
                 if renewed.get("cookies_exp"):
@@ -1728,7 +1741,12 @@ class MuseEngine:
         page.send("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
         page.send("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.cfg.download_dir})
 
-        self._apply_cookies(page, cookies, expires)
+        if BROWSER_MANAGES_VM:
+            browser_cookies = {k: v for k, v in cookies.items() if k not in _BROWSER_SKIP_COOKIES}
+            log.info("🧪 [Worker/VM] TK %s: trình duyệt tự kết nối VM (không bơm hatch_gw, không wake từ Python)", account_id)
+        else:
+            browser_cookies = cookies
+        self._apply_cookies(page, browser_cookies, expires)
         page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
 
         ready = False
@@ -1749,7 +1767,7 @@ class MuseEngine:
                     self.browser.send('Target.disposeBrowserContext', {'browserContextId': bc_id})
             except Exception:
                 pass
-            raise MuseGenerationError("Khởi tạo trang muse.ai cho worker thất bại hoặc timeout")
+            raise MuseVMUnavailableError("Khởi tạo trang muse.ai cho worker thất bại hoặc timeout")
 
         return MuseWorkerSession(self, bc_id, target_id, page, account_id,
                                  proxy_str=proxy_str, forwarder_port=forwarder_port,
@@ -2459,7 +2477,7 @@ class MuseWorkerSession:
                 if undelivered_since == 0.0:
                     undelivered_since = time.time()
                 elif time.time() - undelivered_since >= UNDELIVERED_GRACE_SECONDS:
-                    raise MuseGenerationError(
+                    raise MuseVMUnavailableError(
                         f"Prompt chưa tới được máy ảo Muse sau {UNDELIVERED_GRACE_SECONDS}s "
                         f"(Delivery not confirmed / Connecting...) — đổi sang tài khoản khác")
             else:
@@ -2467,8 +2485,11 @@ class MuseWorkerSession:
             # Tín hiệu sớm hơn: prompt tới được Muse thì trang chuyển sang /thread/<id> và agent trả lời. Kẹt ở
             # /thread/new mà không có trả lời quá ngưỡng = VM không nhận prompt (chữ đỏ chỉ hiện sau ~5 phút).
             if st.get("new_thread") and no_reply and elapsed >= STUCK_NEW_THREAD_SECONDS:
-                self._diagnose_stuck("stuck /thread/new")
-                raise MuseGenerationError(
+                try:
+                    self._diagnose_stuck("stuck /thread/new")
+                except Exception:  # noqa: BLE001 — chẩn đoán lỗi cũng không được chặn việc đổi TK
+                    pass
+                raise MuseVMUnavailableError(
                     f"Prompt chưa tới được máy ảo Muse sau {STUCK_NEW_THREAD_SECONDS}s "
                     f"(vẫn ở /thread/new, agent chưa trả lời) — đổi sang tài khoản khác")
 
