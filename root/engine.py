@@ -2215,37 +2215,58 @@ class MuseWorkerSession:
             }
         })(%s, %s)
         """
-        try:
-            raw_res = self.page.js(_INJECT_JS % (json.dumps(b64), json.dumps(mime)))
-            res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
-            if not res_obj.get("ok"):
-                raise MuseGenerationError("附加参考图失败，已停止生成")
-        except Exception as e:
-            raise MuseGenerationError("附加参考图失败，已停止生成") from e
+        _ATTACHED_JS = """(function(){
+            var btns = Array.from(document.querySelectorAll('button[aria-label]'));
+            var hasRemove = btns.some(function(b){
+                return /remove\\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label') || '');
+            });
+            if (hasRemove) return 'remove';
+            var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+            var composer = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
+            if (composer) {
+                var media = composer.querySelectorAll('img, video');
+                if (media.length > 0) return 'thumb';
+            }
+            return '';
+            })()"""
 
-        deadline = time.time() + 15.0
-        while time.time() < deadline:
-            has_attached = self.page.js(
-                """(function(){
-                var btns = Array.from(document.querySelectorAll('button[aria-label]'));
-                var hasRemove = btns.some(function(b){
-                    return /remove\\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label') || '');
-                });
-                if (hasRemove) return 'remove';
-                var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
-                var composer = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
-                if (composer) {
-                    var media = composer.querySelectorAll('img, video');
-                    if (media.length > 0) return 'thumb';
-                }
-                return '';
-                })()"""
-            )
-            if has_attached:
-                break
+        def _wait_attached(seconds: float) -> str:
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                got = self.page.js(_ATTACHED_JS)
+                if got:
+                    return got
+                time.sleep(0.3)
+            return ""
+
+        # Phiên vừa mở: DOM ô soạn tin có rồi nhưng xử lý của trang có thể chưa gắn xong -> sự kiện 'change' bị bỏ qua,
+        # ảnh không bao giờ hiện. Trước đây app chậm nên vô tình chờ đủ lâu; sau khi app nhanh (09/10) lỗi lộ ra hàng
+        # loạt trên phiên mới. -> Chờ trang tải xong, rồi đưa ảnh tối đa 3 lần (chỉ đưa lại khi lần trước chưa hiện).
+        ready_deadline = time.time() + 15.0
+        while time.time() < ready_deadline:
+            try:
+                if self.page.js("document.readyState === 'complete' && "
+                                "!!document.querySelector('[data-testid=\"hatch-composer-placeholder-overlay\"]')"):
+                    break
+            except Exception:  # noqa: BLE001
+                pass
             time.sleep(0.3)
-        else:
-            raise MuseGenerationError("Ảnh tham chiếu chưa đính kèm được vào ô soạn tin sau 15s, đã dừng trước khi gửi prompt")
+        attached = ""
+        for attempt, wait_s in enumerate((6.0, 6.0, 10.0), 1):
+            try:
+                raw_res = self.page.js(_INJECT_JS % (json.dumps(b64), json.dumps(mime)))
+                res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
+                if not res_obj.get("ok"):
+                    raise MuseGenerationError("附加参考图失败，已停止生成")
+            except Exception as e:
+                raise MuseGenerationError("附加参考图失败，已停止生成") from e
+            attached = _wait_attached(wait_s)
+            if attached:
+                if attempt > 1:
+                    log.info("📎 TK %s: ảnh tham chiếu hiện ra ở lần đưa thứ %d", self.account_id, attempt)
+                break
+        if not attached:
+            raise MuseGenerationError("Ảnh tham chiếu chưa đính kèm được vào ô soạn tin sau 3 lần thử, đã dừng trước khi gửi prompt")
 
         # Ảnh xem trước hiện ra ngay khi chọn file, nhưng upload lên Muse có thể chưa xong (nhất là qua proxy).
         # Chờ (tối đa 45s) cho các dấu hiệu "đang tải" trong ô soạn tin biến mất rồi mới gửi.
