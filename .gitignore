@@ -79,3 +79,11 @@ Thumbs.db
 root/data/proxy_settings.json
 root/data/tasks.archive-*.json
 root/data/stuck_debug/
+
+# File nen ban sao luu (co the chua .env, accounts.json, cookie) - KHONG BAO GIO dua len GitHub
+*.rar
+*.zip
+*.7z
+
+# Anh tam khi ghep Outro 12s
+root/data/temp_outro_*

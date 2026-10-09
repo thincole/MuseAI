@@ -3134,9 +3134,9 @@ def toggle_proxy_mode(req: dict):
 
 
 @app.post("/api/proxy/sync-thinaptm")
-def sync_thinaptm_proxies():
+def sync_thinaptm_proxies(req: dict | None = None):
     import proxy_manager
-    return proxy_manager.sync_all_accounts_with_homeproxy()
+    return proxy_manager.sync_all_accounts_with_homeproxy(rebalance=bool((req or {}).get("rebalance")))
 
 
 @app.post("/api/proxy/test/{acc_id}")

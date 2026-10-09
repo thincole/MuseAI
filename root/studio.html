@@ -4420,23 +4420,33 @@
       btn.disabled = true;
       btn.innerText = "⏳ Đang nạp proxy...";
     }
-    showToast("Đang quét và nạp proxy từ ThinAptm hoặc file proxy.txt...", "info");
+    showToast("Đang nạp danh sách HomeProxy và kiểm tra proxy của các tài khoản...", "info");
     try {
-      const res = await fetch("/api/proxy/sync-thinaptm", { method: "POST", headers: getHeaders() });
-      if (res.ok) {
-        const data = await res.json();
-        const total = data.pool_size || data.total_proxies || 0;
-        if (total === 0) {
-          showToast(data.message || "⚠️ Chưa tìm thấy proxy! Hãy đặt file 'proxy.txt' (mỗi dòng 1 proxy) vào thư mục MuseAI hoặc kiểm tra thư mục ThinAptm.", "warning");
-        } else {
-          showToast(`✓ Đồng bộ thành công! Pool: ${total} proxy, Đã gán: ${data.assigned_count || data.newly_assigned || 0} tài khoản.`, "success");
-        }
-        await loadAccounts();
-        await fetchBrowserTtlStatus();
+      const callSync = async (rebalance) => {
+        const r = await fetch("/api/proxy/sync-thinaptm", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({ rebalance: !!rebalance })
+        });
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
+      };
+      // Proxy gắn CỐ ĐỊNH: lần nạp thường chỉ gán cho TK chưa có proxy / proxy chết, TK đang chạy giữ nguyên IP
+      let data = await callSync(false);
+      const total = data.pool_size || data.total_proxies || 0;
+      if (total === 0) {
+        showToast(data.message || "⚠️ Chưa tìm thấy proxy! Hãy đặt file 'proxy.txt' (mỗi dòng 1 proxy) vào thư mục MuseAI hoặc kiểm tra thư mục ThinAptm.", "warning");
       } else {
-        const err = await res.text();
-        throw new Error(err);
+        showToast(`✓ HomeProxy: ${total} proxy (${data.alive_proxies || 0} sống) cho ${data.total_accounts || 0} TK — gán mới ${data.newly_assigned || 0}, đổi proxy chết ${data.rebalanced || 0}. TK đang có proxy sống giữ nguyên IP.`, "success");
+        if (data.overloaded > 0 && confirm(
+          `Có ${data.overloaded} tài khoản đang dồn trên proxy quá mức chia đều (mức đều: tối đa ${data.max_accounts_per_proxy} TK/proxy).\n\n` +
+          `Chia lại 1 lần để ${total} proxy gánh đều? Các TK bị chuyển sẽ đổi IP (chỉ làm 1 lần, sau đó proxy lại cố định).`)) {
+          data = await callSync(true);
+          showToast(`⚖️ Đã chia lại ${data.rebalanced || 0} TK — giờ tối đa ${data.max_accounts_per_proxy} TK/proxy, proxy cố định từ đây.`, "success");
+        }
       }
+      await loadAccounts();
+      await fetchBrowserTtlStatus();
     } catch (e) {
       showToast(`Lỗi đồng bộ proxy: ${e.message}`, "danger");
     } finally {

@@ -254,28 +254,57 @@ def stop_all_forwarders():
         log.info("🔌 Đã đóng toàn bộ Local Proxy Forwarders.")
 
 
+POOL_SOURCE_HOMEPROXY = "homeproxy_api"
+
+
 def load_proxies_from_thinaptm() -> list[str]:
-    """Đọc danh sách proxy từ ThinAptm0707 (trên mọi ổ đĩa) hoặc file proxy.txt trong thư mục MuseAI."""
+    """Danh sách proxy của hệ thống = đúng các proxy HomeProxy đang thuê (lấy qua HomeProxy API).
+
+    Mọi máy đều nạp cùng danh sách này rồi tự chia đều cho tài khoản của mình. KHÔNG trộn thêm các file proxy khác
+    trong ThinAptm (vd proxy_us_tot_8.txt là IP Mỹ của công cụ khác). API lỗi -> dùng danh sách HomeProxy lấy được
+    lần trước; chưa từng lấy được -> proxy_list trong settings.json của ThinAptm / file proxy.txt trong thư mục MuseAI."""
     proxies: list[str] = []
     token = ""
-
-    # 1. Quét danh sách các thư mục ứng viên ThinAptm
     candidate_dirs = [THINAPTM_DIR]
     for d in ["E", "D", "C", "F"]:
         d_path = f"{d}:\\ThinAptm0707"
         if d_path not in candidate_dirs:
             candidate_dirs.append(d_path)
+    for c_dir in candidate_dirs:
+        settings_file = os.path.join(c_dir, "settings.json")
+        if not token and os.path.isfile(settings_file):
+            try:
+                with open(settings_file, "r", encoding="utf-8") as f:
+                    token = (json.load(f).get("homeproxy_token") or "").strip()
+            except Exception as e:
+                log.warning("Lỗi đọc settings.json từ %s: %s", c_dir, e)
+    token = token or HOMEPROXY_TOKEN or DEFAULT_HOMEPROXY_TOKEN
+
+    if token:
+        hp_list = list(dict.fromkeys(str(p).strip() for p in fetch_proxies_from_homeproxy_api(token) if p and str(p).strip()))
+        if hp_list:
+            log.info("🌐 HomeProxy API: %d proxy -> dùng làm danh sách proxy chung", len(hp_list))
+            save_proxy_pool(hp_list, source=POOL_SOURCE_HOMEPROXY)
+            return hp_list
+        cached = get_cached_proxy_pool()
+        if cached:
+            log.warning("HomeProxy API không trả về proxy -> dùng lại %d proxy HomeProxy lấy được lần trước", len(cached))
+            return cached
+
+    log.warning("Không lấy được danh sách HomeProxy -> dùng proxy_list trong settings.json (ThinAptm) / proxy.txt cục bộ")
+    return _load_proxies_from_files(candidate_dirs)
+
+
+def _load_proxies_from_files(candidate_dirs: list[str]) -> list[str]:
+    """Dự phòng khi chưa từng lấy được danh sách từ HomeProxy API."""
+    proxies: list[str] = []
 
     for c_dir in candidate_dirs:
-        if not os.path.isdir(c_dir):
-            continue
         settings_file = os.path.join(c_dir, "settings.json")
         if os.path.isfile(settings_file):
             try:
                 with open(settings_file, "r", encoding="utf-8") as f:
                     s = json.load(f)
-                if not token:
-                    token = s.get("homeproxy_token", "").strip()
                 for p in s.get("proxy_list", []):
                     p_clean = str(p).strip()
                     if p_clean and p_clean not in proxies and not p_clean.startswith("#"):
@@ -283,20 +312,7 @@ def load_proxies_from_thinaptm() -> list[str]:
             except Exception as e:
                 log.warning("Lỗi đọc settings.json từ %s: %s", c_dir, e)
 
-        # Đọc thêm từ các file proxy .txt trong thư mục ThinAptm
-        for txt_name in ["proxy_us_tot_8.txt", "proxy.txt", "proxies.txt"]:
-            us_file = os.path.join(c_dir, txt_name)
-            if os.path.isfile(us_file):
-                try:
-                    with open(us_file, "r", encoding="utf-8") as f:
-                        for line in f:
-                            p = line.strip()
-                            if p and not p.startswith("#") and p not in proxies:
-                                proxies.append(p)
-                except Exception:
-                    pass
-
-    # 2. Đọc thêm từ file proxy.txt hoặc proxies.txt ngay trong thư mục MuseAI (cực kỳ tiện khi mang sang máy khác)
+    # Đọc thêm từ file proxy.txt hoặc proxies.txt ngay trong thư mục MuseAI (cực kỳ tiện khi mang sang máy khác)
     local_proxy_files = [
         os.path.join(CFG.base_dir, "proxy.txt"),
         os.path.join(CFG.base_dir, "proxies.txt"),
@@ -315,20 +331,6 @@ def load_proxies_from_thinaptm() -> list[str]:
                 log.info("📄 Đã nạp proxy từ file cục bộ: %s (Hiện có %d proxy)", lpf, len(proxies))
             except Exception as e:
                 log.warning("Lỗi đọc file proxy cục bộ %s: %s", lpf, e)
-
-    # 3. Lấy token HomeProxy (ưu tiên token từ settings.json, sau đó .env hoặc DEFAULT_HOMEPROXY_TOKEN)
-    if not token:
-        token = HOMEPROXY_TOKEN or DEFAULT_HOMEPROXY_TOKEN
-
-    if token:
-        hp_list = fetch_proxies_from_homeproxy_api(token)
-        for p in hp_list:
-            if p and p not in proxies:
-                proxies.append(p)
-        log.info("🌐 Tổng số proxy thu thập được sau khi gọi HomeProxy API: %d proxy", len(proxies))
-
-    # Lưu cache vào data/proxy_pool.json
-    save_proxy_pool(proxies)
     return proxies
 
 
@@ -428,25 +430,46 @@ def fetch_proxies_from_homeproxy_api(token: str) -> list[str]:
 
 
 def get_cached_proxy_pool() -> list[str]:
-    """Lấy danh sách proxy đã lưu trong cache."""
+    """Danh sách HomeProxy lấy được lần gần nhất (cache cũ không ghi nguồn có thể lẫn proxy khác -> bỏ qua)."""
     if os.path.isfile(PROXY_CACHE_FILE):
         try:
             with open(PROXY_CACHE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
+            if d.get("source") == POOL_SOURCE_HOMEPROXY:
                 return d.get("proxies", [])
         except Exception:
             pass
     return []
 
 
-def save_proxy_pool(proxies: list[str]):
+def save_proxy_pool(proxies: list[str], source: str = POOL_SOURCE_HOMEPROXY):
     """Lưu danh sách proxy vào cache file."""
     os.makedirs(os.path.dirname(PROXY_CACHE_FILE), exist_ok=True)
     try:
         with open(PROXY_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"proxies": proxies, "updated_at": int(time.time())}, f, ensure_ascii=False, indent=2)
+            json.dump({"proxies": proxies, "source": source, "updated_at": int(time.time())},
+                      f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def _proxy_loads(proxies: list[str], exclude_acc: str | None = None) -> dict[str, int]:
+    """Số tài khoản đang gắn vào từng proxy (để luôn chọn proxy ít tài khoản nhất)."""
+    loads = {p: 0 for p in proxies}
+    for a in store.list_accounts():
+        if a.get("id") == exclude_acc:
+            continue
+        p = a.get("proxy")
+        if p in loads:
+            loads[p] += 1
+    return loads
+
+
+def _least_loaded_first(proxies: list[str], loads: dict[str, int]) -> list[str]:
+    """Proxy ít tài khoản nhất lên trước; các proxy bằng tải thì xáo ngẫu nhiên."""
+    shuffled = list(proxies)
+    random.shuffle(shuffled)
+    return sorted(shuffled, key=lambda p: loads.get(p, 0))
 
 
 def get_account_proxy(acc_id: str) -> str | None:
@@ -481,10 +504,16 @@ def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False) -> st
         return None
 
     cur_proxy = acc.get("proxy")
-    if cur_proxy and not force_check:
+    # Chỉ đọc cache (không gọi mạng): hàm này chạy mỗi lần mượn/trả phiên trình duyệt
+    cached_pool = get_cached_proxy_pool()
+    stale = bool(cur_proxy and cached_pool and cur_proxy not in cached_pool)
+    if stale:
+        log.info("🔀 TK %s đang dùng proxy không còn trong danh sách HomeProxy -> chuyển sang proxy ít TK nhất",
+                 acc.get("label", acc_id))
+    if cur_proxy and not force_check and not stale:
         return cur_proxy
 
-    if cur_proxy:
+    if cur_proxy and not stale:
         ok, ip_or_err = test_proxy(cur_proxy)
         if ok:
             store.update_account(acc_id, proxy_status="alive", proxy_ip=ip_or_err)
@@ -493,23 +522,16 @@ def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False) -> st
             log.warning("❌ Proxy của TK %s đã DIE (%s) -> Tiến hành đổi sang proxy mới!", acc.get("label", acc_id), ip_or_err)
             store.update_account(acc_id, proxy_status="dead", proxy_error=ip_or_err)
 
-    # Cần cấp proxy mới từ Pool
-    pool = get_cached_proxy_pool()
-    if not pool:
-        pool = load_proxies_from_thinaptm()
+    # Cần cấp proxy mới từ danh sách HomeProxy
+    pool = cached_pool or load_proxies_from_thinaptm()
 
     if not pool:
         log.warning("Không có proxy nào khả dụng trong HomeProxy Pool!")
         return None
 
-    # Tìm các proxy chưa được gán cho tài khoản nào khác
-    assigned_proxies = {a.get("proxy") for a in store.list_accounts() if a.get("proxy") and a.get("id") != acc_id}
-    available = [p for p in pool if p not in assigned_proxies and p != cur_proxy]
-    if not available:
-        available = [p for p in pool if p != cur_proxy] or pool
-
-    # Xáo trộn và kiểm tra proxy sống
-    random.shuffle(available)
+    # Ưu tiên proxy đang ít tài khoản nhất (trước đây chọn ngẫu nhiên -> có proxy gánh 20+ TK cùng 1 IP)
+    loads = _proxy_loads(pool, exclude_acc=acc_id)
+    available = _least_loaded_first([p for p in pool if p != cur_proxy] or pool, loads)
     for candidate in available:
         ok, ip_or_err = test_proxy(candidate)
         if ok:
@@ -520,8 +542,12 @@ def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False) -> st
     return None
 
 
-def sync_all_accounts_with_homeproxy() -> dict:
-    """Đồng bộ toàn bộ proxy từ E:\\ThinAptm0707 và gán sticky proxy cho tất cả tài khoản chưa có."""
+def sync_all_accounts_with_homeproxy(rebalance: bool = False) -> dict:
+    """Nạp lại danh sách HomeProxy và gán proxy CỐ ĐỊNH cho tài khoản của máy này.
+
+    Mặc định chỉ gán cho TK chưa có proxy hoặc proxy đã chết / không còn trong danh sách HomeProxy (chọn proxy
+    ít TK nhất) — TK đang có proxy sống giữ nguyên IP. rebalance=True (người dùng xác nhận) mới chuyển bớt TK
+    khỏi proxy đang gánh quá ceil(số TK / số proxy)."""
     import concurrent.futures
     proxies = load_proxies_from_thinaptm()
     accounts = store.list_accounts()
@@ -554,23 +580,46 @@ def sync_all_accounts_with_homeproxy() -> dict:
                 except Exception:
                     pass
 
+    # Proxy đang có TK dùng mà test nhanh bị trượt: test lại kỹ trước khi coi là chết (tránh đổi IP oan)
+    alive_set = {p for p, _ in alive_proxies}
+    in_use = {a.get("proxy") for a in accounts if a.get("proxy")}
+    for p in [p for p in proxies if p in in_use and p not in alive_set]:
+        ok, ip = test_proxy(p, 10.0)
+        if ok:
+            alive_proxies.append((p, ip))
+
     # Nếu không test được mạng ngoài, dùng toàn bộ danh sách proxy làm fallback
     if not alive_proxies and proxies:
         alive_proxies = [(p, "") for p in proxies]
 
-    assigned_proxies = {a.get("proxy") for a in accounts if a.get("proxy")}
-    free_alive = [item for item in alive_proxies if item[0] not in assigned_proxies]
-    if not free_alive:
-        free_alive = list(alive_proxies)
-
-    for i, a in enumerate(accounts):
-        aid = a["id"]
-        cur_p = a.get("proxy")
-        if not cur_p:
-            if free_alive:
-                chosen, ip = free_alive[i % len(free_alive)]
-                assign_sticky_proxy(aid, chosen, ip)
-                assigned_count += 1
+    alive_ip = dict(alive_proxies)
+    cap = -(-len(accounts) // len(alive_ip)) if alive_ip else 0
+    loads = {p: 0 for p in alive_ip}
+    keep, to_assign = [], []
+    for a in accounts:
+        p = a.get("proxy")
+        if p in loads and (not rebalance or loads[p] < cap):
+            loads[p] += 1
+            keep.append(a)
+        else:
+            to_assign.append(a)
+    # Số TK đang vượt mức chia đều (chỉ báo, không tự chuyển nếu người dùng chưa xác nhận)
+    overloaded = sum(max(0, n - cap) for n in loads.values()) if not rebalance else 0
+    rebalanced = 0
+    for a in to_assign:
+        if not loads:
+            break
+        chosen = _least_loaded_first(list(loads), loads)[0]
+        loads[chosen] += 1
+        if a.get("proxy"):
+            rebalanced += 1
+        assign_sticky_proxy(a["id"], chosen, alive_ip.get(chosen, ""))
+        assigned_count += 1
+    if alive_ip:
+        log.info("📌 [Proxy Manager] %d TK / %d proxy sống (của %d HomeProxy): gán mới %d, đổi proxy %d TK "
+                 "(proxy chết/không còn trong danh sách%s), mức chia đều %d TK/proxy, đang vượt mức %d TK",
+                 len(accounts), len(alive_ip), len(proxies), assigned_count - rebalanced, rebalanced,
+                 " + chia lại theo yêu cầu" if rebalance else "", cap, overloaded)
 
     return {
         "success": True,
@@ -579,7 +628,10 @@ def sync_all_accounts_with_homeproxy() -> dict:
         "alive_proxies": len(alive_proxies),
         "total_accounts": len(accounts),
         "assigned_count": assigned_count,
-        "newly_assigned": assigned_count,
+        "newly_assigned": assigned_count - rebalanced,
+        "rebalanced": rebalanced,
+        "max_accounts_per_proxy": cap,
+        "overloaded": overloaded,
         "accounts": store.list_accounts()
     }
 
