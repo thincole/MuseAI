@@ -12,14 +12,18 @@ import os
 import re
 import urllib.parse
 
+log = logging.getLogger("shopee_scraper")
+
+# curl_cffi trên máy mới cài có thể "có nhưng hỏng" (thiếu/lệch DLL -> OSError, không phải ImportError) -> trước đây
+# làm sập cả chức năng Import Link. Hỏng kiểu gì cũng chuyển sang requests thường.
 try:
     from curl_cffi import requests as cffi_requests
     HAS_CURL_CFFI = True
-except ImportError:
-    import requests as std_requests
+except Exception as _cffi_err:  # noqa: BLE001
+    cffi_requests = None
     HAS_CURL_CFFI = False
-
-log = logging.getLogger("shopee_scraper")
+    log.warning("curl_cffi không dùng được (%s: %s) -> cào Shopee bằng requests thường",
+                type(_cffi_err).__name__, _cffi_err)
 
 FACEBOOK_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
 
@@ -93,14 +97,19 @@ def fetch_shopee_product(url: str, timeout: int = 15) -> dict | None:
     final_url = target_url
 
     try:
+        resp = None
         if HAS_CURL_CFFI:
-            resp = cffi_requests.get(
-                target_url,
-                impersonate="chrome124",
-                headers={"User-Agent": FACEBOOK_UA},
-                timeout=timeout,
-                allow_redirects=True
-            )
+            try:
+                resp = cffi_requests.get(
+                    target_url,
+                    impersonate="chrome124",
+                    headers={"User-Agent": FACEBOOK_UA},
+                    timeout=timeout,
+                    allow_redirects=True
+                )
+            except Exception as e:  # noqa: BLE001 - curl_cffi lỗi lúc chạy (vd bản cũ không có chrome124)
+                log.warning("curl_cffi lỗi khi cào %s (%s) -> thử lại bằng requests", target_url, e)
+        if resp is not None:
             html = resp.text
             final_url = str(resp.url)
         else:

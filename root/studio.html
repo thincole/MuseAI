@@ -1958,6 +1958,18 @@
     return h;
   }
 
+  // Đọc phản hồi JSON an toàn: backend/mạng trả trang lỗi dạng chữ (vd "Internal Server Error") thì vẫn trả về
+  // object có message rõ ràng thay vì ném lỗi khó hiểu "Unexpected token ... is not valid JSON".
+  async function readJsonSafe(res) {
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      const snippet = (text || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+      return { success: false, message: `Máy chủ trả lỗi HTTP ${res.status}: ${snippet || res.statusText || "không có nội dung"}` };
+    }
+  }
+
   // Server health check
   async function checkServerStatus() {
     const dot = document.getElementById("serverDot");
@@ -4398,9 +4410,9 @@
         })
       });
 
-      const data = await res.json();
+      const data = await readJsonSafe(res);
       if (!res.ok || !data.success) {
-        throw new Error(data.message || "Lỗi khi cào link");
+        throw new Error(data.message || data.detail || `Lỗi khi cào link (HTTP ${res.status})`);
       }
 
       const newProducts = data.products || [];

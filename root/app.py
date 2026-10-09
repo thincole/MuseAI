@@ -142,6 +142,19 @@ async def _validation_exc(request: Request, exc: RequestValidationError):
             "type": "invalid_request_error", "param": None, "code": 422}})
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
+
+@app.exception_handler(Exception)
+async def _unhandled_exc(request: Request, exc: Exception):
+    """Lỗi chưa bắt -> vẫn trả JSON có nội dung lỗi (thay vì trang "Internal Server Error" khiến giao diện chỉ báo
+    'is not valid JSON' và che mất nguyên nhân), đồng thời ghi Traceback đầy đủ vào log.txt để tra trên từng máy."""
+    log.error("❌ Lỗi không xử lý tại %s %s: %s: %s", request.method, request.url.path, type(exc).__name__, exc,
+              exc_info=exc)
+    msg = f"{type(exc).__name__}: {exc}"
+    if request.url.path.startswith("/v1/"):
+        return JSONResponse(status_code=500, content={"error": {
+            "message": msg, "type": "server_error", "param": None, "code": 500}})
+    return JSONResponse(status_code=500, content={"detail": msg, "message": msg, "success": False})
+
 MODELS = [
     {"id": "muse-spark", "object": "model", "owned_by": "muse",
      "description": "Muse Spark —— 文本 / 代码对话（网页免费额度，支持流式）"},
@@ -2389,8 +2402,13 @@ def import_shopee_links(req: dict):
         }
 
     if prefetch:
-        products = shopee_scraper.scrape_multiple_shopee_links(unique_links, max_workers=6)
-    else:
+        try:
+            products = shopee_scraper.scrape_multiple_shopee_links(unique_links, max_workers=6)
+        except Exception as exc:  # noqa: BLE001 - cào lỗi (mạng/thư viện) -> vẫn nạp link, cào lại lúc render
+            log.warning("Cào trước %d link Shopee lỗi (%s: %s) -> nạp link chưa cào, sẽ cào khi render",
+                        len(unique_links), type(exc).__name__, exc, exc_info=exc)
+            prefetch = False
+    if not prefetch:
         products = []
         for link in unique_links:
             _, iid = shopee_scraper.extract_ids_from_url(link)
