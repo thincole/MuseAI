@@ -1309,14 +1309,16 @@ def ghep_anh_12s(
         y_expr = "ih/2-(ih/zoom/2)"
 
         # Video AI nguyên bản, không làm chậm, cắt chuẩn video_dur
-        v_part = f"[0:v]scale={width}:{height},fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setpts=PTS-STARTPTS[v_part]"
+        # setsar=1 (cả 2 đoạn): một số clip Muse có tỉ lệ điểm ảnh lạ (SAR 16:9, 1124:1125...) trong khi đoạn ảnh
+        # zoom là 1:1 -> concat không nối được 2 đoạn khác SAR, FFmpeg báo -22 (Invalid argument) -> ép về 1:1.
+        v_part = f"[0:v]scale={width}:{height},fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setsar=1,setpts=PTS-STARTPTS[v_part]"
 
         # Outro ảnh chuyển động phóng to (zoom-in)
         i_v = (
             f"[1:v]scale={w_scale}:{h_scale}:force_original_aspect_ratio=increase,"
             f"crop={w_scale}:{h_scale},"
             f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height},"
-            f"fps={fps_int},trim=0:{image_dur},setpts=PTS-STARTPTS[i_v]"
+            f"fps={fps_int},trim=0:{image_dur},setsar=1,setpts=PTS-STARTPTS[i_v]"
         )
 
         filter_parts = [v_part, i_v]
