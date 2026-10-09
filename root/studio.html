@@ -3641,6 +3641,7 @@
     // Muse đã trả clip (tài khoản đã được nhả). Phần lưu/ghép/báo DB trả về dạng hàm để luồng chạy nền,
     // trong lúc đó luồng gửi render SP kế tiếp ngay.
     return async () => {
+    let rawSavedToTemp = false;
     if (effectiveIs16s) {
       appendShopeeLog(`> [Luồng ${workerId}] Đang ghép Clip A + Clip B thành video 16s qua FFmpeg...`);
       const concatRes = await fetch("/api/shopee/concat-videos", {
@@ -3669,6 +3670,7 @@
           const sData = await sRes.json();
           if (sData.path) finishedVideoFilename = sData.path;
           else if (sData.filename) finishedVideoFilename = sData.filename;
+          rawSavedToTemp = !!(sData.path || sData.filename);
         }
       } catch (_) {}
     }
@@ -3695,6 +3697,22 @@
     });
     if (!saveRes.ok) {
       const errText = await saveRes.text();
+      if (shouldGhepAnh && rawSavedToTemp && saveRes.status === 502) {
+        // Video AI đã render xong và nằm an toàn trong temp ({item_id}-raw.mp4): vẫn báo hoàn tất về Database
+        // để SP không bị nhận lại; phần ghép Outro 12s làm sau bằng nút "Ghép Clip Temp".
+        appendShopeeLog(`⚠️ [Luồng ${workerId}] SP ${prod.item_id}: chưa ghép được Outro 12s (${saveRes.status}) -> giữ video AI trong temp/${prod.item_id}-raw.mp4, bấm "Ghép Clip Temp" để ghép sau.`);
+        const pendingPath = `${outDir}/${targetFileName}`;
+        if (!prod._is_imported) {
+          await fetch("/api/shopee/complete", {
+            method: "POST",
+            headers: getHeaders(),
+            body: JSON.stringify({ item_id: prod.item_id, status: "completed", video_path: pendingPath })
+          });
+          appendShopeeLog(`✓ [Luồng ${workerId}] Đã báo hoàn tất Job ID: ${prod.item_id} về Database (video AI chờ ghép 12s trong temp).`);
+        }
+        updateTempStitchButtonStatus();
+        return;
+      }
       throw new Error(`Lỗi lưu/ghép video (${saveRes.status}): ${errText}`);
     }
     const saveData = await saveRes.json();
