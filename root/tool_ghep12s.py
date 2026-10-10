@@ -258,12 +258,13 @@ def internal_ghep_anh_12s(video_path: str, image_path: str, output_path: str) ->
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
 
-        v_part = f"[0:v]scale={width}:{height},fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setpts=PTS-STARTPTS[v_part]"
+        # setsar=1 cả 2 đoạn: clip Muse có SAR lạ (16:9, 1124:1125) -> concat báo -22 (giống shopee_engine.ghep_anh_12s)
+        v_part = f"[0:v]scale={width}:{height},fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setsar=1,setpts=PTS-STARTPTS[v_part]"
         i_v = (
             f"[1:v]scale={w_scale}:{h_scale}:force_original_aspect_ratio=increase,"
             f"crop={w_scale}:{h_scale},"
             f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height},"
-            f"fps={fps_int},trim=0:{image_dur},setpts=PTS-STARTPTS[i_v]"
+            f"fps={fps_int},trim=0:{image_dur},setsar=1,setpts=PTS-STARTPTS[i_v]"
         )
 
         filter_parts = [v_part, i_v]
@@ -287,9 +288,10 @@ def internal_ghep_anh_12s(video_path: str, image_path: str, output_path: str) ->
         filter_complex_str = "; ".join(filter_parts)
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
+        # -reinit_filter 0: clip Muse đổi định dạng điểm ảnh giữa chừng làm FFmpeg vứt khung -> video 10.54s thay vì 12s
         cmd = [
             "ffmpeg", "-y",
-            "-i", video_path,
+            "-reinit_filter", "0", "-i", video_path,
             "-loop", "1", "-t", str(image_dur), "-i", image_path,
             "-filter_complex", filter_complex_str
         ]

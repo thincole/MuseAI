@@ -259,7 +259,7 @@ def clean_product_title(name: str) -> str:
     r"""Làm sạch tên sản phẩm trước khi đưa vào prompt:
     1. Gỡ bỏ thẻ ngoặc quảng cáo: 【 】 [ ] ( ) | - * ~ # $ % ^ & _ = { } \ < > / ? : ; "
     2. Gỡ bỏ các từ nhạy cảm / vi phạm chính sách AI video.
-    3. Trả về tối đa 4-5 từ chữ sạch tinh gọn.
+    3. Trả về tối đa 12 từ chữ sạch tinh gọn.
     """
     if not name:
         return "featured item"
@@ -286,8 +286,33 @@ def clean_product_title(name: str) -> str:
         s = re.sub(r"\b" + re.escape(w) + r"\b", "", s, flags=re.IGNORECASE)
 
     words = [w.strip() for w in s.split() if len(w.strip()) > 1]
-    clean_str = " ".join(words[:4]).strip()
+    # 12 từ: loại sản phẩm thường nằm cuối tiêu đề Shopee (vd "... Board Shorts", "... T-Shirt") — 4 từ hay cắt mất
+    clean_str = " ".join(words[:12]).strip()
     return clean_str if clean_str else "featured item"
+
+
+# Ràng buộc giữ nguyên sản phẩm theo ảnh tham chiếu (09/10: video Unboxing tự bịa hộp in hình, in chữ "SUPER SALE"
+# từ banner quảng cáo lên bao bì, vẽ lại logo/chữ sai) -> gắn vào mọi prompt video.
+PRODUCT_FIDELITY = (
+    'The product must look exactly identical to the product in the attached reference image in every frame: '
+    'same shape, proportions, colors, materials, patterns, logo and printed text. '
+    'Do not redesign, morph, bend, stretch, melt or deform the product, and do not add or remove parts. '
+    'Use only the product itself from the reference image and ignore any promotional text, prices, stickers, '
+    'watermarks, badges or collage elements around it. '
+    'Hands hold the product naturally without merging into it.'
+)
+
+_IMAGE_PRODUCT = "the product shown in the attached reference image"
+
+
+def _image_first(prompt: str, short_name: str) -> str:
+    """Hình ảnh theo ẢNH, tên Shopee chỉ dùng cho lời thoại.
+
+    Thử 10/10: tên trong phần mô tả cảnh lấn át ảnh ("aquaflask ... silicon boot" = vỏ đế bình bị vẽ thành ủng cao su,
+    kể cả khi dặn "làm theo ảnh") -> bỏ tên khỏi mô tả hình ảnh, chỉ đưa vào câu cho lời thoại."""
+    prompt = prompt.replace(f'the product "{short_name}"', _IMAGE_PRODUCT).replace(f'"{short_name}"', _IMAGE_PRODUCT)
+    return (f'{prompt} For the voiceover only, the shop listing title of this product is "{short_name}"; '
+            f'the visuals must show exactly the item in the reference image even if the title suggests something else.')
 
 
 def pick_scene(user_choice: str, lang: str = "en") -> tuple[str, str]:
@@ -302,6 +327,12 @@ def pick_scene(user_choice: str, lang: str = "en") -> tuple[str, str]:
 
 
 def build_tvc_prompt(product_name: str, lang: str = "ph", review_style: str = "Unboxing") -> tuple[str, str]:
+    """Prompt TVC 8s/10s + ràng buộc giữ nguyên sản phẩm theo ảnh tham chiếu (PRODUCT_FIDELITY)."""
+    prompt, label = _build_tvc_prompt_base(product_name, lang=lang, review_style=review_style)
+    return f"{_image_first(prompt, clean_product_title(product_name))} {PRODUCT_FIDELITY}", label
+
+
+def _build_tvc_prompt_base(product_name: str, lang: str = "ph", review_style: str = "Unboxing") -> tuple[str, str]:
     """Tạo 1 prompt TVC 8s chuẩn cho video quảng cáo / review sản phẩm Shopee từ Novagate.
     Hỗ trợ đầy đủ phong cách:
     - POV / Góc nhìn thứ nhất: TUYỆT ĐỐI KHÔNG có mặt người mẫu, chỉ có 2 bàn tay thao tác trên mặt bàn.
@@ -342,8 +373,10 @@ def build_tvc_prompt(product_name: str, lang: str = "ph", review_style: str = "U
             f'Create a product advertisement video (TVC) unboxing the product "{short_name}". '
             f'A top-down desk camera angle looking down at a clean tabletop. '
             f'ABSOLUTELY NO human face, NO head, NO presenter body visible. '
-            f'Only two clean, natural hands are visible carefully opening packaging, unboxing, and presenting the product. '
-            f'The hands smoothly showcase the product details, packaging, and craftsmanship. '
+            f'Only two clean, natural hands are visible opening a plain, unbranded brown cardboard box '
+            f'(no printing, no logo, no text on the box) and taking out the product, then presenting it to the camera. '
+            f'The product taken out of the box is exactly the product from the reference image. '
+            f'The hands smoothly showcase the product details and craftsmanship. '
             f'Voiceover speaks in {_tvc["language_tvc"]} explaining the product benefits right away without any introduction; no text is displayed in the video. '
             f'The product is accurately sized. '
             f'The product price is not mentioned in the video.'
@@ -802,6 +835,7 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
                 # Giới hạn -threads 2 để không chiếm dụng toàn bộ core CPU của máy (tránh đơ máy)
                 cmd_reencode = [
                     "ffmpeg", "-y",
+                    "-reinit_filter", "0",  # clip Muse có thể đổi định dạng điểm ảnh giữa chừng (xem ghep_anh_12s)
                     "-f", "concat", "-safe", "0",
                     "-i", list_file,
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
@@ -830,6 +864,13 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
 
 
 def build_video_prompts_16s(product_name: str, scene_choice: str = "🎲 Random", lang: str = "ph", review_style: str = "Unboxing") -> tuple[list[str], str]:
+    """Prompt A + B (16s) + ràng buộc giữ nguyên sản phẩm theo ảnh tham chiếu (PRODUCT_FIDELITY) cho cả 2 đoạn."""
+    prompts, label = _build_video_prompts_16s_base(product_name, scene_choice=scene_choice, lang=lang, review_style=review_style)
+    short_name = clean_product_title(product_name)
+    return [f"{_image_first(p, short_name)} {PRODUCT_FIDELITY}" for p in prompts], label
+
+
+def _build_video_prompts_16s_base(product_name: str, scene_choice: str = "🎲 Random", lang: str = "ph", review_style: str = "Unboxing") -> tuple[list[str], str]:
     """Tạo 2 prompt Prompt A (0-8s) và Prompt B (8-16s) chuẩn TVC Review sản phẩm Shopee."""
     _tvc = _LANG_MAP.get(lang, _LANG_MAP["ph"])
     short_name = clean_product_title(product_name)
@@ -844,7 +885,8 @@ def build_video_prompts_16s(product_name: str, scene_choice: str = "🎲 Random"
         prompt_a = (
             f'Create segment 1 of a 2-part product review video (0-8 seconds) for "{short_name}". '
             f'First-person point of view (POV) looking down at a clean tabletop surface in {scene_desc}. '
-            f'ABSOLUTELY NO human face, NO head visible. Only two clean natural hands unboxing, picking up, and revealing the product. '
+            f'ABSOLUTELY NO human face, NO head visible. Only two clean natural hands opening a plain, unbranded brown cardboard box '
+            f'(no printing, no logo, no text on the box), picking up and revealing the product, which is exactly the product from the reference image. '
             f'Camera executes dynamic push-in on the product for an impressive reveal moment. '
             f'Voiceover speaks in {_tvc["language_tvc"]} introducing key features without greeting; no text displayed. '
             f'CRITICAL HANDOFF: Segment ends with hands holding the product steady at center desk.'
@@ -1343,9 +1385,11 @@ def ghep_anh_12s(
         filter_complex_str = "; ".join(filter_parts)
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
+        # -reinit_filter 0: một số clip Muse đổi định dạng điểm ảnh giữa chừng (vd 36 khung đầu yuv444p rồi yuv420p)
+        # -> FFmpeg khởi tạo lại chuỗi bộ lọc, mốc thời gian quay về 0 và vứt ~35 khung -> video ra 10.54s thay vì 12s.
         cmd = [
             "ffmpeg", "-y",
-            "-i", video_path,
+            "-reinit_filter", "0", "-i", video_path,
             "-loop", "1", "-t", str(image_dur), "-i", image_path,
             "-filter_complex", filter_complex_str
         ]
