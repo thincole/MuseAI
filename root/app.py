@@ -2110,7 +2110,8 @@ def _get_shopee_settings() -> dict:
         "min_commission": "1",
         "min_sold": "0",
         "min_price": "0",
-        "max_price": ""
+        "max_price": "",
+        "jobs_per_account": 2
     }
     if os.path.isfile(SHOPEE_SETTINGS_FILE):
         try:
@@ -2127,11 +2128,20 @@ def get_shopee_settings():
     return _get_shopee_settings()
 
 
+def _apply_jobs_per_account(value) -> int:
+    """Áp dụng ô "Số video cùng lúc / tài khoản" (1-4) cho bộ cấp TK và pool phiên Chrome."""
+    n = store.set_max_jobs_per_account(value)
+    engine.max_jobs_per_account = n
+    return n
+
+
 @app.post("/api/shopee/save-settings")
 def save_shopee_settings(settings: dict):
     os.makedirs(CFG.data_dir, exist_ok=True)
     with open(SHOPEE_SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
+    if "jobs_per_account" in settings:
+        _apply_jobs_per_account(settings["jobs_per_account"])
     return {"success": True}
 
 
@@ -3224,6 +3234,59 @@ def rotate_account_proxy(acc_id: str):
     return {"success": True, "proxy": new_p, "ip": acc.get("proxy_ip")}
 
 
+# ------------------------- Cấu hình máy -> số luồng tối đa an toàn -------------------------
+RAM_PER_THREAD_GB = 0.5   # mỗi luồng = 1 tab Chrome đang render (đo thực tế ~0,5 GB)
+THREADS_PER_CPU = 2       # mỗi luồng CPU (logical) gánh tối đa ~2 tab
+RAM_RESERVE_GB_MIN = 6    # chừa cho Windows + app + FFmpeg ghép video
+
+
+def _memory_gb() -> tuple[float, float]:
+    """(Tổng RAM, RAM còn trống) theo GB. Không cần psutil (máy mới có thể chưa cài)."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return vm.total / 2**30, vm.available / 2**30
+    except Exception:  # noqa: BLE001
+        pass
+    if os.name == "nt":
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        st = _MemStatus()
+        st.dwLength = ctypes.sizeof(_MemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return st.ullTotalPhys / 2**30, st.ullAvailPhys / 2**30
+    pages, page_size = os.sysconf("SC_PHYS_PAGES"), os.sysconf("SC_PAGE_SIZE")
+    avail = os.sysconf("SC_AVPHYS_PAGES") * page_size
+    return pages * page_size / 2**30, avail / 2**30
+
+
+@app.get("/api/system/capacity")
+def system_capacity():
+    """Số luồng tối đa máy này chạy được mà không lag/đơ: min(giới hạn RAM, giới hạn CPU)."""
+    total_gb, avail_gb = _memory_gb()
+    cpu = os.cpu_count() or 1
+    reserve = max(RAM_RESERVE_GB_MIN, total_gb * 0.1)
+    ram_cap = max(1, int((total_gb - reserve) / RAM_PER_THREAD_GB))
+    cpu_cap = max(1, cpu * THREADS_PER_CPU)
+    return {
+        "ram_total_gb": round(total_gb, 1),
+        "ram_available_gb": round(avail_gb, 1),
+        "ram_used_pct": round((1 - avail_gb / total_gb) * 100) if total_gb else 0,
+        "cpu_threads": cpu,
+        "ram_cap": ram_cap,
+        "cpu_cap": cpu_cap,
+        "max_threads": min(ram_cap, cpu_cap),
+        "limited_by": "RAM" if ram_cap <= cpu_cap else "CPU",
+        "ram_per_thread_gb": RAM_PER_THREAD_GB,
+    }
+
+
 # ------------------------- Trình duyệt Anti-Detect & Quản lý TTL -------------------------
 @app.get("/api/browser/ttl")
 def get_browser_ttl():
@@ -4031,6 +4094,8 @@ async def _startup():
             200, anyio.to_thread.current_default_thread_limiter().total_tokens)
     except Exception as exc:
         log.warning("Không nới được threadpool anyio: %s", exc)
+    n_jobs = _apply_jobs_per_account(_get_shopee_settings().get("jobs_per_account", 2))
+    log.info("🎬 Số video cùng lúc / tài khoản: %d", n_jobs)
     # Luồng xử lý (ảnh lẫn video) đã chết khi tắt app: đóng các task còn treo để không bị đếm/kẹt mãi.
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):

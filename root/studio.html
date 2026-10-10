@@ -1644,8 +1644,19 @@
                   <option value="10">10 Luồng (Xeon/Server)</option>
                   <option value="custom">Tùy chỉnh số luồng...</option>
                 </select>
-                <input type="number" id="sp_threads" min="1" max="100" value="2" style="display:none;width:55px;padding:4px 6px;background:#0d1117;border:1px solid #38bdf8;border-radius:6px;color:#38bdf8;font-weight:bold;text-align:center;font-size:12px;" oninput="onShopeeThreadsCustomChange()" onchange="saveShopeeSettings()" title="Nhập số luồng cụ thể bạn muốn">
+                <input type="number" id="sp_threads" min="1" max="400" value="2" style="display:none;width:55px;padding:4px 6px;background:#0d1117;border:1px solid #38bdf8;border-radius:6px;color:#38bdf8;font-weight:bold;text-align:center;font-size:12px;" oninput="onShopeeThreadsCustomChange()" onchange="saveShopeeSettings()" title="Nhập số luồng cụ thể bạn muốn">
                 <span id="sp_threads_alive_hint" style="font-size:11px;font-weight:600;margin-left:4px;"></span>
+                <span id="sp_threads_machine_hint" style="font-size:11px;font-weight:600;margin-left:4px;"></span>
+              </div>
+
+              <div style="display:flex;align-items:center;gap:6px;background:rgba(56,189,248,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(56,189,248,0.35);" title="Mỗi tài khoản Muse render tối đa bao nhiêu video cùng lúc (mỗi video 1 tab Chrome riêng, ~0,5 GB RAM). Đã thử: 2 video/TK chậm hơn ~14% mỗi video nhưng mỗi TK làm được ~1,7 lần. 3-4 chưa thử kỹ. Quota 2.500 video/TK/tuần không đổi -> càng nhiều video/TK thì TK càng nhanh hết quota.">
+                <span style="font-size:12px;font-weight:700;color:#38bdf8;">🎬 Số video cùng lúc / tài khoản:</span>
+                <select class="shopee-select" id="sp_jobs_per_account" onchange="updateShopeeThreadsHint(); saveShopeeSettings()" style="font-weight:bold;color:#38bdf8;padding:4px 8px;background:#0d1117;">
+                  <option value="1">1</option>
+                  <option value="2" selected>2 (Khuyên dùng)</option>
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                </select>
               </div>
 
               <label style="display:flex;align-items:center;gap:5px;font-size:12px;font-weight:700;color:#a78bfa;cursor:pointer;" title="Khi hàng đợi sắp hết, tự nhận thêm lô SP mới từ Database (cùng bộ lọc) để batch chạy liên tục không phải bấm Nhận SP">
@@ -1913,6 +1924,8 @@
     await loadShopeeSettings();
     initBrowserProtectionCollapse();
     fetchBrowserTtlStatus(); // gồm cả trạng thái Proxy thật -> nút Proxy không hiện sai lúc mới mở
+    fetchMachineCapacity(); // cảnh báo số luồng vượt sức máy
+    setInterval(fetchMachineCapacity, 60000); // cập nhật % RAM đang dùng
 
     // Setup paste listener for clipboard image
     window.addEventListener("paste", handlePasteEvent);
@@ -2819,6 +2832,8 @@
       if (data.del_img !== undefined) document.getElementById("sp_del_img").checked = !!data.del_img;
       if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
       if (data.auto_claim !== undefined) document.getElementById("sp_auto_claim").checked = !!data.auto_claim;
+      if (data.jobs_per_account) document.getElementById("sp_jobs_per_account").value = String(data.jobs_per_account);
+      updateShopeeThreadsHint();
       onShopeeDurationChange();
       updateTempStitchButtonStatus();
     } catch (e) {
@@ -2840,13 +2855,52 @@
     }
 
     const alive = cachedAliveCount;
+    const perAcc = getShopeeJobsPerAccount();
+    const cap = alive * perAcc;
     if (alive <= 0) {
       hintEl.innerHTML = `<span style="color:#ef4444;font-weight:700;">(🔴 0 TK sống - Cần nạp Cookie)</span>`;
-    } else if (userThreads > alive) {
-      hintEl.innerHTML = `<span style="color:#f59e0b;font-weight:700;">(⚠️ Chọn ${userThreads} luồng > ${alive} TK sống → Tối đa chạy ${alive} luồng)</span>`;
+    } else if (userThreads > cap) {
+      hintEl.innerHTML = `<span style="color:#f59e0b;font-weight:700;">(⚠️ Chọn ${userThreads} luồng > ${alive} TK sống × ${perAcc} video → Tối đa chạy ${cap} luồng)</span>`;
     } else {
-      hintEl.innerHTML = `<span style="color:#34d399;font-weight:600;">(🟢 ${userThreads} luồng / ${alive} TK sống)</span>`;
+      hintEl.innerHTML = `<span style="color:#34d399;font-weight:600;">(🟢 ${userThreads} luồng / ${alive} TK sống × ${perAcc} video)</span>`;
     }
+    updateMachineThreadsHint(alive > 0 ? Math.min(userThreads, cap) : userThreads);
+  }
+
+  // ---- Sức máy: mỗi luồng = 1 tab Chrome ~0,5 GB RAM -> cảnh báo khi chọn quá số luồng máy chịu được ----
+  let machineCapacity = null;
+
+  async function fetchMachineCapacity() {
+    try {
+      const res = await fetch("/api/system/capacity", { headers: getHeaders() });
+      if (res.ok) machineCapacity = await res.json();
+    } catch (_) {}
+    updateShopeeThreadsHint();
+    return machineCapacity;
+  }
+
+  function machineSummary(c) {
+    return `${c.ram_total_gb} GB RAM · ${c.cpu_threads} luồng CPU`;
+  }
+
+  function updateMachineThreadsHint(effectiveThreads) {
+    const el = document.getElementById("sp_threads_machine_hint");
+    const c = machineCapacity;
+    if (!el || !c) return;
+    const max = c.max_threads;
+    const ramNote = c.ram_used_pct >= 90 ? ` · RAM đang dùng ${c.ram_used_pct}%!` : "";
+    if (effectiveThreads > max) {
+      el.innerHTML = `<span style="color:#ef4444;font-weight:700;" title="Mỗi luồng ~${c.ram_per_thread_gb} GB RAM. Giới hạn RAM: ${c.ram_cap} luồng, giới hạn CPU: ${c.cpu_cap} luồng.">🔥 VƯỢT SỨC MÁY: ${machineSummary(c)} chỉ chạy tối đa ~${max} luồng (${effectiveThreads} luồng cần ~${Math.ceil(effectiveThreads * c.ram_per_thread_gb)} GB RAM) → dễ lag/đơ${ramNote}</span>`;
+    } else if (effectiveThreads > max * 0.85 || ramNote) {
+      el.innerHTML = `<span style="color:#f59e0b;font-weight:700;" title="Mỗi luồng ~${c.ram_per_thread_gb} GB RAM. Giới hạn RAM: ${c.ram_cap} luồng, giới hạn CPU: ${c.cpu_cap} luồng.">⚠️ Gần giới hạn máy (${machineSummary(c)} → tối đa ~${max} luồng)${ramNote}</span>`;
+    } else {
+      el.innerHTML = `<span style="color:#34d399;font-weight:600;" title="Mỗi luồng ~${c.ram_per_thread_gb} GB RAM. Giới hạn RAM: ${c.ram_cap} luồng, giới hạn CPU: ${c.cpu_cap} luồng.">💻 ${machineSummary(c)} → tối đa ~${max} luồng</span>`;
+    }
+  }
+
+  function getShopeeJobsPerAccount() {
+    const v = parseInt(document.getElementById("sp_jobs_per_account")?.value) || 2;
+    return Math.max(1, Math.min(4, v));
   }
 
   function onShopeeThreadsChange() {
@@ -2881,6 +2935,7 @@
       del_img: document.getElementById("sp_del_img").checked,
       ghep_anh: document.getElementById("sp_ghep_anh").checked,
       auto_claim: !!document.getElementById("sp_auto_claim")?.checked,
+      jobs_per_account: getShopeeJobsPerAccount(),
       naming: document.getElementById("sp_naming").value,
       out_dir: document.getElementById("sp_out_dir").value.trim(),
       limit: parseInt(document.getElementById("sp_limit").value) || 2000,
@@ -3799,6 +3854,20 @@
     }
 
     if (isShopeeBatchRunning) return;
+
+    // Chọn quá sức máy -> hỏi lại trước khi chạy (tránh lag/đơ cả máy)
+    const cap = await fetchMachineCapacity();
+    if (cap) {
+      const wanted = Math.max(1, parseInt(document.getElementById("sp_threads").value) || 2);
+      const effective = cachedAliveCount > 0 ? Math.min(wanted, cachedAliveCount * getShopeeJobsPerAccount()) : wanted;
+      if (effective > cap.max_threads && !confirm(
+          `⚠️ Máy này (${machineSummary(cap)}) chỉ chạy tốt tối đa ~${cap.max_threads} luồng.\n` +
+          `Bạn đang chọn ${effective} luồng (cần ~${Math.ceil(effective * cap.ram_per_thread_gb)} GB RAM) → dễ lag, đơ máy, render lỗi hàng loạt.\n\n` +
+          `Bấm OK để VẪN CHẠY, hoặc Hủy để giảm số luồng.`)) {
+        return;
+      }
+    }
+
     isShopeeBatchRunning = true;
     shopeeStopRequested = false;
     shopeeForceStopRequested = false;
@@ -3861,13 +3930,15 @@
       return;
     }
 
-    // NGUYÊN TẮC: Số luồng chạy luôn <= số tài khoản đang còn sống (mỗi tài khoản 1 luồng cùng lúc, không bao giờ chạy quá)
-    const maxWorkers = Math.min(requestedWorkers, aliveAccounts);
+    // NGUYÊN TẮC: Số luồng chạy luôn <= số TK còn sống × số video cùng lúc / TK (máy chủ cũng giới hạn đúng mức này)
+    const jobsPerAcc = getShopeeJobsPerAccount();
+    await saveShopeeSettings(); // đảm bảo máy chủ dùng đúng số video / TK trước khi chạy
+    const maxWorkers = Math.min(requestedWorkers, aliveAccounts * jobsPerAcc);
 
-    if (requestedWorkers > aliveAccounts) {
-      appendShopeeLog(`⚡ ĐIỀU PHỐI TỐC ĐỘ: Bạn chọn ${requestedWorkers} luồng, nhưng hiện có ${aliveAccounts} tài khoản còn sống -> Hệ thống tự động giới hạn chạy ${maxWorkers} luồng song song (đảm bảo mỗi tài khoản 1 luồng độc lập, tránh xung đột/treo tác vụ).`);
+    if (requestedWorkers > maxWorkers) {
+      appendShopeeLog(`⚡ ĐIỀU PHỐI TỐC ĐỘ: Bạn chọn ${requestedWorkers} luồng, nhưng hiện có ${aliveAccounts} tài khoản còn sống × ${jobsPerAcc} video/TK -> Hệ thống tự động giới hạn chạy ${maxWorkers} luồng song song.`);
     } else {
-      appendShopeeLog(`🚀 BẮT ĐẦU CHẠY BATCH RENDER CHO ${shopeeClaimedProducts.length} SẢN PHẨM VỚI ${maxWorkers} LUỒNG SONG SONG (${aliveAccounts} TÀI KHOẢN KHẢ DỤNG)...`);
+      appendShopeeLog(`🚀 BẮT ĐẦU CHẠY BATCH RENDER CHO ${shopeeClaimedProducts.length} SẢN PHẨM VỚI ${maxWorkers} LUỒNG SONG SONG (${aliveAccounts} TÀI KHOẢN KHẢ DỤNG × tối đa ${jobsPerAcc} video/TK)...`);
     }
 
     // Rà soát trước toàn bộ danh sách sản phẩm trong thư mục temp và outDir

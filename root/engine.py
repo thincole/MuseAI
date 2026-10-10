@@ -382,7 +382,9 @@ class MuseEngine:
         self._last_http_renew: dict[str, float] = {}
         self._log = None
         self._browser_lock = threading.Lock()
+        # Khóa: mã TK (ô 0) hoặc "mãTK#i" (ô i) khi 1 TK chạy nhiều video cùng lúc — xem _slot_keys
         self._session_pool: dict[str, "MuseWorkerSession"] = {}
+        self.max_jobs_per_account = 2
         self._pool_lock = threading.Lock()
         self.proc_started_at = time.time()
         self.browser_ttl_seconds = int(getattr(cfg, "browser_ttl_seconds", 1800))
@@ -1786,6 +1788,24 @@ class MuseEngine:
             self._creating = set()
         return cond
 
+    def _slot_keys(self, account_id: str) -> list[str]:
+        """Khóa pool cho các phiên của 1 TK: ô 0 = mã TK (như cũ), ô i = "mãTK#i" — tối đa max_jobs_per_account ô."""
+        n = max(1, int(getattr(self, "max_jobs_per_account", 1) or 1))
+        return [account_id] + [f"{account_id}#{i}" for i in range(1, n)]
+
+    def _free_slot(self, account_id: str) -> str | None:
+        """(Gọi trong _pool_lock) Ô rảnh của TK: ưu tiên ô có phiên rảnh để dùng lại, sau đó ô trống để tạo mới."""
+        empty = None
+        for k in self._slot_keys(account_id):
+            if k in self._creating:
+                continue
+            s = self._session_pool.get(k)
+            if s is None:
+                empty = empty or k
+            elif not s.in_use:
+                return k
+        return empty
+
     def acquire_session(self, account_id: str, cookies: dict, expires: dict | None = None, timeout: int = 75) -> "MuseWorkerSession":
         """Lấy Browser Session còn hạn TTL từ pool hoặc tạo phiên mới toanh qua HomeProxy.
 
@@ -1799,22 +1819,21 @@ class MuseEngine:
         wait_deadline = time.time() + max(5, int(timeout or 0))
         with cond:
             while True:
-                existing = self._session_pool.get(account_id)
-                busy = account_id in self._creating or (existing is not None and existing.in_use)
-                if not busy:
+                key = self._free_slot(account_id)
+                if key is not None:
                     break
                 remaining = wait_deadline - time.time()
                 if remaining <= 0:
                     break
                 cond.wait(min(remaining, 1.0))
-            existing = self._session_pool.get(account_id)
-            if account_id in self._creating or (existing is not None and existing.in_use):
+            existing = self._session_pool.get(key) if key is not None else None
+            if key is None:
                 mode = "ephemeral"
             elif existing is not None:
                 existing.in_use = True
                 mode = "reuse"
             else:
-                self._creating.add(account_id)
+                self._creating.add(key)
                 mode = "create"
 
         if mode == "reuse":
@@ -1837,9 +1856,9 @@ class MuseEngine:
                     # 过期/失活：移出池并直接转入「创建中」，避免别的线程在间隙里抢到旧 session
                     with cond:
                         existing.in_use = False
-                        if self._session_pool.get(account_id) is existing:
-                            self._session_pool.pop(account_id, None)
-                        self._creating.add(account_id)
+                        if self._session_pool.get(key) is existing:
+                            self._session_pool.pop(key, None)
+                        self._creating.add(key)
                         cond.notify_all()
             try:
                 existing.close()
@@ -1875,21 +1894,22 @@ class MuseEngine:
             )
         except BaseException:
             with cond:
-                self._creating.discard(account_id)
+                self._creating.discard(key)
                 cond.notify_all()
             raise
         session.task_count += 1
         session.in_use = True
+        session.pool_key = key
         stale = None
         with cond:
-            self._creating.discard(account_id)
-            old = self._session_pool.get(account_id)
+            self._creating.discard(key)
+            old = self._session_pool.get(key)
             if old is not None and old is not session:
                 if old.in_use:
                     old.close_requested = True
                 else:
                     stale = old
-            self._session_pool[account_id] = session
+            self._session_pool[key] = session
             cond.notify_all()
         if stale is not None:
             try:
@@ -1913,23 +1933,26 @@ class MuseEngine:
         if not error and not close_requested and pooled:
             expired = session.is_expired()
             alive = (not expired) and session.is_alive()
-        close_it = error or close_requested or not pooled or expired or not alive
+        key = getattr(session, "pool_key", None) or session.account_id
+        # Ô vượt quá số video cùng lúc / TK hiện tại (vừa giảm cài đặt) -> đóng luôn, không giữ tab thừa
+        over_limit = key not in self._slot_keys(session.account_id)
+        close_it = error or close_requested or not pooled or expired or not alive or over_limit
         if not close_it:
             # Còn giữ trong pool: dừng video vừa sinh (đang tự phát lặp) trước khi trả về, lúc phiên
             # vẫn in_use nên không luồng nào khác đang điều khiển trang này.
             session.pause_media()
         with cond:
             session.in_use = False
-            cur = self._session_pool.get(session.account_id)
+            cur = self._session_pool.get(key)
             if not close_it and getattr(session, "close_requested", False):
                 close_it = True  # 检查期间被要求关闭
             if not close_it and cur is not None and cur is not session:
                 close_it = True  # 槽位已被新 session 占用，旧的直接关闭
             if close_it:
                 if cur is session:
-                    self._session_pool.pop(session.account_id, None)
+                    self._session_pool.pop(key, None)
             else:
-                self._session_pool[session.account_id] = session
+                self._session_pool[key] = session
             cond.notify_all()
         if close_it:
             log.info("♻️ [TTL/Release] Giải phóng phiên của TK %s (Lỗi: %s, Hết hạn: %s, Tasks: %d)",
@@ -1941,14 +1964,20 @@ class MuseEngine:
 
         正在被使用的 session 不会被强行关闭：标记 close_requested，在 release 时关闭。"""
         cond = self._pool_condition()
+        idle = []
         with cond:
-            s = self._session_pool.pop(account_id, None)
-            if s is not None and s.in_use:
-                s.close_requested = True
-                s = None
+            for k in [k for k in self._session_pool if k == account_id or k.startswith(f"{account_id}#")]:
+                s = self._session_pool.pop(k)
+                if s.in_use:
+                    s.close_requested = True
+                else:
+                    idle.append(s)
             cond.notify_all()
-        if s:
-            s.close()
+        for s in idle:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def close_all_sessions(self):
         """Hủy tất cả các phiên trình duyệt đang chạy trong pool.
@@ -1982,7 +2011,8 @@ class MuseEngine:
             ttl_left = max(0, s.ttl_seconds - age)
             in_use = bool(getattr(s, "in_use", False))
             out.append({
-                "account_id": aid,
+                "account_id": s.account_id or aid,
+                "slot": aid,
                 "age_seconds": age,
                 "ttl_seconds": s.ttl_seconds,
                 "ttl_remaining_seconds": ttl_left,
@@ -2025,6 +2055,7 @@ class MuseWorkerSession:
         self.is_closed = False
         self.in_use = False
         self.pooled = True
+        self.pool_key = account_id  # ô trong pool (gán lại khi acquire_session tạo phiên)
         self.close_requested = False
 
     def is_expired(self) -> bool:

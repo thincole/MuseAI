@@ -268,8 +268,20 @@ class Store:
             self._save_accounts()
             return acc
 
-    _BUSY_ACCOUNTS = set()
+    # Số việc đang chạy của từng TK; mỗi TK nhận tối đa MAX_JOBS_PER_ACCOUNT việc cùng lúc (ô "Số video cùng lúc / tài khoản").
+    _BUSY_COUNT: dict[str, int] = {}
+    MAX_JOBS_PER_ACCOUNT = 2
     _COND = threading.Condition(_LOCK)
+
+    def set_max_jobs_per_account(self, n) -> int:
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = 2
+        with self._COND:
+            Store.MAX_JOBS_PER_ACCOUNT = max(1, min(4, n))
+            self._COND.notify_all()
+        return Store.MAX_JOBS_PER_ACCOUNT
     # Cooldown (trong RAM, mở lại app là xóa): TK kẹt VM liên tiếp thì cho nghỉ, hết giờ nghỉ được thử lại 1 lần.
     _STUCK_STREAK: dict[str, int] = {}
     _COOLDOWN_UNTIL: dict[str, float] = {}
@@ -296,27 +308,27 @@ class Store:
 
     def acquire_account(self, preferred_id: str | None = None, exclude_id: str | None = None,
                         timeout: float = 60.0) -> dict | None:
-        """Thuê tài khoản cho luồng render worker. Đảm bảo mỗi tài khoản chỉ phục vụ tối đa 1 luồng cùng lúc
-        và bỏ qua TK đang nghỉ (cooldown) vì kẹt VM."""
+        """Thuê tài khoản cho luồng render worker. Mỗi tài khoản phục vụ tối đa MAX_JOBS_PER_ACCOUNT luồng cùng lúc,
+        ưu tiên TK đang ít việc nhất (chia đều trước khi chồng việc), bỏ qua TK đang nghỉ (cooldown) vì kẹt VM."""
         deadline = time.monotonic() + timeout
         with self._COND:
             while True:
                 self._sync_from_disk()
+                busy = self._BUSY_COUNT
+                limit = Store.MAX_JOBS_PER_ACCOUNT
                 live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
-                available = [a for a in live if a["id"] not in self._BUSY_ACCOUNTS and not self.in_cooldown(a["id"])]
+                available = [a for a in live if busy.get(a["id"], 0) < limit and not self.in_cooldown(a["id"])]
                 if exclude_id and len(available) > 1:
                     available = [a for a in available if a["id"] != exclude_id] or available
 
                 if available:
                     healthy = [a for a in available if a.get("ok") is not False]
                     candidates = healthy if healthy else available
-                    if preferred_id:
-                        pref = next((a for a in candidates if a["id"] == preferred_id), None)
-                        acc = pref if pref else min(candidates, key=lambda a: (a.get("last_used") or 0.0, a.get("use_count") or 0))
-                    else:
-                        acc = min(candidates, key=lambda a: (a.get("last_used") or 0.0, a.get("use_count") or 0))
+                    least_busy = lambda a: (busy.get(a["id"], 0), a.get("last_used") or 0.0, a.get("use_count") or 0)  # noqa: E731
+                    pref = next((a for a in candidates if a["id"] == preferred_id), None) if preferred_id else None
+                    acc = pref if pref else min(candidates, key=least_busy)
 
-                    self._BUSY_ACCOUNTS.add(acc["id"])
+                    busy[acc["id"]] = busy.get(acc["id"], 0) + 1
                     acc["last_used"] = time.time()
                     acc["use_count"] = acc.get("use_count", 0) + 1
                     self._save_accounts()
@@ -330,7 +342,11 @@ class Store:
     def release_account(self, aid: str):
         """Trả tài khoản lại cho Pool sau khi worker hoàn thành tác vụ."""
         with self._COND:
-            self._BUSY_ACCOUNTS.discard(aid)
+            n = self._BUSY_COUNT.get(aid, 0) - 1
+            if n > 0:
+                self._BUSY_COUNT[aid] = n
+            else:
+                self._BUSY_COUNT.pop(aid, None)
             self._COND.notify_all()
 
     def touch_keepalive(self, aid: str, ok: bool | None = True, note: str = ""):
