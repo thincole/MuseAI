@@ -3371,9 +3371,16 @@
     while (Date.now() - startPoll < maxPollMs) {
       if (shopeeForceStopRequested) break;
       await new Promise(r => setTimeout(r, 3000));
-      const pollRes = await fetch(`/v1/videos/${taskId}`, { headers: getHeaders() });
-      if (!pollRes.ok) continue;
-      const pData = await pollRes.json();
+      // Lỗi mạng khi hỏi trạng thái (WebView/máy chủ chập chờn vài giây) không có nghĩa là render hỏng:
+      // task vẫn chạy trên máy chủ -> hỏi lại lần sau thay vì báo lỗi SP.
+      let pData;
+      try {
+        const pollRes = await fetch(`/v1/videos/${taskId}`, { headers: getHeaders() });
+        if (!pollRes.ok) continue;
+        pData = await pollRes.json();
+      } catch (_) {
+        continue;
+      }
       if (pData.status === "completed" || pData.status === "succeeded") {
         if (pData.result && pData.result.kind === "image") {
           throw new Error("Muse.ai sinh ra file ảnh thay vì video. Đang bỏ qua kết quả hỏng!");
@@ -4076,7 +4083,43 @@
       recordShopeeCompletion();
     }
 
+    // Trước khi báo "failed": video có thể đã nằm trên ổ đĩa. Lỗi mạng (fetch bị từ chối khi WebView chập chờn)
+    // xảy ra lúc máy chủ vẫn đang lưu/ghép -> nhiều SP bị báo failed nhầm cùng lúc dù video vẫn được tạo xong.
+    // Với lỗi mạng: chờ máy chủ làm xong (tối đa ~45s) rồi mới kết luận.
+    async function findFinishedVideo(prod, err) {
+      const networkErr = err instanceof TypeError || /failed to fetch|networkerror|network error|load failed/i.test(err?.message || "");
+      const checkDuration = String(form.duration || "").toLowerCase().includes("16") ? 16 : 8;
+      const tries = networkErr ? 10 : 1;
+      for (let i = 0; i < tries; i++) {
+        if (i > 0) await new Promise(r => setTimeout(r, 5000));
+        try {
+          const res = await fetch(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}&duration=${checkDuration}`, { headers: getHeaders() });
+          if (res.ok) {
+            const chk = await res.json();
+            if (chk.final_video) return chk.final_video;
+          }
+        } catch (_) {}
+      }
+      return null;
+    }
+
     async function markShopeeFailed(prod, err, workerId) {
+      const finishedVideo = await findFinishedVideo(prod, err);
+      if (finishedVideo) {
+        appendShopeeLog(`✓ [Luồng ${workerId}] SP ${prod.item_id}: gặp lỗi (${err.message}) nhưng video đã có trên ổ đĩa -> báo hoàn tất, không báo lỗi.`);
+        prod._final_video = finishedVideo;
+        markShopeeCompleted(prod);
+        if (!prod._is_imported) {
+          try {
+            await fetch("/api/shopee/complete", {
+              method: "POST",
+              headers: getHeaders(),
+              body: JSON.stringify({ item_id: prod.item_id, status: "completed", video_path: finishedVideo })
+            });
+          } catch (_) {}
+        }
+        return;
+      }
       prod._status = "failed";
       failedCount++;
       appendShopeeLog(`❌ [Luồng ${workerId}] Lỗi SP ${prod.item_id}: ${err.message}`);
