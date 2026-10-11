@@ -811,11 +811,20 @@ class MuseEngine:
     #   Weekly limit resets on Sep 30
     #   1% used
     #   Additional tokens / Never expires / 0% used (2B tokens left)
-    def _click_point(self, x: int, y: int):
+    def _click_point(self, x: int, y: int, page=None):
+        p = page or self.page
+        # Tab worker (Browser Context riêng) cần được đưa lên trước + di chuột thì menu mới nhận cú bấm
+        # (headless nên không làm nhảy cửa sổ nào trên màn hình).
+        try:
+            p.send("Page.bringToFront")
+        except Exception:  # noqa: BLE001
+            pass
+        p.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+        time.sleep(0.3)
         for t in ("mousePressed", "mouseReleased"):
-            self.page.send("Input.dispatchMouseEvent",
-                           {"type": t, "x": x, "y": y,
-                            "button": "left", "clickCount": 1})
+            p.send("Input.dispatchMouseEvent",
+                   {"type": t, "x": x, "y": y,
+                    "button": "left", "clickCount": 1})
 
     _CLICK_JS = (
         "(function(){var sel=%s;"
@@ -828,42 +837,66 @@ class MuseEngine:
     def quota(self, cookies: dict, expires: dict | None = None) -> dict:
         """打开 Settings 面板读额度。返回结构化 dict；读不到时 raise。"""
         self.ensure_page(cookies, expires)
-        p = self.page
+        return self._read_quota(self.page)
+
+    def quota_worker(self, cookies: dict, expires: dict | None = None, account_id: str | None = None) -> dict:
+        """Đọc hạn mức bằng một phiên worker RIÊNG (Browser Context mới, đi qua proxy cố định của tài khoản),
+        đóng phiên ngay sau khi đọc xong. Không dùng chung trình duyệt chính và không chiếm phiên của luồng render."""
+        sess = self.create_worker_session(cookies, expires=expires, account_id=account_id, timeout=90)
+        try:
+            return self._read_quota(sess.page)
+        finally:
+            try:
+                sess.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    _MENU_ITEM_JS = (
+        "(function(){"
+        "var els=[...document.querySelectorAll('div,span,li,[role=menuitem],button')]"
+        ".filter(function(e){return e.offsetParent!==null"
+        "&&(e.textContent||'').trim()==='Settings'"
+        "&&e.getAttribute('aria-label')!=='Settings'"
+        "&&e.children.length<=3;});"
+        "if(!els.length)return null;"
+        "var el=els[els.length-1];var r=el.getBoundingClientRect();"
+        "return JSON.stringify({x:Math.round(r.x+r.width/2),"
+        "y:Math.round(r.y+r.height/2)});})()")
+
+    def _read_quota(self, p) -> dict:
         time.sleep(1)
 
-        # 1) 点左下角 Settings 按钮（aria-label=Settings）
-        raw = p.js(self._CLICK_JS % json.dumps('button[aria-label="Settings"]'))
-        if not raw:
-            raise MuseGenerationError("找不到 Settings 按钮")
-        pt = json.loads(raw)
-        self._click_point(pt["x"], pt["y"])
-        time.sleep(1.6)
-
-        # 2) 点弹出的菜单里文本为 Settings 的项
-        raw = p.js(
-            "(function(){"
-            "var els=[...document.querySelectorAll('div,span,li,[role=menuitem],button')]"
-            ".filter(function(e){return e.offsetParent!==null"
-            "&&(e.textContent||'').trim()==='Settings'"
-            "&&e.getAttribute('aria-label')!=='Settings'"
-            "&&e.children.length<=3;});"
-            "if(!els.length)return null;"
-            "var el=els[els.length-1];var r=el.getBoundingClientRect();"
-            "return JSON.stringify({x:Math.round(r.x+r.width/2),"
-            "y:Math.round(r.y+r.height/2)});})()")
-        if not raw:
-            raise MuseGenerationError("Settings 菜单未弹出")
-        pt = json.loads(raw)
-        self._click_point(pt["x"], pt["y"])
+        # 1)+2) Bấm nút Settings (aria-label=Settings) rồi tìm mục "Settings" trong menu bật ra.
+        # Qua proxy trang tải chậm: nút có sẵn nhưng giao diện chưa gắn xong sự kiện -> bấm lại tối đa 4 lần.
+        menu_pt = None
+        for attempt in range(4):
+            raw = p.js(self._CLICK_JS % json.dumps('button[aria-label="Settings"]'))
+            if not raw:
+                time.sleep(2.0)
+                continue
+            pt = json.loads(raw)
+            self._click_point(pt["x"], pt["y"], p)
+            for _ in range(8):  # chờ menu hiện tối đa ~4s
+                time.sleep(0.5)
+                raw = p.js(self._MENU_ITEM_JS)
+                if raw:
+                    menu_pt = json.loads(raw)
+                    break
+            if menu_pt:
+                break
+            time.sleep(1.5)
+        if not menu_pt:
+            raise MuseGenerationError("Settings 菜单未弹出（đã thử 4 lần）")
+        self._click_point(menu_pt["x"], menu_pt["y"], p)
         time.sleep(3.0)
 
         # 3) 读设置面板文本
         txt = ""
-        for _ in range(6):
+        for _ in range(16):  # qua proxy bảng Usage tải chậm: chờ tối đa ~20s
             txt = p.js(
                 "(function(){var d=document.querySelector('[role=dialog],[aria-modal=true]');"
                 "return d?(d.innerText||''):'';})()") or ""
-            if "Usage" in txt or "used" in txt:
+            if "% used" in txt or "used (" in txt or "tokens left" in txt:
                 break
             time.sleep(1.2)
 

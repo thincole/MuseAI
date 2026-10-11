@@ -1262,8 +1262,17 @@
               <button class="btn-header" onclick="triggerKeepaliveAll()">
                 ⚡ Giữ Kết Nối & Đánh Thức VM (Keepalive All)
               </button>
+              <button class="btn-header" id="btnQuotaAll" onclick="checkAllQuota()" style="background:rgba(251,191,36,0.15);border:1px solid #fbbf24;color:#fbbf24;" title="Đọc hạn mức token của TẤT CẢ tài khoản (mỗi TK đi qua proxy riêng của nó, 3 TK cùng lúc, ~20-25 giây/TK)">
+                📊 Kiểm tra hạn mức tất cả
+              </button>
             </div>
           </div>
+
+          <div id="accQuotaSummary" style="font-size:12.5px;margin-bottom:6px;"></div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#fbbf24;cursor:pointer;margin-bottom:10px;" title="Khi bật: không giao việc cho TK đã hết sạch token (theo lần kiểm tra hạn mức gần nhất). Mặc định TẮT vì đo thực tế các TK '0 token' vẫn render được. Nếu mọi TK đều hết token thì vẫn giao như cũ. Luôn có sẵn: nếu Muse TỪ CHỐI vì hết hạn ngạch, TK tự nghỉ 6 giờ.">
+            <input type="checkbox" id="skipExhausted" onchange="saveShopeeSettings(); renderQuotaSummary(); updateShopeeThreadsHint();">
+            🔋 Tự động bỏ qua TK hết token khi giao việc <span style="color:var(--text-dim);">(mặc định tắt — xem gợi ý khi rê chuột)</span>
+          </label>
 
           <div style="background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.25);border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:10px;">
             <span style="font-size:20px;">🛡️</span>
@@ -1281,13 +1290,14 @@
                 <th>Proxy Cố Định</th>
                 <th>Số Cookie</th>
                 <th>Hạn Sử Dụng</th>
+                <th>Hạn Mức Token</th>
                 <th>Số Lần Dùng</th>
                 <th>Thao Tác</th>
               </tr>
             </thead>
             <tbody id="accountsTableBody">
               <tr>
-                <td colspan="7" style="text-align:center;color:var(--text-dim);padding:30px;">
+                <td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">
                   Đang tải danh sách tài khoản...
                 </td>
               </tr>
@@ -2580,7 +2590,7 @@
           const ej = await res.json();
           err = ej.detail || err;
         } catch (_) {}
-        tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--danger);padding:20px;">${err}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--danger);padding:20px;">${err}</td></tr>`;
         return;
       }
 
@@ -2596,7 +2606,8 @@
       if (!accs || accs.length === 0) {
         cachedAliveCount = 0;
         updateShopeeThreadsHint();
-        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
+        renderQuotaSummary();
         return;
       }
 
@@ -2648,20 +2659,173 @@
             <td>${proxyHtml}</td>
             <td>${cookieCount} cookies</td>
             <td>${expStr}</td>
+            <td id="qc_${a.id}">${quotaCellHtml(a.quota)}</td>
             <td>${a.use_count || 0} lượt</td>
             <td>
               <div style="display:flex;gap:6px;">
                 <button class="btn-tiny" onclick="testAccount('${a.id}')">Kiểm Tra</button>
+                <button class="btn-tiny" id="qb_${a.id}" onclick="checkAccountQuota('${a.id}')" title="Đọc hạn mức token của tài khoản này (qua proxy riêng của nó)">Hạn mức</button>
                 <button class="btn-tiny danger" onclick="deleteAccount('${a.id}')">Xóa</button>
               </div>
             </td>
           </tr>
         `;
       }).join("");
+      renderQuotaSummary();
 
     } catch (e) {
-      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
     }
+  }
+
+  // ---------- Hạn mức token (quota) của tài khoản Muse ----------
+  // "Token phụ" (Additional tokens) là nguồn đang dùng để render; hết token phụ + hết hạn mức tuần = tài khoản không tạo được video.
+  const QUOTA_LOW_TOKENS = 100e6; // dưới ~100 triệu token coi là sắp hết
+
+  function parseTokenCount(s) {
+    // "488M tokens left", "1B tokens left", "0 tokens left", "1.2B tokens left"
+    const m = String(s || "").match(/([\d.,]+)\s*([KMBT]?)/i);
+    if (!m) return null;
+    const mult = { "": 1, K: 1e3, M: 1e6, B: 1e9, T: 1e12 }[m[2].toUpperCase()];
+    const n = parseFloat(m[1].replace(/,/g, ""));
+    return isNaN(n) ? null : n * mult;
+  }
+
+  function fmtTokens(n) {
+    if (n == null) return "?";
+    if (n >= 1e9) return (n / 1e9).toFixed(n >= 1e10 ? 0 : 1).replace(/\.0$/, "") + " tỷ";
+    if (n >= 1e6) return Math.round(n / 1e6) + " triệu";
+    if (n >= 1e3) return Math.round(n / 1e3) + " nghìn";
+    return String(Math.round(n));
+  }
+
+  function quotaState(q) {
+    if (!q || !q.found) return { state: "unknown" };
+    const tokens = parseTokenCount(q.extra_left);
+    const weekly = q.weekly_used_pct;
+    if (tokens === 0 && (weekly == null || weekly >= 100)) return { state: "exhausted", tokens, weekly };
+    if (tokens != null && tokens < QUOTA_LOW_TOKENS) return { state: "low", tokens, weekly };
+    return { state: "ok", tokens, weekly };
+  }
+
+  function ageText(ts) {
+    if (!ts) return "";
+    const m = Math.round((Date.now() / 1000 - ts) / 60);
+    if (m < 2) return "vừa xong";
+    if (m < 90) return `${m} phút trước`;
+    const h = Math.round(m / 60);
+    return h < 48 ? `${h} giờ trước` : `${Math.round(h / 24)} ngày trước`;
+  }
+
+  function quotaCellHtml(q) {
+    const st = quotaState(q);
+    if (st.state === "unknown") {
+      return `<span style="color:var(--text-dim);font-size:11.5px;">Chưa kiểm tra</span>`;
+    }
+    const styles = {
+      exhausted: ["rgba(239,68,68,0.15)", "#f87171", "🔴 Hết token"],
+      low: ["rgba(245,158,11,0.15)", "#fbbf24", "🟠 Sắp hết"],
+      ok: ["rgba(52,211,153,0.15)", "#34d399", "🟢 Còn"]
+    }[st.state];
+    const tokenTxt = st.state === "exhausted" ? "còn 0 token" : `còn ${fmtTokens(st.tokens)} token`;
+    const weeklyTxt = q.weekly_used_pct != null
+      ? `Tuần: ${q.weekly_used_pct}%${q.weekly_reset ? " · reset " + q.weekly_reset : ""}` : "";
+    const stale = q.checked_at && (Date.now() / 1000 - q.checked_at) > 6 * 3600;
+    const title = `${q.plan || "Gói ?"}\n${q.extra_left || ""}\nKiểm tra: ${ageText(q.checked_at)}`;
+    return `<div title="${title.replace(/"/g, "&quot;")}">
+      <span class="status-pill" style="background:${styles[0]};color:${styles[1]};border:1px solid ${styles[1]}55;padding:1px 7px;font-size:11px;">${styles[2]}</span>
+      <div style="font-size:11.5px;color:var(--text);margin-top:3px;">${tokenTxt}</div>
+      <div style="font-size:10.5px;color:var(--text-dim);">${weeklyTxt}</div>
+      <div style="font-size:10px;color:${stale ? "#fbbf24" : "var(--text-dim)"};">${stale ? "⚠ số cũ · " : ""}${ageText(q.checked_at)}</div>
+    </div>`;
+  }
+
+  function renderQuotaSummary() {
+    const el = document.getElementById("accQuotaSummary");
+    if (!el) return;
+    const accs = (cachedAccounts || []).filter(a => a.enabled !== false);
+    if (!accs.length) { el.innerHTML = ""; return; }
+    let ok = 0, low = 0, ex = 0, unk = 0, totalTokens = 0, oldest = Infinity;
+    accs.forEach(a => {
+      const st = quotaState(a.quota);
+      if (st.state === "unknown") unk++;
+      else {
+        if (st.state === "ok") ok++; else if (st.state === "low") low++; else ex++;
+        totalTokens += st.tokens || 0;
+        if (a.quota.checked_at) oldest = Math.min(oldest, a.quota.checked_at);
+      }
+    });
+    const parts = [
+      `<b>Hạn mức token (${accs.length} TK):</b>`,
+      `<span style="color:#34d399;">🟢 còn ${ok}</span>`,
+      `<span style="color:#fbbf24;">🟠 sắp hết ${low}</span>`,
+      `<span style="color:#f87171;">🔴 hết token ${ex}</span>`,
+      `<span style="color:var(--text-dim);">⚪ chưa kiểm tra ${unk}</span>`
+    ];
+    if (ok + low + ex > 0) {
+      parts.push(`· Tổng token phụ còn lại (trong ${ok + low + ex} TK đã kiểm tra): <b>${fmtTokens(totalTokens)}</b>`);
+      if (oldest !== Infinity) parts.push(`· số cũ nhất: ${ageText(oldest)}`);
+    }
+    el.innerHTML = `<div style="background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.25);border-radius:8px;padding:8px 12px;display:flex;gap:14px;flex-wrap:wrap;">${parts.join(" ")}</div>`;
+  }
+
+  function applyQuotaToRow(aid, q) {
+    const acc = (cachedAccounts || []).find(a => a.id === aid);
+    if (acc) acc.quota = q;
+    const cell = document.getElementById("qc_" + aid);
+    if (cell) cell.innerHTML = quotaCellHtml(q);
+    renderQuotaSummary();
+  }
+
+  async function checkAccountQuota(aid, silent) {
+    const btn = document.getElementById("qb_" + aid);
+    const oldText = btn ? btn.innerText : "Hạn mức";
+    if (btn) { btn.disabled = true; btn.innerText = "⏳ ..."; }
+    try {
+      const res = await fetch(`/admin/accounts/${aid}/quota-check`, { method: "POST", headers: getHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+      if (!data.found) throw new Error("Không đọc được hạn mức (giao diện Muse có thể đã đổi)");
+      applyQuotaToRow(aid, data);
+      if (!silent) {
+        const st = quotaState(data);
+        showToast(st.state === "exhausted" ? "TK đã hết token!" : `Còn ${fmtTokens(st.tokens)} token`, st.state === "exhausted" ? "danger" : "success");
+      }
+      return true;
+    } catch (e) {
+      if (!silent) showToast(`Lỗi đọc hạn mức: ${e.message}`, "danger");
+      return false;
+    } finally {
+      if (btn) { btn.disabled = false; btn.innerText = oldText; }
+    }
+  }
+
+  let quotaAllRunning = false;
+  let quotaAllStop = false;
+  async function checkAllQuota() {
+    const btn = document.getElementById("btnQuotaAll");
+    if (quotaAllRunning) { quotaAllStop = true; if (btn) btn.innerText = "⏹ Đang dừng..."; return; }
+    const ids = (cachedAccounts || []).filter(a => a.enabled !== false && a.cookie_count !== 0).map(a => a.id);
+    if (!ids.length) { showToast("Chưa có tài khoản nào", "warning"); return; }
+    if (!confirm(`Đọc hạn mức token của ${ids.length} tài khoản?\nMỗi TK mở 1 tab tạm qua proxy riêng, 3 TK cùng lúc, khoảng ${Math.ceil(ids.length * 25 / 3 / 60)} phút. Có thể bấm lại nút để dừng giữa chừng.`)) return;
+    quotaAllRunning = true; quotaAllStop = false;
+    let done = 0, fail = 0, next = 0;
+    const total = ids.length;
+    const setBtn = () => { if (btn && !quotaAllStop) btn.innerText = `⏹ Dừng (${done}/${total})`; };
+    setBtn();
+    const worker = async () => {
+      while (!quotaAllStop && next < total) {
+        const aid = ids[next++];
+        const ok = await checkAccountQuota(aid, true);
+        done++; if (!ok) fail++;
+        setBtn();
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    quotaAllRunning = false;
+    if (btn) btn.innerText = "📊 Kiểm tra hạn mức tất cả";
+    showToast(`Đã đọc hạn mức ${done - fail}/${done} tài khoản${fail ? ` (${fail} lỗi)` : ""}${quotaAllStop ? " — đã dừng giữa chừng" : ""}`, fail ? "warning" : "success");
+    quotaAllStop = false;
   }
 
   async function submitAddAccount() {
@@ -2833,6 +2997,7 @@
       if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
       if (data.auto_claim !== undefined) document.getElementById("sp_auto_claim").checked = !!data.auto_claim;
       if (data.jobs_per_account) document.getElementById("sp_jobs_per_account").value = String(data.jobs_per_account);
+      if (data.skip_exhausted_accounts !== undefined) document.getElementById("skipExhausted").checked = !!data.skip_exhausted_accounts;
       updateShopeeThreadsHint();
       onShopeeDurationChange();
       updateTempStitchButtonStatus();
@@ -2854,7 +3019,7 @@
       userThreads = Math.max(1, parseInt(sel.value) || 2);
     }
 
-    const alive = cachedAliveCount;
+    const alive = getUsableAccountCount();
     const perAcc = getShopeeJobsPerAccount();
     const cap = alive * perAcc;
     if (alive <= 0) {
@@ -2898,6 +3063,15 @@
     }
   }
 
+  // Số TK còn dùng được để giao việc: TK sống, trừ TK hết token khi ô "bỏ qua TK hết token" đang bật
+  // (nếu tất cả đều hết token, máy chủ vẫn giao như cũ nên không trừ về 0).
+  function getUsableAccountCount() {
+    const alive = cachedAliveCount;
+    if (alive <= 0 || !document.getElementById("skipExhausted")?.checked) return alive;
+    const ex = (cachedAccounts || []).filter(a => a.enabled !== false && a.is_alive !== false && a.quota_exhausted).length;
+    return ex >= alive ? alive : alive - ex;
+  }
+
   function getShopeeJobsPerAccount() {
     const v = parseInt(document.getElementById("sp_jobs_per_account")?.value) || 2;
     return Math.max(1, Math.min(4, v));
@@ -2936,6 +3110,7 @@
       ghep_anh: document.getElementById("sp_ghep_anh").checked,
       auto_claim: !!document.getElementById("sp_auto_claim")?.checked,
       jobs_per_account: getShopeeJobsPerAccount(),
+      skip_exhausted_accounts: !!document.getElementById("skipExhausted")?.checked,
       naming: document.getElementById("sp_naming").value,
       out_dir: document.getElementById("sp_out_dir").value.trim(),
       limit: parseInt(document.getElementById("sp_limit").value) || 2000,
@@ -3940,10 +4115,14 @@
     // NGUYÊN TẮC: Số luồng chạy luôn <= số TK còn sống × số video cùng lúc / TK (máy chủ cũng giới hạn đúng mức này)
     const jobsPerAcc = getShopeeJobsPerAccount();
     await saveShopeeSettings(); // đảm bảo máy chủ dùng đúng số video / TK trước khi chạy
-    const maxWorkers = Math.min(requestedWorkers, aliveAccounts * jobsPerAcc);
+    const usableAccounts = getUsableAccountCount() || aliveAccounts;
+    const maxWorkers = Math.min(requestedWorkers, usableAccounts * jobsPerAcc);
+    if (usableAccounts < aliveAccounts) {
+      appendShopeeLog(`🔋 Bỏ qua ${aliveAccounts - usableAccounts} TK đã hết token (theo hạn mức đã kiểm tra) -> còn ${usableAccounts} TK dùng được.`);
+    }
 
     if (requestedWorkers > maxWorkers) {
-      appendShopeeLog(`⚡ ĐIỀU PHỐI TỐC ĐỘ: Bạn chọn ${requestedWorkers} luồng, nhưng hiện có ${aliveAccounts} tài khoản còn sống × ${jobsPerAcc} video/TK -> Hệ thống tự động giới hạn chạy ${maxWorkers} luồng song song.`);
+      appendShopeeLog(`⚡ ĐIỀU PHỐI TỐC ĐỘ: Bạn chọn ${requestedWorkers} luồng, nhưng hiện có ${usableAccounts} tài khoản dùng được × ${jobsPerAcc} video/TK -> Hệ thống tự động giới hạn chạy ${maxWorkers} luồng song song.`);
     } else {
       appendShopeeLog(`🚀 BẮT ĐẦU CHẠY BATCH RENDER CHO ${shopeeClaimedProducts.length} SẢN PHẨM VỚI ${maxWorkers} LUỒNG SONG SONG (${aliveAccounts} TÀI KHOẢN KHẢ DỤNG × tối đa ${jobsPerAcc} video/TK)...`);
     }

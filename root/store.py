@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
 import uuid
+from datetime import date, datetime, timedelta
 
 _LOCK = threading.Lock()
 # Khóa riêng cho tasks.json: ghi task không được chặn việc thuê/trả tài khoản (_LOCK).
@@ -32,6 +34,50 @@ def _is_pos(v) -> bool:
         return int(v) > 0
     except (TypeError, ValueError):
         return False
+
+
+# ---- Hạn mức token của tài khoản Muse (đọc từ Settings → Usage, lưu trong account["quota"]) ----
+_TOKEN_RE = re.compile(r"([\d.,]+)\s*([KMBT]?)", re.I)
+_TOKEN_MULT = {"": 1, "K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
+
+
+def parse_token_count(text) -> float | None:
+    """'488M tokens left' -> 488e6; '0 tokens left' -> 0; không đọc được -> None."""
+    m = _TOKEN_RE.search(str(text or ""))
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "")) * _TOKEN_MULT[m.group(2).upper()]
+    except (ValueError, KeyError):
+        return None
+
+
+def _reset_date(text, today: date) -> date | None:
+    """'Oct 14' -> ngày reset hạn mức tuần gần nhất (năm hiện tại, hoặc năm sau nếu đã lùi quá xa)."""
+    try:
+        d = datetime.strptime(f"{str(text).strip()} {today.year}", "%b %d %Y").date()
+    except (ValueError, TypeError):
+        return None
+    if d < today - timedelta(days=180):
+        d = d.replace(year=d.year + 1)
+    return d
+
+
+def account_exhausted(acc: dict, today: date | None = None) -> bool:
+    """Tài khoản đã hết SẠCH hạn mức theo lần kiểm tra gần nhất: token phụ = 0 và hạn mức tuần đã dùng 100%,
+    và ngày reset tuần CHƯA tới. Qua ngày reset thì coi như có hạn mức tuần mới (cho dùng lại để thử)."""
+    q = acc.get("quota") or {}
+    if not q.get("found"):
+        return False
+    tokens = parse_token_count(q.get("extra_left"))
+    if tokens is None or tokens > 0:
+        return False
+    weekly = q.get("weekly_used_pct")
+    if weekly is not None and weekly < 100:
+        return False
+    today = today or date.today()
+    reset = _reset_date(q.get("weekly_reset"), today)
+    return not (reset and today >= reset)
 
 
 # hatch_vml 固定约 2 天，且不因使用而延长 —— 它就是决定账号寿命的那条 cookie。
@@ -216,6 +262,7 @@ class Store:
                     and a.get("ok") is not False
                     and (not a.get("expires_at") or a["expires_at"] > now_ts)
                 )
+                item["quota_exhausted"] = account_exhausted(a)  # một nguồn sự thật cho giao diện
                 out.append(item)
             return out
 
@@ -271,7 +318,23 @@ class Store:
     # Số việc đang chạy của từng TK; mỗi TK nhận tối đa MAX_JOBS_PER_ACCOUNT việc cùng lúc (ô "Số video cùng lúc / tài khoản").
     _BUSY_COUNT: dict[str, int] = {}
     MAX_JOBS_PER_ACCOUNT = 2
+    # Bỏ qua TK hết token (theo hạn mức đã kiểm tra) khi giao việc. Mặc định TẮT: đo thực tế các TK "0 token"
+    # vẫn render thành công, chặn trước sẽ bỏ phí chúng. Bật bằng ô trong tab Tài Khoản Muse.
+    SKIP_EXHAUSTED = False
+    _last_all_exhausted_warn = 0.0
     _COND = threading.Condition(_LOCK)
+
+    def set_skip_exhausted(self, on) -> bool:
+        with self._COND:
+            Store.SKIP_EXHAUSTED = bool(on)
+            self._COND.notify_all()
+        return Store.SKIP_EXHAUSTED
+
+    def block_until(self, aid: str, seconds: float):
+        """Cho TK nghỉ `seconds` giây (trong RAM). Dùng khi Muse TỪ CHỐI thật vì hết hạn ngạch."""
+        with self._COND:
+            self._COOLDOWN_UNTIL[aid] = time.time() + seconds
+            self._COND.notify_all()
 
     def set_max_jobs_per_account(self, n) -> int:
         try:
@@ -320,6 +383,19 @@ class Store:
                 available = [a for a in live if busy.get(a["id"], 0) < limit and not self.in_cooldown(a["id"])]
                 if exclude_id and len(available) > 1:
                     available = [a for a in available if a["id"] != exclude_id] or available
+
+                if Store.SKIP_EXHAUSTED and available:
+                    # Bỏ qua TK hết token: TK còn token đang bận thì luồng CHỜ (không tràn sang TK hết token).
+                    # Chỉ khi TOÀN BỘ TK đều hết token mới dùng như cũ (không để hệ thống tự kẹt hoặc đẩy hàng loạt SP vào
+                    # trạng thái lỗi) và cảnh báo.
+                    if all(account_exhausted(a) for a in live):
+                        if time.time() - Store._last_all_exhausted_warn > 300:
+                            Store._last_all_exhausted_warn = time.time()
+                            import logging
+                            logging.getLogger("muse2api").warning(
+                                "⚠ [Hạn mức] Tất cả TK đều hết token -> vẫn giao việc như cũ. Kiểm tra lại hạn mức ở tab Tài Khoản Muse.")
+                    else:
+                        available = [a for a in available if not account_exhausted(a)]
 
                 if available:
                     healthy = [a for a in available if a.get("ok") is not False]

@@ -894,6 +894,12 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 last_exc = exc
                 log.warning("✗ [Video Gen] Lỗi tạo video với TK %s: %s", cur_acc["id"], exc)
                 store.mark(cur_acc["id"], True, f"Tác vụ gián đoạn: {str(exc)[:60]}")
+                if "hết hạn ngạch" in str(exc) or "额度不足" in str(exc):
+                    # Muse TỪ CHỐI thật vì hết hạn mức: cho TK nghỉ 6 giờ, các luồng dùng TK khác (khác với số token hiển thị,
+                    # vì đo thực tế có TK "0 token" vẫn render được — chỉ khi Muse từ chối mới chặn).
+                    store.block_until(cur_acc["id"], 6 * 3600)
+                    log.warning("🚫 [Hạn mức] Muse từ chối TK %s (%s) vì hết hạn ngạch -> cho nghỉ 6 giờ",
+                                cur_acc["id"], cur_acc.get("label"))
                 if isinstance(exc, MuseVMUnavailableError) and store.record_vm_stuck(cur_acc["id"]):
                     log.warning("😴 [Cooldown] TK %s (%s) kẹt VM %d lần liên tiếp -> cho nghỉ %d phút, các luồng dùng TK khác",
                                 cur_acc["id"], cur_acc.get("label"), store._STUCK_STREAK.get(cur_acc["id"], 0),
@@ -1728,6 +1734,41 @@ async def query_quota(aid: str, _=Depends(admin_auth)):
         raise HTTPException(502, f"额度查询失败: {exc}") from exc
 
 
+_QUOTA_CHECK_SLOTS = threading.BoundedSemaphore(3)  # tối đa 3 lần đọc hạn mức cùng lúc (mỗi lần mở 1 tab tạm)
+
+
+@app.post("/admin/accounts/{aid}/quota-check")
+async def check_account_quota(aid: str, _=Depends(admin_auth)):
+    """Đọc hạn mức (gói / % tuần / token phụ còn lại) của 1 tài khoản bằng PHIÊN WORKER RIÊNG đi qua proxy cố định
+    của chính tài khoản đó (khác /admin/accounts/{id}/quota dùng trình duyệt chính + IP thật của máy).
+    Lưu kết quả vào tài khoản (quota + checked_at) để tab Tài khoản Muse hiển thị."""
+    acc = store.get_account(aid)
+    if not acc:
+        raise HTTPException(404, "Tài khoản không tồn tại")
+    if not acc.get("cookies"):
+        raise HTTPException(400, "Tài khoản chưa có cookie")
+
+    def _probe():
+        with _QUOTA_CHECK_SLOTS:
+            engine.start()
+            q = engine.quota_worker(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+            if not q.get("found"):
+                # Không lưu kết quả rỗng: tránh ghi đè số liệu tốt đã đọc trước đó
+                raise MuseGenerationError("Không đọc được hạn mức (bảng Usage chưa tải xong qua proxy). Thử lại sau.")
+            q["checked_at"] = int(time.time())
+            store.update_account(aid, quota=q)
+            return q
+
+    try:
+        return await asyncio.to_thread(_probe)
+    except MuseAuthError as exc:
+        raise HTTPException(401, f"Phiên Muse đã bị đăng xuất: {exc}") from exc
+    except MuseGenerationError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Đọc hạn mức thất bại: {exc}") from exc
+
+
 @app.post("/admin/quota")
 async def query_any_quota(_=Depends(admin_auth)):
     """用当前最久未用的可用账号查一次额度（同池账号共享同一 muse.ai 计划的
@@ -2111,7 +2152,8 @@ def _get_shopee_settings() -> dict:
         "min_sold": "0",
         "min_price": "0",
         "max_price": "",
-        "jobs_per_account": 2
+        "jobs_per_account": 2,
+        "skip_exhausted_accounts": False
     }
     if os.path.isfile(SHOPEE_SETTINGS_FILE):
         try:
@@ -2142,6 +2184,8 @@ def save_shopee_settings(settings: dict):
         json.dump(settings, f, ensure_ascii=False, indent=2)
     if "jobs_per_account" in settings:
         _apply_jobs_per_account(settings["jobs_per_account"])
+    if "skip_exhausted_accounts" in settings:
+        store.set_skip_exhausted(settings["skip_exhausted_accounts"])
     return {"success": True}
 
 
@@ -3456,7 +3500,10 @@ def save_rendered_video(req: dict):
             real_dur = shopee_engine.probe_media_duration(src)
             ghep_dur = real_dur or ai_dur
             try:
-                temp_img_path = os.path.join(CFG.data_dir, f"temp_outro_{int(time.time()*1000)}.jpg")
+                # Tên file riêng cho từng lần ghép: 2 SP ghép cùng 1 mili-giây từng dùng chung 1 file ảnh,
+                # SP xong trước xóa mất ảnh của SP kia -> "[WinError 2] cannot find the file".
+                safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(item_id or ""))[:24]
+                temp_img_path = os.path.join(CFG.data_dir, f"temp_outro_{safe_id}_{uuid.uuid4().hex[:10]}.jpg")
                 if image_data_url and ";base64," in image_data_url:
                     b64_content = image_data_url.split(";base64,", 1)[1]
                     with open(temp_img_path, "wb") as f:
@@ -4096,6 +4143,8 @@ async def _startup():
         log.warning("Không nới được threadpool anyio: %s", exc)
     n_jobs = _apply_jobs_per_account(_get_shopee_settings().get("jobs_per_account", 2))
     log.info("🎬 Số video cùng lúc / tài khoản: %d", n_jobs)
+    skip_ex = store.set_skip_exhausted(_get_shopee_settings().get("skip_exhausted_accounts", False))
+    log.info("🔋 Bỏ qua TK hết token khi giao việc: %s", "BẬT" if skip_ex else "tắt")
     # Luồng xử lý (ảnh lẫn video) đã chết khi tắt app: đóng các task còn treo để không bị đếm/kẹt mãi.
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
