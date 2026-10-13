@@ -2673,6 +2673,9 @@ def save_temp_clip(req: dict):
             image_url = f"https://cf.shopee.ph/file/{image_url}"
         shopee_engine.set_cached_clip(item_id, "image_url", image_url)
     log.info("💾 [Temp Clip] Đã lưu clip thành phần: temp/%s (%s)", target_filename, target_path)
+    # Clip đã đổi tên sang temp/{item}-raw.mp4: chuyển nhãn "TK nào sinh ra" sang tên mới, để bước ghép/lưu sau còn biết
+    # cộng "Video thành công" cho đúng TK.
+    _remember_file_account(target_filename, _FILE_ACCOUNT.pop(os.path.basename(filename), None))
     return {"success": True, "path": target_path, "filename": target_filename}
 
 
@@ -3625,8 +3628,11 @@ def save_rendered_video(req: dict):
         if done_acc:
             try:
                 store.record_success(done_acc)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[Video thành công] Không cộng được cho TK %s: %s: %s", done_acc, type(exc).__name__, exc)
+        else:
+            log.warning("[Video thành công] SP %s: không biết TK nào đã sinh clip '%s' (không cộng được vào cột Video Thành Công)",
+                        item_id, os.path.basename(filename))
         return {"success": True, "saved_path": dst, "stitched": stitched}
     except HTTPException:
         raise
