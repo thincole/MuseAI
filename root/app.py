@@ -834,6 +834,20 @@ def _pos(v) -> bool:
         return False
 
 
+# Tên file video Muse vừa sinh -> TK đã sinh ra nó. Dùng để cộng "Video thành công" cho TK khi video được ghép/lưu xong
+# (bước lưu chạy sau, ở API khác nên cần nhớ TK). Giới hạn kích thước để không phình RAM.
+_FILE_ACCOUNT: dict[str, str] = {}
+
+
+def _remember_file_account(filename: str, acc_id: str | None):
+    if not filename or not acc_id:
+        return
+    _FILE_ACCOUNT[os.path.basename(str(filename))] = acc_id
+    if len(_FILE_ACCOUNT) > 6000:
+        for k in list(_FILE_ACCOUNT)[:2000]:
+            _FILE_ACCOUNT.pop(k, None)
+
+
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None) -> tuple[dict, str | None]:
@@ -1205,6 +1219,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
             if res.get("kind") != "video" or not fn.endswith((".mp4", ".webm", ".mov")) or res.get("size", 0) < 200000:
                 raise MuseGenerationError(f"Muse.ai đã sinh ra file không phải video (file: {res.get('filename')}, size: {res.get('size', 0)} bytes)")
             vurl = media_url(res["filename"])
+            _remember_file_account(res["filename"], acc_id)
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
                               elapsed=round(time.time() - t0, 1),
                               url=vurl,
@@ -3605,6 +3620,13 @@ def save_rendered_video(req: dict):
                                 except Exception:
                                     pass
 
+        # Video đã ra và ghép/lưu xong -> cộng "Video thành công" cho TK đã sinh ra clip này
+        done_acc = _FILE_ACCOUNT.pop(os.path.basename(filename), None)
+        if done_acc:
+            try:
+                store.record_success(done_acc)
+            except Exception:  # noqa: BLE001
+                pass
         return {"success": True, "saved_path": dst, "stitched": stitched}
     except HTTPException:
         raise

@@ -1292,12 +1292,13 @@
                 <th>Hạn Sử Dụng</th>
                 <th>Hạn Mức Token</th>
                 <th>Số Lần Dùng</th>
+                <th title="Số video đã ra VÀ ghép xong. Lượt dùng nhiều mà video ít = TK hay lỗi">Video Thành Công</th>
                 <th>Thao Tác</th>
               </tr>
             </thead>
             <tbody id="accountsTableBody">
               <tr>
-                <td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">
+                <td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">
                   Đang tải danh sách tài khoản...
                 </td>
               </tr>
@@ -2590,7 +2591,7 @@
           const ej = await res.json();
           err = ej.detail || err;
         } catch (_) {}
-        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--danger);padding:20px;">${err}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--danger);padding:20px;">${err}</td></tr>`;
         return;
       }
 
@@ -2606,7 +2607,7 @@
       if (!accs || accs.length === 0) {
         cachedAliveCount = 0;
         updateShopeeThreadsHint();
-        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
         renderQuotaSummary();
         return;
       }
@@ -2661,6 +2662,7 @@
             <td>${expStr}</td>
             <td id="qc_${a.id}">${quotaCellHtml(a.quota)}</td>
             <td>${a.use_count || 0} lượt</td>
+            <td>${successCellHtml(a)}</td>
             <td>
               <div style="display:flex;gap:6px;">
                 <button class="btn-tiny" onclick="testAccount('${a.id}')">Kiểm Tra</button>
@@ -2674,7 +2676,7 @@
       renderQuotaSummary();
 
     } catch (e) {
-      tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
     }
   }
 
@@ -2717,7 +2719,16 @@
     return h < 48 ? `${h} giờ trước` : `${Math.round(h / 24)} ngày trước`;
   }
 
-  function quotaCellHtml(q) {
+  function successCellHtml(a) {
+      const ok = a.success_count || 0, used = Math.max(0, (a.use_count || 0) - (a.success_since_use || 0));
+      if (!used) return `<b>${ok}</b>`;
+      const rate = Math.min(100, Math.round(ok * 100 / used));
+      // Tỉ lệ = video thành công / lượt dùng, đều tính từ lúc bản có cột này. Chỉ cảnh báo khi đã đủ lượt để kết luận.
+      const color = used >= 20 && rate < 40 ? "#f87171" : (rate < 70 ? "#fbbf24" : "#4ade80");
+      return `<b>${ok}</b><div style="font-size:10.5px;color:${color};">${rate}% / lượt</div>`;
+    }
+
+    function quotaCellHtml(q) {
     const st = quotaState(q);
     if (st.state === "unknown") {
       return `<span style="color:var(--text-dim);font-size:11.5px;">Chưa kiểm tra</span>`;

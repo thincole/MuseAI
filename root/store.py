@@ -147,6 +147,10 @@ def _write(path: str, obj, compact: bool = False):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, **dump_kw)
+            # Ép dữ liệu xuống đĩa TRƯỚC khi đổi tên: nếu mất điện đúng lúc này, file cũ vẫn còn nguyên
+            # (trước đây không fsync nên mất điện có thể để lại file đủ dung lượng nhưng toàn byte 0).
+            f.flush()
+            os.fsync(f.fileno())
         for attempt in range(5):
             try:
                 os.replace(tmp, path)
@@ -165,11 +169,83 @@ def _write(path: str, obj, compact: bool = False):
                 pass
 
 
+# ---------------- Sao lưu & tự khôi phục accounts.json (mất điện đột ngột) ----------------
+BACKUP_KEEP = 48            # giữ tối đa bấy nhiêu bản sao lưu (mỗi 10 phút 1 bản = ~8 giờ + các bản lúc khởi động)
+BACKUP_INTERVAL = 600       # giây giữa 2 lần sao lưu tự động khi đang chạy
+_last_backup_at = 0.0
+
+
+def _backup_dir(accounts_path: str) -> str:
+    return os.path.join(os.path.dirname(accounts_path), "backups")
+
+
+def _list_backups(accounts_path: str) -> list[str]:
+    d = _backup_dir(accounts_path)
+    try:
+        names = [n for n in os.listdir(d) if n.startswith("accounts-") and n.endswith(".json")]
+    except OSError:
+        return []
+    return [os.path.join(d, n) for n in sorted(names, reverse=True)]   # mới nhất trước
+
+
+def backup_accounts(accounts_path: str, force: bool = False) -> str | None:
+    """Sao lưu accounts.json sang data/backups/accounts-YYYYmmdd-HHMMSS.json. Chỉ sao lưu khi file đọc được và có TK
+    (không bao giờ ghi đè bản tốt bằng bản hỏng). Giữ BACKUP_KEEP bản mới nhất. Trả về đường dẫn bản mới, hoặc None."""
+    global _last_backup_at
+    now = time.time()
+    if not force and now - _last_backup_at < BACKUP_INTERVAL:
+        return None
+    try:
+        data = _read(accounts_path, None)
+        if not isinstance(data, list) or not data:
+            return None
+        d = _backup_dir(accounts_path)
+        dest = os.path.join(d, time.strftime("accounts-%Y%m%d-%H%M%S.json", time.localtime(now)))
+        _write(dest, data)
+        _last_backup_at = now
+        for old in _list_backups(accounts_path)[BACKUP_KEEP:]:
+            try:
+                os.unlink(old)
+            except OSError:
+                pass
+        return dest
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_accounts_with_recovery(accounts_path: str) -> list:
+    """Đọc accounts.json. Nếu file hỏng/rỗng/toàn byte 0 (mất điện) thì tự khôi phục từ bản sao lưu hợp lệ mới nhất
+    và ghi lại file chính."""
+    if not os.path.isfile(accounts_path):
+        data = None
+    else:
+        data = _read(accounts_path, None)
+    if isinstance(data, list):
+        return data
+    import logging
+    log = logging.getLogger("muse2api")
+    for b in _list_backups(accounts_path):
+        cand = _read(b, None)
+        if isinstance(cand, list) and cand:
+            log.warning("🛟 [Sao lưu] accounts.json bị hỏng/mất -> tự khôi phục %d TK từ %s", len(cand), os.path.basename(b))
+            try:
+                _write(accounts_path, cand)
+            except Exception:  # noqa: BLE001
+                pass
+            return cand
+    if os.path.isfile(accounts_path):
+        log.error("⚠ [Sao lưu] accounts.json bị hỏng và KHÔNG có bản sao lưu nào dùng được (thư mục data/backups).")
+    return []
+
+
 class Store:
     def __init__(self, cfg):
         self.cfg = cfg
         self._accounts_mtime = 0
         self.accounts: list[dict] = []
+        # Mỗi lần mở phần mềm: nếu accounts.json lành thì sao lưu 1 bản; nếu hỏng thì tự khôi phục từ bản sao lưu.
+        load_accounts_with_recovery(cfg.accounts_file)
+        backup_accounts(cfg.accounts_file, force=True)
         self._sync_from_disk()
         self.tasks: dict[str, dict] = _read(cfg.tasks_file, {})
         self._tasks_written_at = 0.0
@@ -182,8 +258,13 @@ class Store:
             mtime = os.path.getmtime(self.cfg.accounts_file)
             if mtime == getattr(self, "_accounts_mtime", 0):
                 return
-            disk_accs = _read(self.cfg.accounts_file, [])
+            disk_accs = load_accounts_with_recovery(self.cfg.accounts_file)
+            mtime = os.path.getmtime(self.cfg.accounts_file)
             for a in disk_accs:
+                # TK cũ chưa có bộ đếm "Video thành công": bắt đầu đếm từ số lượt hiện tại để tỉ lệ thành công không bị lệch
+                if "success_count" not in a:
+                    a["success_count"] = 0
+                    a["success_since_use"] = int(a.get("use_count") or 0)
                 ce = a.get("cookies_exp") or {}
                 if _is_pos(ce.get("hatch_vml")):
                     a["expires_at"] = int(ce["hatch_vml"])
@@ -198,6 +279,7 @@ class Store:
             self._accounts_mtime = os.path.getmtime(self.cfg.accounts_file)
         except Exception:
             pass
+        backup_accounts(self.cfg.accounts_file)   # tối đa 10 phút 1 bản
 
     # ---------- 账号 ----------
     def add_account(self, cookies: dict, label: str = "",
@@ -236,7 +318,7 @@ class Store:
                    "cookies_exp": exp, "expires_at": account_expiry(exp, now),
                    "expiry_anchor": None,
                    "enabled": True, "created_at": now,
-                   "last_used": None, "last_keepalive": None, "use_count": 0,
+                   "last_used": None, "last_keepalive": None, "use_count": 0, "success_count": 0, "success_since_use": 0,
                    "ok": None, "note": "", "synced_at": None}
             self.accounts.append(acc)
             self._save_accounts()
@@ -414,6 +496,19 @@ class Store:
                 if rem <= 0:
                     return None
                 self._COND.wait(timeout=min(2.0, rem))
+
+    def record_success(self, aid: str):
+        """Cộng 1 vào 'Video thành công' của TK: chỉ gọi khi video đã ra VÀ ghép/lưu xong (khác 'Số lần dùng' = số lượt
+        được giao việc, kể cả lượt lỗi)."""
+        with _LOCK:
+            self._sync_from_disk()
+            for a in self.accounts:
+                if a["id"] == aid:
+                    a["success_count"] = int(a.get("success_count") or 0) + 1
+                    break
+            else:
+                return
+            self._save_accounts()
 
     def release_account(self, aid: str):
         """Trả tài khoản lại cho Pool sau khi worker hoàn thành tác vụ."""
