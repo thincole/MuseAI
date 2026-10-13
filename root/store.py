@@ -170,8 +170,7 @@ def _write(path: str, obj, compact: bool = False):
 
 
 # ---------------- Sao lưu & tự khôi phục accounts.json (mất điện đột ngột) ----------------
-BACKUP_KEEP = 48            # giữ tối đa bấy nhiêu bản sao lưu (mỗi 10 phút 1 bản = ~8 giờ + các bản lúc khởi động)
-BACKUP_INTERVAL = 600       # giây giữa 2 lần sao lưu tự động khi đang chạy
+BACKUP_KEEP = 10            # chỉ sao lưu 1 bản mỗi lần mở phần mềm; giữ tối đa bấy nhiêu bản mới nhất
 _last_backup_at = 0.0
 
 
@@ -189,15 +188,17 @@ def _list_backups(accounts_path: str) -> list[str]:
 
 
 def backup_accounts(accounts_path: str, force: bool = False) -> str | None:
-    """Sao lưu accounts.json sang data/backups/accounts-YYYYmmdd-HHMMSS.json. Chỉ sao lưu khi file đọc được và có TK
-    (không bao giờ ghi đè bản tốt bằng bản hỏng). Giữ BACKUP_KEEP bản mới nhất. Trả về đường dẫn bản mới, hoặc None."""
+    """Sao lưu accounts.json sang data/backups/accounts-YYYYmmdd-HHMMSS.json. Chỉ gọi 1 lần khi mở phần mềm.
+    Chỉ sao lưu khi file đọc được và có TK (không bao giờ ghi đè bản tốt bằng bản hỏng), và bỏ qua nếu nội dung
+    giống hệt bản mới nhất. Giữ BACKUP_KEEP bản mới nhất. Trả về đường dẫn bản mới, hoặc None."""
     global _last_backup_at
     now = time.time()
-    if not force and now - _last_backup_at < BACKUP_INTERVAL:
-        return None
     try:
         data = _read(accounts_path, None)
         if not isinstance(data, list) or not data:
+            return None
+        newest = _list_backups(accounts_path)[:1]
+        if newest and _read(newest[0], None) == data:
             return None
         d = _backup_dir(accounts_path)
         dest = os.path.join(d, time.strftime("accounts-%Y%m%d-%H%M%S.json", time.localtime(now)))
@@ -279,7 +280,6 @@ class Store:
             self._accounts_mtime = os.path.getmtime(self.cfg.accounts_file)
         except Exception:
             pass
-        backup_accounts(self.cfg.accounts_file)   # tối đa 10 phút 1 bản
 
     # ---------- 账号 ----------
     def add_account(self, cookies: dict, label: str = "",
