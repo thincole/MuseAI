@@ -50,7 +50,8 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from pydantic import BaseModel, Field
 
 from config import CFG
-from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError, MuseVMUnavailableError
+from engine import (ESSENTIAL_COOKIES, MuseAccountDisconnectedError, MuseAuthError, MuseEngine, MuseGenerationError,
+                    MuseVMUnavailableError)
 from store import STUCK_COOLDOWN_SECONDS, Store, account_expiry, min_expiry
 
 import sys
@@ -845,16 +846,21 @@ def _run_generation(prompt: str, kind: str, timeout: int,
 
     last_exc = None
     try:
-        for attempt in range(2):
+        attempt = 0        # lượt thử thật của sản phẩm (tối đa 2)
+        disc_skips = 0     # số lần gặp TK bị Muse ngắt kết nối: lỗi tức thì, KHÔNG tính vào 2 lượt, đổi TK khác thử tiếp
+        first = True
+        while attempt < 2:
             if deadline is not None and time.monotonic() >= deadline:
                 raise MuseGenerationError("Đã hết thời gian chờ tác vụ")
-            if attempt > 0:
+            if not first:
                 alt = store.acquire_account(exclude_id=cur_acc["id"], timeout=10)
                 if not alt:
                     break
                 store.release_account(cur_acc["id"])
                 cur_acc = alt
                 log.info("Chuyển sang tài khoản dự phòng: %s (%s)", cur_acc.get("label"), cur_acc["id"])
+            first = False
+            disconnected = False
 
             session = None
             try:
@@ -892,8 +898,17 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     session = None
             except MuseGenerationError as exc:
                 last_exc = exc
+                disconnected = isinstance(exc, MuseAccountDisconnectedError)
                 log.warning("✗ [Video Gen] Lỗi tạo video với TK %s: %s", cur_acc["id"], exc)
-                store.mark(cur_acc["id"], True, f"Tác vụ gián đoạn: {str(exc)[:60]}")
+                if disconnected:
+                    # Muse khoá TK ("Muse is disconnected"): mọi lần thử tiếp đều lỗi -> cho TK nghỉ 6 giờ (hết giờ thử lại
+                    # 1 lần, còn bị khoá thì nghỉ tiếp) và đánh dấu đỏ ở tab Tài Khoản Muse để biết TK nào cần gửi ticket.
+                    store.mark(cur_acc["id"], False, "Muse ngắt kết nối TK (Muse is disconnected) — cần gửi ticket cho Muse")
+                    store.block_until(cur_acc["id"], 6 * 3600)
+                    log.warning("🔌 [Muse ngắt kết nối] TK %s (%s) bị Muse khoá bảo vệ -> cho nghỉ 6 giờ, luồng dùng TK khác",
+                                cur_acc["id"], cur_acc.get("label"))
+                else:
+                    store.mark(cur_acc["id"], True, f"Tác vụ gián đoạn: {str(exc)[:60]}")
                 if "hết hạn ngạch" in str(exc) or "额度不足" in str(exc):
                     # Muse TỪ CHỐI thật vì hết hạn mức: cho TK nghỉ 6 giờ, các luồng dùng TK khác (khác với số token hiển thị,
                     # vì đo thực tế có TK "0 token" vẫn render được — chỉ khi Muse từ chối mới chặn).
@@ -926,6 +941,11 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     except Exception:
                         pass
                     session = None
+
+            if disconnected and disc_skips < 6:
+                disc_skips += 1
+                continue
+            attempt += 1
 
         raise last_exc or MuseGenerationError("Tạo video thất bại sau các lần thử")
     finally:

@@ -364,6 +364,11 @@ class MuseVMUnavailableError(MuseGenerationError):
     """Máy ảo Muse của tài khoản không nhận prompt / không mở được phiên — dùng để cho tài khoản nghỉ (cooldown)."""
 
 
+class MuseAccountDisconnectedError(MuseGenerationError):
+    """Muse hiện "Muse is disconnected ... Submit a feedback ticket to reconnect" = TK bị Muse khoá bảo vệ.
+    Đổi IP/proxy không cứu được; luồng phải bỏ TK này ngay và dùng TK khác (không tính là 1 lần thử của sản phẩm)."""
+
+
 # Để trình duyệt tự quản lý kết nối VM như người dùng thật: không bơm cookie hatch_gw (token cổng VM) lấy từ
 # Python vào trình duyệt và không gọi /api/hatch/vm/wake từ Python khi mở phiên (trang muse.ai tự xin token + tự
 # đánh thức VM). Log 09/10: 4/5 TK luôn render được KHÔNG có hatch_gw, 57/58 TK luôn kẹt "Connecting..." CÓ hatch_gw.
@@ -2236,6 +2241,19 @@ class MuseWorkerSession:
         if n > base_user_msgs and imgs == 0:
             raise MuseGenerationError("Prompt đã gửi nhưng KHÔNG kèm ảnh tham chiếu (upload ảnh chưa xong) — đổi sang tài khoản khác")
 
+    _DISCONNECTED_JS = ("(function(){var t=(document.body&&document.body.innerText)||'';"
+                        "return /Muse is disconnected|disconnected Muse to protect/i.test(t);})()")
+
+    def _raise_if_disconnected(self):
+        """Trang đang hiện 'Muse is disconnected' (TK bị Muse khoá bảo vệ) -> báo lỗi riêng để app cho TK nghỉ dài."""
+        try:
+            hit = bool(self.page.js(self._DISCONNECTED_JS))
+        except Exception:  # noqa: BLE001
+            hit = False
+        if hit:
+            raise MuseAccountDisconnectedError(
+                'Muse đã ngắt kết nối TK này ("Muse is disconnected" — Muse khoá bảo vệ, cần gửi ticket cho Muse để mở lại)')
+
     def _attach_image(self, image_data: str):
         b64, mime = self.engine._normalize_image(image_data)
         if not b64:
@@ -2309,6 +2327,7 @@ class MuseWorkerSession:
         # loạt trên phiên mới. -> Chờ trang tải xong, rồi đưa ảnh tối đa 3 lần (chỉ đưa lại khi lần trước chưa hiện).
         ready_deadline = time.time() + 15.0
         while time.time() < ready_deadline:
+            self._raise_if_disconnected()
             try:
                 if self.page.js("document.readyState === 'complete' && "
                                 "!!document.querySelector('[data-testid=\"hatch-composer-placeholder-overlay\"]')"):
@@ -2318,19 +2337,26 @@ class MuseWorkerSession:
             time.sleep(0.3)
         attached = ""
         for attempt, wait_s in enumerate((6.0, 6.0, 10.0), 1):
+            inject_err = ""
             try:
                 raw_res = self.page.js(_INJECT_JS % (json.dumps(b64), json.dumps(mime)))
                 res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
                 if not res_obj.get("ok"):
-                    raise MuseGenerationError("附加参考图失败，已停止生成")
-            except Exception as e:
-                raise MuseGenerationError("附加参考图失败，已停止生成") from e
+                    inject_err = str(res_obj.get("err") or "unknown")
+            except Exception as e:  # noqa: BLE001
+                inject_err = f"{type(e).__name__}: {e}"[:120]
+            if inject_err:
+                # Ghi rõ lý do (trước đây nuốt mất: 'no-file-input' = trang chưa/không dựng ô soạn tin) và phân biệt
+                # trường hợp TK bị Muse ngắt kết nối.
+                self._raise_if_disconnected()
+                raise MuseGenerationError(f"附加参考图失败，已停止生成 ({inject_err})")
             attached = _wait_attached(wait_s)
             if attached:
                 if attempt > 1:
                     log.info("📎 TK %s: ảnh tham chiếu hiện ra ở lần đưa thứ %d", self.account_id, attempt)
                 break
         if not attached:
+            self._raise_if_disconnected()
             raise MuseGenerationError("Ảnh tham chiếu chưa đính kèm được vào ô soạn tin sau 3 lần thử, đã dừng trước khi gửi prompt")
 
         # Ảnh xem trước hiện ra ngay khi chọn file, nhưng upload lên Muse có thể chưa xong (nhất là qua proxy).
