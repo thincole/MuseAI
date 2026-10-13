@@ -117,6 +117,89 @@ def is_recent_dongvan_time(time_str: str, max_age_seconds: int = 3600) -> bool:
 
 
 # ============================================================================
+# PROXY CỐ ĐỊNH CHO TỪNG LUỒNG (HomeProxy): mỗi luồng đăng nhập 1 IP riêng, không dùng IP thật của máy
+# ============================================================================
+def pick_worker_proxies(n: int, log=None) -> list[str | None]:
+    """Chọn n proxy KHÁC NHAU còn sống từ danh sách HomeProxy mà phần mềm đang dùng (ưu tiên proxy ít TK nhất).
+    Trả về list độ dài n; luồng nào không kiếm được proxy thì None (chạy IP thật)."""
+    out: list[str | None] = [None] * n
+    try:
+        import proxy_manager as pm
+        if not pm.is_proxy_enabled():
+            if log:
+                log("Proxy đang TẮT trong cài đặt phần mềm (Không fake IP) -> các luồng chạy IP thật.")
+            return out
+        pool = pm.get_cached_proxy_pool() or pm.load_proxies_from_thinaptm()
+        if not pool:
+            if log:
+                log("Không có proxy nào trong HomeProxy Pool -> các luồng chạy IP thật.")
+            return out
+        try:
+            order = pm._least_loaded_first(pool, pm._proxy_loads(pool))
+        except Exception:  # noqa: BLE001
+            order = list(pool)
+        k = 0
+        for cand in order:
+            if k >= n:
+                break
+            ok, ip = pm.test_proxy(cand)
+            if ok:
+                out[k] = cand
+                if log:
+                    log(f"[Luồng {k + 1}] dùng proxy cố định IP {ip}")
+                k += 1
+        if k < n and log:
+            log(f"Chỉ có {k}/{n} proxy còn sống: các luồng còn lại chạy IP thật.")
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log(f"Không chọn được proxy ({type(exc).__name__}: {exc}) -> chạy IP thật.")
+    return out
+
+
+# ============================================================================
+# NGUỒN ĐỌC OTP THỨ 2: hòm thư tạm https://mail.nguyenmaucole.io.vn/ (cho email @nguyenmaucole.io.vn)
+# Trang này chỉ là giao diện; dữ liệu lấy qua API JSON (không cần mở trình duyệt, không phụ thuộc DongVanFB):
+#   GET https://tempmail-backend.thincole.workers.dev/api/emails?address=<email>  ->  [{id, sender, subject, body_html, received_at}, ...]
+# ============================================================================
+MAILAPI_DOMAIN = "@nguyenmaucole.io.vn"
+MAILAPI_URL = "https://tempmail-backend.thincole.workers.dev/api/emails?address="
+MAILAPI_ATTEMPTS = 12      # số lần hỏi API
+MAILAPI_INTERVAL = 5       # giây giữa 2 lần hỏi
+
+
+def is_mailapi_email(email: str) -> bool:
+    return str(email or "").strip().lower().endswith(MAILAPI_DOMAIN)
+
+
+def mailapi_fetch(email: str, timeout: float = 15.0) -> list[dict] | None:
+    """Danh sách thư của hòm thư (mới nhất trước) hoặc None nếu không gọi được API."""
+    import urllib.parse
+    import urllib.request
+    url = MAILAPI_URL + urllib.parse.quote(email.strip().lower())
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return data if isinstance(data, list) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def mailapi_extract_otp(mail: dict) -> str | None:
+    """Bóc mã 6 số từ 1 thư (tiêu đề + nội dung), bỏ qua mã màu CSS (#123456) và phần <style>."""
+    subject = str(mail.get("subject") or "")
+    body = str(mail.get("body_html") or mail.get("body") or "")
+    body = re.sub(r"(?is)<(style|script)\b.*?</\1>", " ", body)
+    body = re.sub(r"(?s)<[^>]+>", " ", body)
+    body = re.sub(r"&nbsp;|&#160;", " ", body)
+    text = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", subject + " " + body)
+    m = re.search(r"(?:use\s+code|login\s+code|security\s+code|mã\s+xác\s+nhận|mã|code)\D{0,40}?(\d{6})\b", text, re.IGNORECASE)
+    if not m:
+        m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+    return m.group(1) if m else None
+
+
+# ============================================================================
 # LỚP WORKER THREAD CHẠY TỪNG TÀI KHOẢN TRONG POOL
 # ============================================================================
 class LoginWorker(threading.Thread):
@@ -128,6 +211,7 @@ class LoginWorker(threading.Thread):
         headless: bool,
         chrome_path: str,
         delay_between: int,
+        proxy_str: str | None = None,
     ):
         super().__init__()
         self.worker_id = worker_id
@@ -136,6 +220,7 @@ class LoginWorker(threading.Thread):
         self.headless = headless
         self.chrome_path = chrome_path
         self.delay_between = delay_between
+        self.proxy_str = proxy_str
         self.profile_dir = os.path.join(tempfile.gettempdir(), f"muse_gui_worker_{worker_id}")
         self.port = 9310 + worker_id * 5
         self.daemon = True
@@ -148,6 +233,16 @@ class LoginWorker(threading.Thread):
         co.set_argument("--no-first-run")
         co.set_argument("--no-default-browser-check")
         co.set_argument("--disable-blink-features=AutomationControlled")
+        if self.proxy_str:
+            try:
+                import proxy_manager as pm
+                fport = pm.start_local_forwarder(self.proxy_str)
+                co.set_argument(f"--proxy-server=http://127.0.0.1:{fport}")
+                # Trang đọc hòm thư (DongVanFB) đi thẳng, không qua proxy: nhanh và tránh proxy chặn làm không đọc được OTP
+                co.set_argument("--proxy-bypass-list=dongvanfb.net;*.dongvanfb.net;localhost;127.0.0.1")
+                self.controller.log(f"[Luồng {self.worker_id}] Chrome chạy qua proxy cố định (forwarder 127.0.0.1:{fport})")
+            except Exception as exc:  # noqa: BLE001
+                self.controller.log(f"[Luồng {self.worker_id}] Không bật được proxy ({exc}) -> chạy IP thật")
         if self.headless:
             co.headless(True)
         else:
@@ -228,6 +323,75 @@ class LoginWorker(threading.Thread):
                 return m.group(1)
         return None
 
+    def _otp_from_mailapi(self, row_idx: int, email: str, seen: set[str] | None) -> str | None:
+        """Hỏi API hòm thư tạm mỗi MAILAPI_INTERVAL giây (tối đa MAILAPI_ATTEMPTS lần), chỉ nhận thư MỚI có mã 6 số."""
+        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đọc OTP qua mail.nguyenmaucole.io.vn (API)...")
+        for attempt in range(1, MAILAPI_ATTEMPTS + 1):
+            if not self.controller.is_running:
+                return None
+            self.controller.update_status(row_idx, f"Đang lấy OTP mail.nguyenmaucole (lần {attempt}/{MAILAPI_ATTEMPTS})...", "#fbbf24")
+            mails = mailapi_fetch(email)
+            if mails is None:
+                self.controller.log(f"[Luồng {self.worker_id}] [{email}] Không gọi được API hòm thư (lần {attempt}), thử lại...")
+            else:
+                for mail in mails:               # mới nhất trước
+                    if seen is not None and str(mail.get("id")) in seen:
+                        continue
+                    code = mailapi_extract_otp(mail)
+                    if code:
+                        return code
+            time.sleep(MAILAPI_INTERVAL)
+        return None
+
+    def _otp_from_dongvan(self, page, dongvan_tab, row_idx: int, acc_line: str, email: str) -> str | None:
+        # Đọc OTP trên DongVanFB (chỉ chấp nhận thư mới gửi)
+        self.controller.update_status(row_idx, "Đang lấy OTP DongVanFB...", "#fbbf24")
+        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chuyển tab DongVanFB đọc hòm thư...")
+
+        page.activate_tab(dongvan_tab)
+        time.sleep(1)
+
+        dongvan_tab.run_js("""
+            let r = document.querySelector('input[value="oauth2"]');
+            if (r) {
+                r.checked = true;
+                r.click();
+                r.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            let ta = document.getElementById('list_email') || document.querySelector('textarea');
+            if (ta) {
+                ta.value = arguments[0];
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
+            if (btn) btn.click();
+        """, acc_line)
+
+        # DongVanFB đôi khi phải đọc lại vài lần mới thấy thư OTP -> thử tối đa OTP_READ_ATTEMPTS lần,
+        # mỗi lần bấm "Đọc hòm thư" rồi chờ OTP_READ_INTERVAL giây (vẫn dò bảng mỗi giây, thấy mã là dừng ngay).
+        otp_code = None
+        for attempt in range(1, OTP_READ_ATTEMPTS + 1):
+            if not self.controller.is_running:
+                break
+            if attempt > 1:
+                dongvan_tab.run_js("""
+                    let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
+                    if (btn) btn.click();
+                """)
+            self.controller.update_status(row_idx, f"Đang lấy OTP DongVanFB (lần {attempt}/{OTP_READ_ATTEMPTS})...", "#fbbf24")
+            deadline = time.time() + OTP_READ_INTERVAL
+            while time.time() < deadline and self.controller.is_running:
+                time.sleep(1)
+                otp_code = self._find_dongvan_otp(dongvan_tab, email)
+                if otp_code:
+                    break
+            if otp_code:
+                break
+            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chưa thấy mã OTP (lần {attempt}/{OTP_READ_ATTEMPTS}), đọc lại hòm thư...")
+
+        return otp_code
+
     def process_single_account(self, page: ChromiumPage, dongvan_tab, row_idx: int, acc_line: str, email: str):
         if not self.controller.is_running:
             return
@@ -282,6 +446,12 @@ class LoginWorker(threading.Thread):
             self.controller.record_result(False)
             return
 
+        # Email @nguyenmaucole.io.vn: chụp danh sách thư ĐANG CÓ trước khi bấm Continue, sau đó chỉ nhận thư MỚI (khác id)
+        mailapi_seen: set[str] | None = None
+        if is_mailapi_email(email):
+            before = mailapi_fetch(email)
+            mailapi_seen = {str(m.get("id")) for m in before} if before is not None else None
+
         btn_continue.click()
         self.controller.update_status(row_idx, "Đã gửi yêu cầu OTP...", "#f59e0b")
         # Đợi 4 giây cho Muse gửi email
@@ -297,51 +467,11 @@ class LoginWorker(threading.Thread):
             self.controller.record_result(False)
             return
 
-        # 2. Đọc OTP trên DongVanFB (chỉ chấp nhận thư mới gửi)
-        self.controller.update_status(row_idx, "Đang lấy OTP DongVanFB...", "#fbbf24")
-        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chuyển tab DongVanFB đọc hòm thư...")
-
-        page.activate_tab(dongvan_tab)
-        time.sleep(1)
-
-        dongvan_tab.run_js("""
-            let r = document.querySelector('input[value="oauth2"]');
-            if (r) {
-                r.checked = true;
-                r.click();
-                r.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            let ta = document.getElementById('list_email') || document.querySelector('textarea');
-            if (ta) {
-                ta.value = arguments[0];
-                ta.dispatchEvent(new Event('input', { bubbles: true }));
-                ta.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
-            if (btn) btn.click();
-        """, acc_line)
-
-        # DongVanFB đôi khi phải đọc lại vài lần mới thấy thư OTP -> thử tối đa OTP_READ_ATTEMPTS lần,
-        # mỗi lần bấm "Đọc hòm thư" rồi chờ OTP_READ_INTERVAL giây (vẫn dò bảng mỗi giây, thấy mã là dừng ngay).
-        otp_code = None
-        for attempt in range(1, OTP_READ_ATTEMPTS + 1):
-            if not self.controller.is_running:
-                break
-            if attempt > 1:
-                dongvan_tab.run_js("""
-                    let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
-                    if (btn) btn.click();
-                """)
-            self.controller.update_status(row_idx, f"Đang lấy OTP DongVanFB (lần {attempt}/{OTP_READ_ATTEMPTS})...", "#fbbf24")
-            deadline = time.time() + OTP_READ_INTERVAL
-            while time.time() < deadline and self.controller.is_running:
-                time.sleep(1)
-                otp_code = self._find_dongvan_otp(dongvan_tab, email)
-                if otp_code:
-                    break
-            if otp_code:
-                break
-            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chưa thấy mã OTP (lần {attempt}/{OTP_READ_ATTEMPTS}), đọc lại hòm thư...")
+        # 2. Lấy OTP: email @nguyenmaucole.io.vn đọc qua API hòm thư tạm; email khác (Hotmail OAuth2...) đọc qua DongVanFB
+        if is_mailapi_email(email):
+            otp_code = self._otp_from_mailapi(row_idx, email, mailapi_seen)
+        else:
+            otp_code = self._otp_from_dongvan(page, dongvan_tab, row_idx, acc_line, email)
 
         if not otp_code:
             self.controller.update_status(row_idx, f"Không lấy được OTP sau {OTP_READ_ATTEMPTS} lần", "#ef4444")
@@ -463,8 +593,10 @@ class WorkerController(QThread):
         save_to_store: bool,
         delay_between: int,
         tasks: list[tuple[int, str]] | None = None,
+        use_proxy: bool = True,
     ):
         super().__init__()
+        self.use_proxy = use_proxy
         self.accounts = accounts
         self.tasks = tasks if tasks is not None else [(idx, acc) for idx, acc in enumerate(accounts)]
         self.num_threads = num_threads
@@ -493,6 +625,12 @@ class WorkerController(QThread):
 
         workers = []
         actual_threads = min(self.num_threads, self.total)
+        if self.use_proxy:
+            self.log(f"Đang chọn {actual_threads} proxy cố định (mỗi luồng 1 IP riêng)...")
+            worker_proxies = pick_worker_proxies(actual_threads, self.log)
+        else:
+            self.log("Không dùng proxy: các luồng chạy bằng IP thật của máy.")
+            worker_proxies = [None] * actual_threads
         for i in range(actual_threads):
             w = LoginWorker(
                 worker_id=i + 1,
@@ -501,6 +639,7 @@ class WorkerController(QThread):
                 headless=self.headless,
                 chrome_path=self.chrome_path,
                 delay_between=self.delay_between,
+                proxy_str=worker_proxies[i],
             )
             workers.append(w)
             w.start()
@@ -509,6 +648,12 @@ class WorkerController(QThread):
         for w in workers:
             w.join()
 
+        if self.use_proxy:
+            try:
+                import proxy_manager as pm
+                pm.stop_all_forwarders()      # chỉ đóng forwarder do công cụ này mở
+            except Exception:  # noqa: BLE001
+                pass
         self.log("Hoàn thành toàn bộ danh sách tài khoản!")
         self.finished_signal.emit()
 
@@ -797,6 +942,11 @@ class MainWindow(QMainWindow):
         self.chk_headless.setToolTip("Tích vào để không làm phiền màn hình làm việc")
         row2.addWidget(self.chk_headless)
 
+        self.chk_proxy = QCheckBox("Proxy cố định (HomeProxy, mỗi luồng 1 IP)")
+        self.chk_proxy.setChecked(True)
+        self.chk_proxy.setToolTip("Mỗi luồng đăng nhập qua 1 proxy riêng thay vì IP thật của máy (giảm bị Muse chặn)")
+        row2.addWidget(self.chk_proxy)
+
         self.chk_save_store = QCheckBox("Tự động nạp vào MuseAI Studio")
         self.chk_save_store.setChecked(True)
         self.chk_save_store.setToolTip("Cập nhật trực tiếp vào data/accounts.json")
@@ -950,6 +1100,7 @@ class MainWindow(QMainWindow):
             headless=headless,
             save_to_store=save_store,
             delay_between=delay,
+            use_proxy=self.chk_proxy.isChecked(),
         )
         self.controller.log_signal.connect(self.log)
         self.controller.status_signal.connect(self.on_status_updated)
@@ -1046,6 +1197,7 @@ class MainWindow(QMainWindow):
             headless=headless,
             save_to_store=save_store,
             delay_between=delay,
+            use_proxy=self.chk_proxy.isChecked(),
             tasks=tasks,
         )
         self.controller.log_signal.connect(self.log)

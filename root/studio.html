@@ -2630,7 +2630,8 @@
                                  .replace(/会话正常/g, "Phiên hợp lệ")
                                  .replace(/已更新 cookie/g, "Đã cập nhật Cookie")
                                  .replace(/RUNNING/g, "Đang chạy");
-        const noteColor = (a.ok === true) ? "#34d399" : (a.ok === false ? "#f87171" : "var(--text-dim)");
+        if (a.muse_locked) displayNote = "🔒 Muse ngắt kết nối TK (Muse is disconnected) — đã khoá, không giao việc · cần gửi ticket cho Muse";
+        const noteColor = a.muse_locked ? "#f87171" : (a.ok === true) ? "#34d399" : (a.ok === false ? "#f87171" : "var(--text-dim)");
         const noteHtml = displayNote ? `<div style="font-size:11px;color:${noteColor};margin-top:2px;">${displayNote}</div>` : "";
 
         let proxyHtml = `<span style="color:var(--text-dim);font-size:11px;">Chưa gán</span> <button class="btn-tiny" onclick="rotateAccountProxy('${a.id}')" style="margin-left:4px;padding:2px 6px;">Gán Proxy</button>`;
@@ -2667,6 +2668,7 @@
               <div style="display:flex;gap:6px;">
                 <button class="btn-tiny" onclick="testAccount('${a.id}')">Kiểm Tra</button>
                 <button class="btn-tiny" id="qb_${a.id}" onclick="checkAccountQuota('${a.id}')" title="Đọc hạn mức token của tài khoản này (qua proxy riêng của nó)">Hạn mức</button>
+                ${a.muse_locked ? `<button class="btn-tiny" onclick="unlockAccount('${a.id}')" title="Mở khoá để phần mềm giao việc lại cho TK này">Mở khoá</button>` : ""}
                 <button class="btn-tiny danger" onclick="deleteAccount('${a.id}')">Xóa</button>
               </div>
             </td>
@@ -2914,6 +2916,17 @@
       loadAccounts();
     } catch (e) {
       showToast(`Lỗi test: ${e.message}`, "danger");
+    }
+  }
+
+  async function unlockAccount(aid) {
+    if (!confirm("Mở khoá tài khoản này? Phần mềm sẽ giao việc lại cho TK. Chỉ nên mở khi đã gửi ticket cho Muse hoặc TK dùng lại được.")) return;
+    try {
+      const res = await fetch(`/admin/accounts/${aid}/unlock`, { method: "POST", headers: getHeaders() });
+      if (res.ok) { showToast("Đã mở khoá tài khoản", "info"); loadAccounts(); }
+      else showToast("Không mở khoá được", "danger");
+    } catch (e) {
+      showToast(`Lỗi mở khoá: ${e.message}`, "danger");
     }
   }
 

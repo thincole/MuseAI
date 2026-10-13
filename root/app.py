@@ -923,6 +923,10 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                                "Phiên TK hỏng (Something went wrong) — thử đăng nhập lại lấy cookie mới" if wrong
                                else "Muse ngắt kết nối TK (Muse is disconnected) — cần gửi ticket cho Muse")
                     store.block_until(cur_acc["id"], (1 if wrong else 6) * 3600)
+                    if not wrong:
+                        # "Muse is disconnected": khoá TK hẳn (bền qua khởi động lại) cho tới khi người dùng mở khoá
+                        store.set_locked(cur_acc["id"], True,
+                                         "Muse ngắt kết nối TK (Muse is disconnected) — cần gửi ticket cho Muse")
                     log.warning("🔌 [Muse ngắt kết nối] TK %s (%s) %s -> cho nghỉ %d giờ, luồng dùng TK khác",
                                 cur_acc["id"], cur_acc.get("label"),
                                 "báo Something went wrong" if wrong else "bị Muse khoá bảo vệ", 1 if wrong else 6)
@@ -1775,6 +1779,15 @@ async def query_quota(aid: str, _=Depends(admin_auth)):
 
 
 _QUOTA_CHECK_SLOTS = threading.BoundedSemaphore(3)  # tối đa 3 lần đọc hạn mức cùng lúc (mỗi lần mở 1 tab tạm)
+
+
+@app.post("/admin/accounts/{aid}/unlock")
+def unlock_account(aid: str, _=Depends(admin_auth)):
+    """Mở khoá TK đã bị khoá vì 'Muse is disconnected' (sau khi đã gửi ticket / TK đã dùng lại được)."""
+    if not store.get_account(aid):
+        raise HTTPException(404, "Tài khoản không tồn tại")
+    store.set_locked(aid, False, "Đã mở khoá thủ công")
+    return {"ok": True}
 
 
 @app.post("/admin/accounts/{aid}/quota-check")

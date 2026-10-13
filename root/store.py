@@ -263,6 +263,8 @@ class Store:
             mtime = os.path.getmtime(self.cfg.accounts_file)
             for a in disk_accs:
                 # TK cũ chưa có bộ đếm "Video thành công": bắt đầu đếm từ số lượt hiện tại để tỉ lệ thành công không bị lệch
+                if "Muse is disconnected" in (a.get("note") or "") and not a.get("muse_locked"):
+                    a["muse_locked"] = True
                 if "success_count" not in a:
                     a["success_count"] = 0
                     a["success_since_use"] = int(a.get("use_count") or 0)
@@ -462,7 +464,8 @@ class Store:
                 busy = self._BUSY_COUNT
                 limit = Store.MAX_JOBS_PER_ACCOUNT
                 live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
-                available = [a for a in live if busy.get(a["id"], 0) < limit and not self.in_cooldown(a["id"])]
+                available = [a for a in live if busy.get(a["id"], 0) < limit and not self.in_cooldown(a["id"])
+                             and not a.get("muse_locked")]
                 if exclude_id and len(available) > 1:
                     available = [a for a in available if a["id"] != exclude_id] or available
 
@@ -496,6 +499,25 @@ class Store:
                 if rem <= 0:
                     return None
                 self._COND.wait(timeout=min(2.0, rem))
+
+    def set_locked(self, aid: str, locked: bool, note: str = ""):
+        """Khoá/mở khoá TK bị Muse ngắt kết nối. TK khoá KHÔNG được giao việc (kể cả sau khi khởi động lại phần mềm) cho tới
+        khi người dùng mở khoá. Cờ riêng 'muse_locked' (không dùng ghi chú vì tác vụ giữ phiên tự ghi đè ghi chú)."""
+        with _LOCK:
+            self._sync_from_disk()
+            for a in self.accounts:
+                if a["id"] == aid:
+                    a["muse_locked"] = bool(locked)
+                    if note:
+                        a["note"] = note[:300]
+                    if not locked:
+                        a["ok"] = None
+                    break
+            else:
+                return
+            self._save_accounts()
+        with self._COND:
+            self._COND.notify_all()
 
     def record_success(self, aid: str):
         """Cộng 1 vào 'Video thành công' của TK: chỉ gọi khi video đã ra VÀ ghép/lưu xong (khác 'Số lần dùng' = số lượt
