@@ -901,12 +901,17 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 disconnected = isinstance(exc, MuseAccountDisconnectedError)
                 log.warning("✗ [Video Gen] Lỗi tạo video với TK %s: %s", cur_acc["id"], exc)
                 if disconnected:
-                    # Muse khoá TK ("Muse is disconnected"): mọi lần thử tiếp đều lỗi -> cho TK nghỉ 6 giờ (hết giờ thử lại
-                    # 1 lần, còn bị khoá thì nghỉ tiếp) và đánh dấu đỏ ở tab Tài Khoản Muse để biết TK nào cần gửi ticket.
-                    store.mark(cur_acc["id"], False, "Muse ngắt kết nối TK (Muse is disconnected) — cần gửi ticket cho Muse")
-                    store.block_until(cur_acc["id"], 6 * 3600)
-                    log.warning("🔌 [Muse ngắt kết nối] TK %s (%s) bị Muse khoá bảo vệ -> cho nghỉ 6 giờ, luồng dùng TK khác",
-                                cur_acc["id"], cur_acc.get("label"))
+                    # TK đang ở màn hình lỗi của Muse: mọi lần thử tiếp đều lỗi ngay -> cho TK nghỉ và đánh dấu đỏ ở tab Tài Khoản
+                    # Muse. "Muse is disconnected" (Muse khoá TK) nghỉ 6 giờ; "Something went wrong" (phiên hỏng, có thể chớp
+                    # nhoáng) nghỉ 1 giờ. Hết giờ thử lại 1 lần, còn lỗi thì nghỉ tiếp.
+                    wrong = getattr(exc, "kind", "") == "wrong"
+                    store.mark(cur_acc["id"], False,
+                               "Phiên TK hỏng (Something went wrong) — thử đăng nhập lại lấy cookie mới" if wrong
+                               else "Muse ngắt kết nối TK (Muse is disconnected) — cần gửi ticket cho Muse")
+                    store.block_until(cur_acc["id"], (1 if wrong else 6) * 3600)
+                    log.warning("🔌 [Muse ngắt kết nối] TK %s (%s) %s -> cho nghỉ %d giờ, luồng dùng TK khác",
+                                cur_acc["id"], cur_acc.get("label"),
+                                "báo Something went wrong" if wrong else "bị Muse khoá bảo vệ", 1 if wrong else 6)
                 else:
                     store.mark(cur_acc["id"], True, f"Tác vụ gián đoạn: {str(exc)[:60]}")
                 if "hết hạn ngạch" in str(exc) or "额度不足" in str(exc):

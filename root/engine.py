@@ -366,7 +366,9 @@ class MuseVMUnavailableError(MuseGenerationError):
 
 class MuseAccountDisconnectedError(MuseGenerationError):
     """Muse hiện "Muse is disconnected ... Submit a feedback ticket to reconnect" = TK bị Muse khoá bảo vệ.
-    Đổi IP/proxy không cứu được; luồng phải bỏ TK này ngay và dùng TK khác (không tính là 1 lần thử của sản phẩm)."""
+    Đổi IP/proxy không cứu được; luồng phải bỏ TK này ngay và dùng TK khác (không tính là 1 lần thử của sản phẩm).
+    Cũng dùng cho màn hình "Something went wrong" (phiên TK hỏng). Thuộc tính kind: "disconnected" | "wrong"."""
+    kind = "disconnected"
 
 
 # Để trình duyệt tự quản lý kết nối VM như người dùng thật: không bơm cookie hatch_gw (token cổng VM) lấy từ
@@ -2242,17 +2244,34 @@ class MuseWorkerSession:
             raise MuseGenerationError("Prompt đã gửi nhưng KHÔNG kèm ảnh tham chiếu (upload ảnh chưa xong) — đổi sang tài khoản khác")
 
     _DISCONNECTED_JS = ("(function(){var t=(document.body&&document.body.innerText)||'';"
-                        "return /Muse is disconnected|disconnected Muse to protect/i.test(t);})()")
+                        "if(/Muse is disconnected|disconnected Muse to protect/i.test(t))return 'disconnected';"
+                        "if(/Something went wrong/i.test(t)&&!document.querySelector('textarea'))return 'wrong';"
+                        "return '';})()")
 
     def _raise_if_disconnected(self):
-        """Trang đang hiện 'Muse is disconnected' (TK bị Muse khoá bảo vệ) -> báo lỗi riêng để app cho TK nghỉ dài."""
-        try:
-            hit = bool(self.page.js(self._DISCONNECTED_JS))
-        except Exception:  # noqa: BLE001
-            hit = False
-        if hit:
-            raise MuseAccountDisconnectedError(
+        """Trang TK đang ở màn hình lỗi của Muse -> báo lỗi riêng để app cho TK nghỉ (không giao việc tiếp):
+        - 'Muse is disconnected' = Muse khoá bảo vệ TK (nghỉ 6 giờ).
+        - 'Something went wrong / Try again' và không còn ô soạn tin = phiên TK hỏng (cookie cũ / Muse cản), nghỉ 1 giờ.
+          Màn hình này có thể chớp nhoáng ở TK tốt nên kiểm tra lại sau 2 giây rồi mới kết luận."""
+        def _kind():
+            try:
+                return str(self.page.js(self._DISCONNECTED_JS) or "")
+            except Exception:  # noqa: BLE001
+                return ""
+        kind = _kind()
+        if kind == "wrong":
+            time.sleep(2.0)
+            kind = _kind()
+        if kind == "disconnected":
+            err = MuseAccountDisconnectedError(
                 'Muse đã ngắt kết nối TK này ("Muse is disconnected" — Muse khoá bảo vệ, cần gửi ticket cho Muse để mở lại)')
+            err.kind = "disconnected"
+            raise err
+        if kind == "wrong":
+            err = MuseAccountDisconnectedError(
+                'Trang Muse của TK này báo "Something went wrong / Try again" (phiên TK hỏng hoặc bị Muse cản — thử đăng nhập lại để lấy cookie mới)')
+            err.kind = "wrong"
+            raise err
 
     def _attach_image(self, image_data: str):
         b64, mime = self.engine._normalize_image(image_data)
