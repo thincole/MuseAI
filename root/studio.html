@@ -1274,6 +1274,11 @@
             🔋 Tự động bỏ qua TK hết token khi giao việc <span style="color:var(--text-dim);">(mặc định tắt — xem gợi ý khi rê chuột)</span>
           </label>
 
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#f87171;cursor:pointer;margin-bottom:10px;" title="Ẩn khỏi bảng các TK đã bị khoá vì Muse ngắt kết nối (Muse is disconnected) hoặc phiên hết hạn. Chỉ ẩn trên giao diện, các TK này vẫn bị khoá và không được giao việc. Bỏ chọn để hiện lại và bấm 'Mở khoá' khi cần.">
+            <input type="checkbox" id="hideLockedAccounts" onchange="onHideLockedChange()">
+            🙈 Ẩn các TK bị khoá (Muse is disconnected) <span id="hiddenLockedCount" style="color:var(--text-dim);"></span>
+          </label>
+
           <div style="background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.25);border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:10px;">
             <span style="font-size:20px;">🛡️</span>
             <div style="font-size:12px;color:#94a3b8;line-height:1.5;">
@@ -2588,6 +2593,24 @@
   let cachedAccounts = [];
   let cachedAliveCount = 0;
 
+  function isHideLockedOn() {
+    const el = document.getElementById("hideLockedAccounts");
+    return !!(el && el.checked);
+  }
+
+  function onHideLockedChange() {
+    try { localStorage.setItem("hideLockedAccounts", isHideLockedOn() ? "1" : "0"); } catch (_) {}
+    loadAccounts();
+  }
+
+  // Khôi phục lựa chọn "Ẩn TK bị khoá" của lần trước (nếu trình duyệt cho phép lưu)
+  (function restoreHideLocked() {
+    try {
+      const el = document.getElementById("hideLockedAccounts");
+      if (el && localStorage.getItem("hideLockedAccounts") === "1") el.checked = true;
+    } catch (_) {}
+  })();
+
   async function loadAccounts() {
     const tbody = document.getElementById("accountsTableBody");
     try {
@@ -2619,7 +2642,19 @@
         return;
       }
 
-      tbody.innerHTML = accs.map(a => {
+      // Ẩn TK bị khoá (chỉ trên giao diện; TK vẫn bị khoá, không được giao việc)
+      const hideLocked = isHideLockedOn();
+      const lockedCount = accs.filter(a => a.muse_locked).length;
+      const hiddenEl = document.getElementById("hiddenLockedCount");
+      if (hiddenEl) hiddenEl.textContent = lockedCount ? `(${hideLocked ? "đang ẩn" : "có"} ${lockedCount} TK bị khoá)` : "";
+      const shownAccs = hideLocked ? accs.filter(a => !a.muse_locked) : accs;
+      if (shownAccs.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">Không có TK nào để hiển thị — ${lockedCount} TK bị khoá đang được ẩn (bỏ chọn "Ẩn các TK bị khoá" để xem).</td></tr>`;
+        renderQuotaSummary();
+        return;
+      }
+
+      tbody.innerHTML = shownAccs.map(a => {
         let statusBadge = `<span class="status-pill unknown">Chưa kiểm tra</span>`;
         if (a.ok === true) statusBadge = `<span class="status-pill good">🟢 Hoạt động</span>`;
         else if (a.ok === false) statusBadge = `<span class="status-pill bad" title="${a.note || ''}">🔴 Lỗi / Hết hạn</span>`;
@@ -4164,6 +4199,7 @@
     let nextIndex = 0;
     let completedCount = shopeeClaimedProducts.filter(p => p._status === "completed").length;
     let failedCount = 0;
+    let requeuedCount = 0;   // SP lỗi do TK/proxy được trả về hàng chờ (không đánh failed)
     let skippedCount = 0; // SP đã completed / thuộc máy khác trên Database / không có ảnh -> bỏ qua
     // Nhiều SP liên tiếp không tải được ảnh = lỗi của cả máy (mạng/proxy) chứ không phải từng SP -> tự dừng batch
     const NO_IMAGE_STOP_AFTER = 5;
@@ -4348,11 +4384,16 @@
 
       if (!prod._is_imported) {
         try {
-          await fetch("/api/shopee/complete", {
+          const cr = await fetch("/api/shopee/complete", {
             method: "POST",
             headers: getHeaders(),
-            body: JSON.stringify({ item_id: prod.item_id, status: "failed" })
+            body: JSON.stringify({ item_id: prod.item_id, status: "failed", error: String(err && err.message || "").slice(0, 800) })
           });
+          const cj = await cr.json().catch(() => ({}));
+          if (cj && cj.requeued) {
+            requeuedCount++;
+            appendShopeeLog(`↩️ [Luồng ${workerId}] SP ${prod.item_id}: lỗi do tài khoản/proxy (không phải do SP) -> đã trả về hàng chờ để làm lại (lần ${cj.requeued}), không đánh lỗi.`);
+          }
         } catch (_) {}
       }
     }
@@ -4369,10 +4410,34 @@
       }
     }
 
+    // Số luồng được chạy thật sự: tự hạ xuống khoảng (số "ô" việc của các TK đang dùng được) x 1.25 để không có hàng chục luồng
+    // ngồi chờ TK hỏng/đang nghỉ; không bao giờ vượt số luồng người dùng đặt. Tăng lại tự động khi có thêm TK tốt.
+    let allowedWorkers = maxWorkers;
+    async function refreshAllowedWorkers() {
+      try {
+        const r = await fetch("/api/shopee/capacity", { headers: getHeaders() });
+        if (!r.ok) return;
+        const d = await r.json();
+        const floor = Math.max(6, Math.ceil(maxWorkers * 0.12));
+        const target = Math.max(floor, Math.min(maxWorkers, Math.ceil((d.slots || 0) * 1.25) + 2));
+        if (target !== allowedWorkers) {
+          appendShopeeLog(`⚙️ Số luồng chạy thật: ${allowedWorkers} → ${target}/${maxWorkers} (${d.accounts_usable} TK dùng được, ${d.slots} ô việc song song)`);
+          allowedWorkers = target;
+        }
+      } catch (_) {}
+    }
+    const capacityTimer = setInterval(refreshAllowedWorkers, 60000);
+    setTimeout(refreshAllowedWorkers, 15000);
+
     async function workerLoop(workerId) {
       // Mỗi luồng có tối đa 1 SP đang lưu/ghép chạy nền, song song với SP kế tiếp đang render trên Muse
       let pendingFinalize = null;
       while (!shopeeStopRequested && !shopeeForceStopRequested) {
+        if (workerId > allowedWorkers && nextIndex < shopeeClaimedProducts.length) {
+          // luồng dư (ít TK tốt): nghỉ, không nhận SP mới
+          await new Promise(r => setTimeout(r, 5000));
+          continue;
+        }
         if (nextIndex >= shopeeClaimedProducts.length) {
           if (!(await waitForMoreProducts())) break;
           continue;
@@ -4440,6 +4505,7 @@
       }
     }
     await Promise.all(workerPromises);
+    clearInterval(capacityTimer);
     clearShopeePrefetch();
 
     clearInterval(shopeeBatchTimer);

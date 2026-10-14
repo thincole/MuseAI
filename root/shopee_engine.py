@@ -1070,6 +1070,72 @@ def release_stuck_jobs(server_url: str | None = None, api_key: str | None = None
     return res.get("released", 0) if isinstance(res, dict) else 0
 
 
+# ==================== LỖI DO TK (KHÔNG PHẢI DO SẢN PHẨM) -> TRẢ SP VỀ HÀNG CHỜ ====================
+# SP lỗi vì TK Muse hỏng / im lặng / proxy chết thì KHÔNG đánh `failed` (mất SP vĩnh viễn): trả về `pending` để máy khác (hoặc
+# TK khác) làm lại. Lỗi do chính SP (Muse từ chối nội dung, chỉ trả chữ, không có ảnh) vẫn đánh `failed`.
+ACCOUNT_FAULT_MARKERS = (
+    "附加参考图失败", "no-file-input",                       # TK không đính được ảnh (phiên hết hạn / Instagram)
+    "等待生成超时", "Hết thời gian chờ render",               # TK im lặng: nhận việc nhưng không trả video
+    "找不到聊天输入框", "Khởi tạo trang muse.ai",              # trang Muse không mở được (proxy / phiên)
+    "Prompt chưa tới được máy ảo", "máy ảo Muse",            # VM Muse không phản hồi
+    "Muse is disconnected", "Muse đã ngắt kết nối", "Phiên TK hết hạn", "Something went wrong",
+    "ProxyError", "Không có tài khoản nào khả dụng", "tất cả tài khoản đang bận", "Đã hết thời gian chờ tác vụ",
+    "Lỗi xác thực tài khoản", "MuseAuthError", "hết hạn ngạch", "额度不足",
+)
+MAX_REQUEUE = 3                      # 1 SP bị trả về hàng chờ tối đa chừng này lần, quá thì đánh `failed`
+REQUEUE_FILE = os.path.join(CFG.data_dir, "requeue_counts.json")
+_requeue_lock = threading.Lock()
+_requeue_counts: dict[str, int] | None = None
+
+
+def is_account_fault(message: str) -> bool:
+    msg = str(message or "")
+    return any(m in msg for m in ACCOUNT_FAULT_MARKERS)
+
+
+def _load_requeue() -> dict[str, int]:
+    global _requeue_counts
+    if _requeue_counts is None:
+        try:
+            with open(REQUEUE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            _requeue_counts = {str(k): int(v) for k, v in d.items()} if isinstance(d, dict) else {}
+        except Exception:  # noqa: BLE001
+            _requeue_counts = {}
+    return _requeue_counts
+
+
+def take_requeue_slot(item_id) -> int:
+    """Xin 1 lượt trả SP về hàng chờ. Trả về số lượt đã dùng (1..MAX_REQUEUE) nếu còn được trả; 0 nếu đã hết lượt (đánh failed)."""
+    key = str(item_id)
+    with _requeue_lock:
+        counts = _load_requeue()
+        n = counts.get(key, 0)
+        if n >= MAX_REQUEUE:
+            return 0
+        counts[key] = n + 1
+        if len(counts) > 50000:                       # giữ file gọn: bỏ bớt các SP cũ nhất
+            for k in list(counts)[:10000]:
+                counts.pop(k, None)
+        try:
+            _atomic_write_json(REQUEUE_FILE, counts)
+        except Exception:  # noqa: BLE001
+            pass
+        return n + 1
+
+
+def forget_requeue(item_id) -> None:
+    """SP đã xong: bỏ đếm lượt trả về."""
+    key = str(item_id)
+    with _requeue_lock:
+        counts = _load_requeue()
+        if counts.pop(key, None) is not None:
+            try:
+                _atomic_write_json(REQUEUE_FILE, counts)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def report_job_completion(
     server_url: str | None = None,
     api_key: str | None = None,

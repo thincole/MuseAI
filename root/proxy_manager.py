@@ -185,6 +185,39 @@ def test_proxy(proxy_str: str, timeout: float = 6.0) -> tuple[bool, str]:
 
 FORWARDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy_forwarder.py")
 _forwarder_procs: dict[str, subprocess.Popen] = {}
+BW_DIR = os.path.join(CFG.data_dir, "proxy_bw")                 # số byte theo host do các forwarder ghi ra
+BLOCKLIST_FILE = os.path.join(CFG.data_dir, "proxy_blocklist.txt")  # mỗi dòng 1 host (hoặc đuôi host) bị chặn, tuỳ chọn
+_APP_STARTED_AT = time.time()
+
+
+def load_block_hosts() -> list[str]:
+    """Host bị chặn ở forwarder (không tốn băng thông proxy). File data/proxy_blocklist.txt, mỗi dòng 1 host; # là ghi chú."""
+    try:
+        with open(BLOCKLIST_FILE, "r", encoding="utf-8") as f:
+            return [ln.strip().lower() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def bandwidth_by_host(max_age: float | None = None) -> dict[str, int]:
+    """Tổng số byte đã đi qua các forwarder (từ lúc app chạy) gộp theo host đích, lớn nhất trước."""
+    totals: dict[str, int] = {}
+    try:
+        for name in os.listdir(BW_DIR):
+            fp = os.path.join(BW_DIR, name)
+            try:
+                if os.path.getmtime(fp) < _APP_STARTED_AT - 5:
+                    continue
+                if max_age is not None and time.time() - os.path.getmtime(fp) > max_age:
+                    continue
+                with open(fp, "r", encoding="utf-8") as f:
+                    for host, n in (json.load(f).get("bytes") or {}).items():
+                        totals[host] = totals.get(host, 0) + int(n)
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return dict(sorted(totals.items(), key=lambda kv: -kv[1]))
 
 
 def start_local_forwarder(proxy_str: str) -> int:
@@ -225,7 +258,8 @@ def _spawn_forwarder_process(clean_key: str, p: dict) -> int:
     proc = subprocess.Popen([sys.executable, "-u", FORWARDER_SCRIPT], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=flags)
     try:
-        cfg = {"host": p["host"], "port": int(p["port"]), "user": p["user"] or "", "pass": p["pass"] or ""}
+        cfg = {"host": p["host"], "port": int(p["port"]), "user": p["user"] or "", "pass": p["pass"] or "",
+               "stats_file": os.path.join(BW_DIR, f"fw_{proc.pid}.json"), "block_hosts": load_block_hosts()}
         proc.stdin.write((json.dumps(cfg) + "\n").encode())
         proc.stdin.flush()
         result: list[bytes] = []
@@ -420,6 +454,58 @@ def fetch_proxies_from_webshare(api_key: str, timeout: float = 20.0) -> list[str
         if not url:
             break
     return lines
+
+
+_ws_refresh_lock = threading.Lock()
+_ws_last_refresh = 0.0
+WEBSHARE_REFRESH_SECONDS = 600       # làm mới định kỳ danh sách proxy Webshare
+WEBSHARE_FORCE_MIN_GAP = 90          # sau lỗi proxy: làm mới ngay nhưng cách nhau tối thiểu chừng này giây
+
+
+def refresh_webshare_pool(force: bool = False) -> dict:
+    """Nạp lại danh sách proxy Webshare và đổi proxy cho các TK đang giữ proxy đã bị Webshare thay / thu hồi (lỗi 407).
+
+    Webshare tự thay proxy "invalid" (auto replace) nên danh sách nạp lúc khởi động nhanh chóng lỗi thời. Trả về
+    {"refreshed": bool, "pool": n, "stale_accounts": n, "reassigned": [acc_id, ...]}; các TK trong "reassigned" cần được
+    đóng phiên trình duyệt cũ (nơi gọi làm). Không chạy nếu nguồn không phải Webshare hoặc Proxy đang TẮT."""
+    global _ws_last_refresh
+    out = {"refreshed": False, "pool": 0, "stale_accounts": 0, "reassigned": []}
+    if get_provider() != PROVIDER_WEBSHARE or not is_proxy_enabled():
+        return out
+    gap = WEBSHARE_FORCE_MIN_GAP if force else WEBSHARE_REFRESH_SECONDS - 30
+    if not _ws_refresh_lock.acquire(blocking=False):
+        return out
+    try:
+        if time.time() - _ws_last_refresh < gap:
+            return out
+        _ws_last_refresh = time.time()
+        key = get_webshare_key()
+        pool = fetch_proxies_from_webshare(key) if key else []
+        if not pool:
+            log.warning("[Webshare] Làm mới danh sách proxy: không lấy được proxy nào -> giữ danh sách cũ")
+            return out
+        old_pool = set(get_cached_proxy_pool())
+        save_proxy_pool(pool, source=POOL_SOURCE_WEBSHARE)
+        pool_set = set(pool)
+        out.update(refreshed=True, pool=len(pool))
+        stale = [a for a in store.list_accounts()
+                 if a.get("proxy") and a["proxy"] not in pool_set and not a.get("muse_locked")]
+        out["stale_accounts"] = len(stale)
+        for a in stale:
+            old_p = a["proxy"]
+            try:
+                new_p = ensure_alive_proxy_for_account(a["id"])
+                if new_p and new_p != old_p:
+                    out["reassigned"].append(a["id"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[Webshare] Không đổi được proxy cho TK %s: %s", a.get("label", a["id"]), exc)
+        removed = len(old_pool - pool_set) if old_pool else 0
+        if stale or removed:
+            log.info("🔄 [Webshare] Làm mới danh sách: %d proxy (Webshare đã thay %d proxy so với lần trước) -> %d TK dùng proxy cũ, đã đổi %d TK",
+                     len(pool), removed, len(stale), len(out["reassigned"]))
+        return out
+    finally:
+        _ws_refresh_lock.release()
 
 
 def load_proxies_from_webshare() -> list[str]:

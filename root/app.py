@@ -848,6 +848,33 @@ def _remember_file_account(filename: str, acc_id: str | None):
             _FILE_ACCOUNT.pop(k, None)
 
 
+def _webshare_refresh_now(force: bool) -> dict:
+    """Làm mới danh sách proxy Webshare và đóng phiên trình duyệt của các TK vừa được đổi proxy."""
+    try:
+        import proxy_manager
+        res = proxy_manager.refresh_webshare_pool(force=force)
+        for aid in res.get("reassigned", []):
+            try:
+                engine.close_session_for_account(aid)
+            except Exception:  # noqa: BLE001
+                pass
+        return res
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Làm mới proxy Webshare lỗi: %s", exc)
+        return {}
+
+
+def _kick_webshare_refresh():
+    """Gọi từ luồng tạo video khi trang Muse không mở được: làm mới Webshare ở luồng nền (không chặn, tự giới hạn tần suất)."""
+    try:
+        import proxy_manager
+        if proxy_manager.get_provider() != proxy_manager.PROVIDER_WEBSHARE:
+            return
+    except Exception:  # noqa: BLE001
+        return
+    threading.Thread(target=_webshare_refresh_now, args=(True,), daemon=True).start()
+
+
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None) -> tuple[dict, str | None]:
@@ -902,6 +929,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 return res, cur_acc["id"]
             except MuseAuthError as exc:
                 last_exc = exc
+                store.record_outcome(cur_acc["id"], False)
                 log.warning("✗ [Video Gen] Lỗi xác thực tài khoản %s: %s", cur_acc["id"], exc)
                 store.mark(cur_acc["id"], False, str(exc))
                 if session:
@@ -914,6 +942,10 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 last_exc = exc
                 disconnected = isinstance(exc, MuseAccountDisconnectedError)
                 log.warning("✗ [Video Gen] Lỗi tạo video với TK %s: %s", cur_acc["id"], exc)
+                if not disconnected:
+                    store.record_outcome(cur_acc["id"], False)
+                if "Khởi tạo trang muse.ai" in str(exc) or "ProxyError" in str(exc):
+                    _kick_webshare_refresh()   # trang không mở được: có thể proxy Webshare đã bị thay -> nạp lại danh sách
                 if disconnected:
                     # TK đang ở màn hình lỗi của Muse: mọi lần thử tiếp đều lỗi ngay -> cho TK nghỉ và đánh dấu đỏ ở tab Tài Khoản
                     # Muse. "Muse is disconnected" (Muse khoá TK) nghỉ 6 giờ; "Something went wrong" (phiên hỏng, có thể chớp
@@ -2446,8 +2478,63 @@ def complete_shopee_job(req: dict):
     item_id = req.get("item_id", "")
     status = req.get("status", "completed")
     video_path = req.get("video_path")
+    requeued = 0
+    if status == "failed" and shopee_engine.is_account_fault(req.get("error")):
+        # Lỗi do TK / proxy / Muse (không phải do SP): trả SP về hàng chờ thay vì đánh failed vĩnh viễn (tối đa MAX_REQUEUE lần)
+        requeued = shopee_engine.take_requeue_slot(item_id)
+        if requeued:
+            status = "pending"
+            log.info("↩️ [Hàng chờ] SP %s lỗi do TK/proxy -> trả về hàng chờ (lần %d/%d), không đánh failed",
+                     item_id, requeued, shopee_engine.MAX_REQUEUE)
+    elif status == "completed":
+        shopee_engine.forget_requeue(item_id)
     res = shopee_engine.report_job_completion(server_url, api_key, item_id, status, video_path)
-    return {"success": res}
+    return {"success": res, "requeued": requeued}
+
+
+@app.get("/api/shopee/capacity")
+def shopee_capacity():
+    """Số TK dùng được và số 'ô' việc song song hiện có (giao diện dùng để tự hạ số luồng khi có ít TK tốt)."""
+    snap = store.capacity_snapshot()
+    snap["threads_hint"] = snap["slots"]
+    return snap
+
+
+def reclaim_stale_processing(hours: float = 24.0, market: str = "PH") -> int:
+    """Trả về `pending` các SP kẹt ở `processing` quá `hours` giờ (máy đã tắt/hỏng không báo lại). Ghi danh sách vào
+    data/backups/stale_processing_<giờ>.json trước khi sửa. Nhiều máy cùng chạy không sao (câu lệnh lặp lại được)."""
+    conn = _shopee_db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT item_id, claimed_by, claimed_at FROM shopee_products WHERE market = %s AND video_status = 'processing' "
+                    "AND claimed_at < now() - (%s * interval '1 hour')", (market, float(hours)))
+        rows = cur.fetchall()
+        if not rows:
+            return 0
+        bdir = os.path.join(CFG.data_dir, "backups")
+        os.makedirs(bdir, exist_ok=True)
+        with open(os.path.join(bdir, f"stale_processing_{time.strftime('%Y%m%d-%H%M%S')}.json"), "w", encoding="utf-8") as f:
+            json.dump([{"item_id": r[0], "claimed_by": r[1], "claimed_at": str(r[2])} for r in rows], f)
+        ids = [r[0] for r in rows]
+        cur.execute("UPDATE shopee_products SET video_status = 'pending', claimed_by = NULL, claimed_at = NULL "
+                    "WHERE market = %s AND video_status = 'processing' AND item_id = ANY(%s)", (market, ids))
+        n = cur.rowcount
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+@app.post("/api/shopee/reclaim-stale")
+def shopee_reclaim_stale(req: dict | None = None):
+    cfg = _get_shopee_settings()
+    hours = float((req or {}).get("hours") or cfg.get("stale_reclaim_hours") or 24)
+    market = str((req or {}).get("market") or cfg.get("market") or "PH").upper()
+    try:
+        n = reclaim_stale_processing(hours, market)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"Không dọn được SP processing treo: {exc}")
+    return {"success": True, "reclaimed": n, "hours": hours, "market": market}
 
 
 @app.post("/api/shopee/job-status")
@@ -3313,6 +3400,17 @@ def toggle_proxy_mode(req: dict):
         "enabled": proxy_manager.is_proxy_enabled(),
         "message": "Đã BẬT Fake Proxy (HomeProxy Sticky)" if enabled else "Đã TẮT Fake Proxy (Chạy Trực Tiếp / Không Fake IP)"
     }
+
+
+@app.get("/api/proxy/bandwidth")
+def get_proxy_bandwidth():
+    """Băng thông đã đi qua proxy từ lúc app chạy, gộp theo host đích (để biết nên chặn host nào cho đỡ tốn gói proxy)."""
+    import proxy_manager
+    by_host = proxy_manager.bandwidth_by_host()
+    total = sum(by_host.values())
+    return {"success": True, "total_mb": round(total / 1e6, 1),
+            "hosts": [{"host": h, "mb": round(n / 1e6, 2)} for h, n in list(by_host.items())[:25]],
+            "blocklist": proxy_manager.load_block_hosts()}
 
 
 @app.post("/api/proxy/provider")
@@ -4276,6 +4374,37 @@ async def _startup():
         log.warning("🔑 API key cũ trống hoặc là key mặc định công khai -> đã tạo key ngẫu nhiên mới và ghi vào .env "
                     "(MUSE2API_KEY). Cập nhật key này cho extension / userscript / client bên ngoài.")
     asyncio.create_task(_keepalive_loop())
+    asyncio.create_task(_maintenance_loop())
+
+
+async def _maintenance_loop():
+    """Việc nền định kỳ: làm mới danh sách proxy Webshare (10 phút) và trả về hàng chờ các SP kẹt `processing` quá lâu (30 phút)."""
+    await asyncio.sleep(60)
+    last_reclaim = 0.0
+    while True:
+        try:
+            await asyncio.to_thread(_webshare_refresh_now, False)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Làm mới Webshare định kỳ lỗi: %s", exc)
+        try:
+            import proxy_manager
+            by_host = proxy_manager.bandwidth_by_host()
+            if by_host:
+                top = ", ".join(f"{h} {n / 1e6:.0f}MB" for h, n in list(by_host.items())[:5])
+                log.info("📶 [Băng thông proxy] đã dùng %.0f MB từ lúc chạy app. Nhiều nhất: %s", sum(by_host.values()) / 1e6, top)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Thống kê băng thông proxy lỗi: %s", exc)
+        try:
+            cfg = _get_shopee_settings()
+            hours = float(cfg.get("stale_reclaim_hours", 24) or 0)
+            if hours > 0 and time.time() - last_reclaim >= 1800:
+                last_reclaim = time.time()
+                n = await asyncio.to_thread(reclaim_stale_processing, hours, str(cfg.get("market") or "PH").upper())
+                if n:
+                    log.info("🧹 [Dọn DB] Đã trả %d SP kẹt `processing` quá %g giờ về hàng chờ", n, hours)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Dọn SP processing treo lỗi: %s", exc)
+        await asyncio.sleep(600)
 
 
 @app.on_event("shutdown")

@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import date, datetime, timedelta
 
 _LOCK = threading.Lock()
@@ -473,8 +474,55 @@ class Store:
             self._COOLDOWN_UNTIL[aid] = time.time() + seconds
             return seconds
 
+    # Chất lượng TK theo kết quả các lượt gần nhất (trong RAM): TK hay lỗi/im lặng được giao ÍT việc hơn thay vì chia đều.
+    QUALITY_WINDOW = 12          # số lượt gần nhất được tính
+    QUALITY_MIN_SAMPLES = 6      # chưa đủ số lượt này thì coi như TK tốt (chưa đủ dữ liệu để kết luận)
+    QUALITY_PROBE_AFTER = 1200   # TK bị cho 0 việc: sau chừng này giây (kể từ lượt cuối) được thử lại 1 việc
+    _OUTCOMES: dict[str, deque] = {}
+    _OUTCOME_TS: dict[str, float] = {}
+
+    def record_outcome(self, aid: str, ok: bool):
+        """Ghi kết quả 1 lượt tạo video của TK (True = ra video, False = lỗi do TK/Muse/proxy)."""
+        with self._COND:
+            dq = self._OUTCOMES.get(aid)
+            if dq is None:
+                dq = self._OUTCOMES[aid] = deque(maxlen=self.QUALITY_WINDOW)
+            dq.append(bool(ok))
+            self._OUTCOME_TS[aid] = time.time()
+
+    def quality_rate(self, aid: str) -> tuple[float | None, int]:
+        """(tỉ lệ thành công, số lượt đã ghi) trong cửa sổ gần nhất; tỉ lệ None nếu chưa đủ dữ liệu."""
+        dq = self._OUTCOMES.get(aid)
+        n = len(dq) if dq else 0
+        if n < self.QUALITY_MIN_SAMPLES:
+            return None, n
+        return sum(dq) / n, n
+
+    def effective_limit(self, aid: str, base_limit: int) -> int:
+        """Số việc tối đa TK được nhận cùng lúc: TK tốt = base_limit; thành công 15-50% = 1 việc; dưới 15% = 0 (nghỉ),
+        quá QUALITY_PROBE_AFTER giây không có lượt mới thì cho thử lại 1 việc để biết TK đã hồi chưa."""
+        rate, _n = self.quality_rate(aid)
+        if rate is None or rate >= 0.5:
+            return base_limit
+        if rate >= 0.15:
+            return min(base_limit, 1)
+        if time.time() - self._OUTCOME_TS.get(aid, 0.0) >= self.QUALITY_PROBE_AFTER:
+            return min(base_limit, 1)
+        return 0
+
+    def capacity_snapshot(self) -> dict:
+        """Số TK dùng được và tổng số 'ô' việc song song hiện có (để gợi ý số luồng hợp lý)."""
+        with self._COND:
+            base = Store.MAX_JOBS_PER_ACCOUNT
+            live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
+            usable = [a for a in live if not a.get("muse_locked") and not self.in_cooldown(a["id"])]
+            slots = sum(self.effective_limit(a["id"], base) for a in usable)
+            return {"accounts_total": len(self.accounts), "accounts_usable": len([a for a in usable if self.effective_limit(a["id"], base) > 0]),
+                    "slots": slots, "jobs_per_account": base}
+
     def record_vm_ok(self, aid: str):
         """TK vừa render thành công: xóa chuỗi kẹt và giờ nghỉ."""
+        self.record_outcome(aid, True)
         with self._COND:
             self._TIMEOUT_STREAK.pop(aid, None)
             self._ATTACH_STREAK.pop(aid, None)
@@ -493,8 +541,8 @@ class Store:
                 busy = self._BUSY_COUNT
                 limit = Store.MAX_JOBS_PER_ACCOUNT
                 live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
-                available = [a for a in live if busy.get(a["id"], 0) < limit and not self.in_cooldown(a["id"])
-                             and not a.get("muse_locked")]
+                available = [a for a in live if busy.get(a["id"], 0) < self.effective_limit(a["id"], limit)
+                             and not self.in_cooldown(a["id"]) and not a.get("muse_locked")]
                 if exclude_id and len(available) > 1:
                     available = [a for a in available if a["id"] != exclude_id] or available
 
