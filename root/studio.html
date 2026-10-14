@@ -1291,14 +1291,13 @@
                 <th>Số Cookie</th>
                 <th>Hạn Sử Dụng</th>
                 <th>Hạn Mức Token</th>
-                <th>Số Lần Dùng</th>
                 <th title="Số video đã ra VÀ ghép xong. Lượt dùng nhiều mà video ít = TK hay lỗi">Video Thành Công</th>
                 <th>Thao Tác</th>
               </tr>
             </thead>
             <tbody id="accountsTableBody">
               <tr>
-                <td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">
+                <td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">
                   Đang tải danh sách tài khoản...
                 </td>
               </tr>
@@ -1412,9 +1411,17 @@
             <div class="shopee-row" style="margin-bottom:0; flex-wrap:wrap; gap:8px; align-items:center;">
               <span class="shopee-lbl">Chế độ Mạng / Proxy:</span>
               <select class="shopee-select" id="sp_proxy_mode" onchange="changeProxyMode(this.value)" style="font-weight:700; color:#38bdf8;">
-                <option value="enabled" selected>🌐 Bật HomeProxy (Fake IP)</option>
+                <option value="enabled" selected>🌐 Bật Proxy (Fake IP)</option>
                 <option value="disabled">⚡ Không Fake IP (Chạy Trực Tiếp - Tốc độ cao)</option>
               </select>
+
+              <span class="shopee-lbl" style="margin-left:8px;">Nguồn Proxy:</span>
+              <select class="shopee-select" id="sp_proxy_provider" onchange="onProxyProviderChange(this.value)" style="font-weight:700; color:#38bdf8;">
+                <option value="homeproxy" selected>🏠 HomeProxy</option>
+                <option value="webshare">🔗 Webshare</option>
+              </select>
+              <input type="password" id="sp_webshare_key" class="shopee-input" placeholder="Webshare API key" autocomplete="off" style="display:none; width:230px; font-size:12px;" title="API key lấy ở webshare.io → API. Lưu trong data/proxy_settings.json trên máy này, không đưa lên GitHub.">
+              <button type="button" class="shopee-btn" id="btnApplyProxyProvider" onclick="applyProxyProvider()" style="display:none; background:#0f766e; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;" title="Đổi nguồn proxy: nạp proxy mới, gán lại cho các TK và làm mới trình duyệt">✔ Áp dụng nguồn</button>
 
               <span class="shopee-lbl" style="margin-left:8px;">Thời gian sống TTL:</span>
               <select class="shopee-select" id="sp_browser_ttl" onchange="changeBrowserTtl(this.value)">
@@ -2591,7 +2598,7 @@
           const ej = await res.json();
           err = ej.detail || err;
         } catch (_) {}
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--danger);padding:20px;">${err}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--danger);padding:20px;">${err}</td></tr>`;
         return;
       }
 
@@ -2607,7 +2614,7 @@
       if (!accs || accs.length === 0) {
         cachedAliveCount = 0;
         updateShopeeThreadsHint();
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
         renderQuotaSummary();
         return;
       }
@@ -2662,7 +2669,6 @@
             <td>${cookieCount} cookies</td>
             <td>${expStr}</td>
             <td id="qc_${a.id}">${quotaCellHtml(a.quota)}</td>
-            <td>${a.use_count || 0} lượt</td>
             <td>${successCellHtml(a)}</td>
             <td>
               <div style="display:flex;gap:6px;">
@@ -2678,7 +2684,7 @@
       renderQuotaSummary();
 
     } catch (e) {
-      tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
     }
   }
 
@@ -4877,6 +4883,52 @@
   }
 
   let isProxyEnabled = null; // null = chưa đọc được trạng thái thật từ backend
+  let activeProxyProvider = "homeproxy";
+  let webshareKeySet = false;
+
+  function onProxyProviderChange(val) {
+    // Hiện ô nhập API key + nút Áp dụng khi chọn khác nguồn đang chạy (hoặc Webshare chưa có key)
+    const keyEl = document.getElementById("sp_webshare_key");
+    const btn = document.getElementById("btnApplyProxyProvider");
+    const changed = val !== activeProxyProvider;
+    if (keyEl) keyEl.style.display = (val === "webshare" && (!webshareKeySet || changed)) ? "" : "none";
+    if (btn) btn.style.display = changed ? "" : "none";
+    if (keyEl && webshareKeySet) keyEl.placeholder = "Đã lưu API key — để trống để dùng key cũ";
+  }
+
+  async function applyProxyProvider() {
+    const sel = document.getElementById("sp_proxy_provider");
+    const keyEl = document.getElementById("sp_webshare_key");
+    const btn = document.getElementById("btnApplyProxyProvider");
+    const provider = sel ? sel.value : "homeproxy";
+    const key = keyEl ? keyEl.value.trim() : "";
+    if (provider === "webshare" && !key && !webshareKeySet) {
+      showToast("Nhập API key Webshare trước", "warning");
+      return;
+    }
+    if (!confirm(`Đổi nguồn proxy sang ${provider === "webshare" ? "Webshare" : "HomeProxy"}?\n\nCác TK sẽ được gán lại proxy mới (đổi IP) và các phiên trình duyệt đang rảnh sẽ được mở lại.`)) {
+      await fetchProxyStatus();
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.innerText = "⏳ Đang nạp proxy..."; }
+    try {
+      const res = await fetch("/api/proxy/provider", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ provider, webshare_key: key })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.detail || `HTTP ${res.status}`);
+      if (keyEl) keyEl.value = "";
+      showToast(`✓ Nguồn proxy: ${provider === "webshare" ? "Webshare" : "HomeProxy"} — ${d.total_proxies} proxy (${d.alive_proxies} sống) cho ${d.total_accounts} TK, gán mới ${d.newly_assigned}, đổi ${d.rebalanced}`, "success");
+      await loadAccounts();
+    } catch (e) {
+      showToast(`Không đổi được nguồn proxy: ${e.message}`, "danger");
+    } finally {
+      if (btn) { btn.disabled = false; btn.innerText = "✔ Áp dụng nguồn"; }
+      await fetchProxyStatus();
+    }
+  }
 
   async function fetchProxyStatus() {
     try {
@@ -4884,6 +4936,11 @@
       if (res.ok) {
         const data = await res.json();
         isProxyEnabled = data.enabled !== false;
+        activeProxyProvider = data.provider || "homeproxy";
+        webshareKeySet = !!data.webshare_key_set;
+        const psel = document.getElementById("sp_proxy_provider");
+        if (psel) psel.value = activeProxyProvider;
+        onProxyProviderChange(activeProxyProvider);
         updateProxyModeUI(isProxyEnabled, data.assigned_accounts || 0, data.total_proxies || 0);
       }
     } catch (_) {}

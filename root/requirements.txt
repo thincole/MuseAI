@@ -16,3 +16,6 @@ PyQt6>=6.6.0
 
 # Shopee Scraper
 curl_cffi>=0.7.0
+
+# Database (kiểm tra SP trùng / trạng thái trên PostgreSQL)
+psycopg2-binary>=2.9.9

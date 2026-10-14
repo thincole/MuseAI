@@ -919,11 +919,16 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     # Muse. "Muse is disconnected" (Muse khoá TK) nghỉ 6 giờ; "Something went wrong" (phiên hỏng, có thể chớp
                     # nhoáng) nghỉ 1 giờ. Hết giờ thử lại 1 lần, còn lỗi thì nghỉ tiếp.
                     wrong = getattr(exc, "kind", "") == "wrong"
+                    relogin = getattr(exc, "kind", "") == "login"
                     store.mark(cur_acc["id"], False,
                                "Phiên TK hỏng (Something went wrong) — thử đăng nhập lại lấy cookie mới" if wrong
                                else "Muse ngắt kết nối TK (Muse is disconnected) — cần gửi ticket cho Muse")
                     store.block_until(cur_acc["id"], (1 if wrong else 6) * 3600)
-                    if not wrong:
+                    if relogin:
+                        # Muse đá sang đăng nhập Instagram: phiên TK hết hạn -> khoá TK tới khi lấy cookie mới
+                        store.set_locked(cur_acc["id"], True,
+                                         "Phiên TK hết hạn (Muse chuyển sang Instagram) — cần lấy cookie mới bằng công cụ Lấy Cookie")
+                    elif not wrong:
                         # "Muse is disconnected": khoá TK hẳn (bền qua khởi động lại) cho tới khi người dùng mở khoá
                         store.set_locked(cur_acc["id"], True,
                                          "Muse ngắt kết nối TK (Muse is disconnected) — cần gửi ticket cho Muse")
@@ -938,6 +943,16 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     store.block_until(cur_acc["id"], 6 * 3600)
                     log.warning("🚫 [Hạn mức] Muse từ chối TK %s (%s) vì hết hạn ngạch -> cho nghỉ 6 giờ",
                                 cur_acc["id"], cur_acc.get("label"))
+                if "no-file-input" in str(exc) and not disconnected and store.record_attach_fail(cur_acc["id"]):
+                    # TK không đính được ảnh 3 lần liên tiếp (trang không có ô nhận file, không rõ lý do): cho nghỉ 1 giờ
+                    store.block_until(cur_acc["id"], 3600)
+                    log.warning("😴 [Cooldown] TK %s (%s) không đính được ảnh 3 lần liên tiếp -> nghỉ 1 giờ, luồng dùng TK khác",
+                                cur_acc["id"], cur_acc.get("label"))
+                if "等待生成超时" in str(exc) and not disconnected:
+                    rest = store.record_timeout(cur_acc["id"])
+                    if rest:
+                        log.warning("😴 [Cooldown] TK %s (%s) im lặng (hết giờ chờ video) %d lần liên tiếp -> nghỉ %d giờ, luồng dùng TK khác",
+                                    cur_acc["id"], cur_acc.get("label"), store._TIMEOUT_STREAK.get(cur_acc["id"], 0), rest // 3600)
                 if isinstance(exc, MuseVMUnavailableError) and store.record_vm_stuck(cur_acc["id"]):
                     log.warning("😴 [Cooldown] TK %s (%s) kẹt VM %d lần liên tiếp -> cho nghỉ %d phút, các luồng dùng TK khác",
                                 cur_acc["id"], cur_acc.get("label"), store._STUCK_STREAK.get(cur_acc["id"], 0),
@@ -3269,6 +3284,8 @@ def get_proxy_status():
     return {
         "success": True,
         "enabled": proxy_manager.is_proxy_enabled(),
+        "provider": proxy_manager.get_provider(),
+        "webshare_key_set": bool(proxy_manager.get_webshare_key()),
         "total_proxies": len(pool),
         "proxies": pool[:30],
         "assigned_accounts": assigned,
@@ -3296,6 +3313,41 @@ def toggle_proxy_mode(req: dict):
         "enabled": proxy_manager.is_proxy_enabled(),
         "message": "Đã BẬT Fake Proxy (HomeProxy Sticky)" if enabled else "Đã TẮT Fake Proxy (Chạy Trực Tiếp / Không Fake IP)"
     }
+
+
+@app.post("/api/proxy/provider")
+def set_proxy_provider(req: dict):
+    """Chọn nguồn proxy fake IP cho các luồng: HomeProxy hoặc Webshare (cần API key). Nạp thử danh sách proxy của nguồn
+    mới TRƯỚC khi chuyển: không lấy được proxy nào thì giữ nguồn cũ. Chuyển xong gán lại proxy cố định cho các TK
+    (TK đang dùng proxy của nguồn cũ được chuyển sang proxy của nguồn mới) và làm mới các phiên trình duyệt."""
+    import proxy_manager
+    provider = str((req or {}).get("provider") or "").strip().lower()
+    key = str((req or {}).get("webshare_key") or "").strip()
+    if provider not in (proxy_manager.PROVIDER_HOMEPROXY, proxy_manager.PROVIDER_WEBSHARE):
+        raise HTTPException(400, "Nguồn proxy phải là 'homeproxy' hoặc 'webshare'")
+    old = proxy_manager.get_provider()
+    if provider == proxy_manager.PROVIDER_WEBSHARE:
+        key = key or proxy_manager.get_webshare_key()
+        if not key:
+            raise HTTPException(400, "Chưa có API key Webshare")
+    proxy_manager.set_provider(provider, key or None)
+    try:
+        pool = proxy_manager.load_proxies_from_thinaptm()
+    except Exception as exc:  # noqa: BLE001
+        pool = []
+        log.warning("Không nạp được proxy của nguồn %s: %s", provider, exc)
+    if not pool:
+        proxy_manager.set_provider(old)
+        raise HTTPException(502, "Không lấy được proxy nào từ nguồn "
+                                 f"{'Webshare (kiểm tra API key / mạng)' if provider == 'webshare' else 'HomeProxy'} -> giữ nguồn cũ")
+    res = proxy_manager.sync_all_accounts_with_homeproxy()
+    try:
+        engine.close_all_sessions()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Không làm mới được phiên trình duyệt sau khi đổi nguồn proxy: %s", exc)
+    return {"success": True, "provider": provider, "total_proxies": len(pool),
+            "alive_proxies": res.get("alive_proxies", 0), "newly_assigned": res.get("newly_assigned", 0),
+            "rebalanced": res.get("rebalanced", 0), "total_accounts": res.get("total_accounts", 0)}
 
 
 @app.post("/api/proxy/sync-thinaptm")

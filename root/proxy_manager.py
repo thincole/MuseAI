@@ -37,6 +37,58 @@ _forwarder_lock = threading.Lock()
 _pool_lock = threading.Lock()
 _proxy_enabled_mem: bool | None = None
 
+PROVIDER_HOMEPROXY = "homeproxy"
+PROVIDER_WEBSHARE = "webshare"
+WEBSHARE_API = "https://proxy.webshare.io/api/v2"
+
+
+def _read_settings() -> dict:
+    try:
+        with open(PROXY_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _update_settings(**changes) -> bool:
+    """Đọc-sửa-ghi proxy_settings.json (giữ nguyên các khoá khác: bật/tắt, nguồn proxy, API key)."""
+    d = _read_settings()
+    d.update(changes)
+    d["updated_at"] = int(time.time())
+    os.makedirs(os.path.dirname(PROXY_SETTINGS_FILE), exist_ok=True)
+    try:
+        with open(PROXY_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+        return True
+    except Exception as e:
+        log.warning("Lỗi lưu proxy settings: %s", e)
+        return False
+
+
+def get_provider() -> str:
+    """Nguồn proxy đang dùng để fake IP cho các luồng: 'homeproxy' (mặc định) hoặc 'webshare'."""
+    p = str(_read_settings().get("provider") or PROVIDER_HOMEPROXY).strip().lower()
+    return p if p in (PROVIDER_HOMEPROXY, PROVIDER_WEBSHARE) else PROVIDER_HOMEPROXY
+
+
+def get_webshare_key() -> str:
+    return str(_read_settings().get("webshare_key") or os.environ.get("WEBSHARE_API_KEY", "")).strip()
+
+
+def set_provider(provider: str, webshare_key: str | None = None) -> bool:
+    """Chọn nguồn proxy. Có webshare_key thì lưu (file data/proxy_settings.json, không đưa lên git)."""
+    provider = (provider or "").strip().lower()
+    if provider not in (PROVIDER_HOMEPROXY, PROVIDER_WEBSHARE):
+        raise ValueError("Nguồn proxy phải là 'homeproxy' hoặc 'webshare'")
+    changes: dict = {"provider": provider}
+    if webshare_key is not None and webshare_key.strip():
+        changes["webshare_key"] = webshare_key.strip()
+    ok = _update_settings(**changes)
+    if ok:
+        log.info("🌐 [Proxy Manager] Nguồn proxy đã chuyển sang: %s", "Webshare" if provider == PROVIDER_WEBSHARE else "HomeProxy")
+    return ok
+
 
 def is_proxy_enabled() -> bool:
     """Kiểm tra xem hệ thống có đang bật fake IP / proxy hay không.
@@ -60,15 +112,10 @@ def set_proxy_enabled(enabled: bool) -> bool:
     """Bật hoặc tắt toàn bộ việc sử dụng Proxy trên toàn hệ thống."""
     global _proxy_enabled_mem
     _proxy_enabled_mem = bool(enabled)
-    os.makedirs(os.path.dirname(PROXY_SETTINGS_FILE), exist_ok=True)
-    try:
-        with open(PROXY_SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"enabled": bool(enabled), "updated_at": int(time.time())}, f, indent=2)
+    if _update_settings(enabled=bool(enabled)):
         log.info("🌐 [Proxy Manager] Chế độ Proxy đã chuyển sang: %s", "BẬT (Fake IP)" if enabled else "TẮT (Chạy Trực Tiếp / Không Fake IP)")
         return True
-    except Exception as e:
-        log.warning("Lỗi lưu proxy settings: %s", e)
-        return False
+    return False
 
 
 def parse_proxy_str(proxy_str: str) -> dict | None:
@@ -330,9 +377,75 @@ atexit.register(_kill_forwarder_procs)
 
 
 POOL_SOURCE_HOMEPROXY = "homeproxy_api"
+POOL_SOURCE_WEBSHARE = "webshare_api"
+
+
+def _pool_source() -> str:
+    return POOL_SOURCE_WEBSHARE if get_provider() == PROVIDER_WEBSHARE else POOL_SOURCE_HOMEPROXY
+
+
+def fetch_proxies_from_webshare(api_key: str, timeout: float = 20.0) -> list[str]:
+    """Lấy danh sách proxy đang dùng được từ Webshare (GET /proxy/list/?mode=direct), mỗi dòng host:port:user:pass.
+
+    Header: Authorization: Token <API key>. Chỉ lấy proxy valid=true. Giới hạn của Webshare: 60 lần gọi/phút (429 -> chờ)."""
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return []
+    headers = {"Authorization": f"Token {api_key}"}
+    lines: list[str] = []
+    url = f"{WEBSHARE_API}/proxy/list/?mode=direct&page=1&page_size=100"
+    for _ in range(50):  # tối đa 5.000 proxy
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[Webshare] Lỗi gọi API: %s", exc)
+            break
+        if r.status_code == 429:
+            time.sleep(min(60, int(r.headers.get("Retry-After", "5") or 5)))
+            continue
+        if r.status_code != 200:
+            log.warning("[Webshare] API trả HTTP %s: %s", r.status_code, r.text[:120])
+            break
+        data = r.json()
+        for it in data.get("results", []):
+            if it.get("valid") is False:
+                continue
+            host, port = it.get("proxy_address"), it.get("port")
+            user, pwd = it.get("username"), it.get("password")
+            if host and port:
+                line = f"{host}:{int(port)}:{user}:{pwd}" if user else f"{host}:{int(port)}"
+                if line not in lines:
+                    lines.append(line)
+        url = data.get("next")
+        if not url:
+            break
+    return lines
+
+
+def load_proxies_from_webshare() -> list[str]:
+    """Danh sách proxy của hệ thống khi chọn nguồn Webshare. API lỗi -> dùng danh sách Webshare lấy được lần trước."""
+    key = get_webshare_key()
+    if not key:
+        log.warning("Chưa nhập API key Webshare -> không có proxy")
+        return []
+    lst = fetch_proxies_from_webshare(key)
+    if lst:
+        log.info("🌐 Webshare API: %d proxy -> dùng làm danh sách proxy chung", len(lst))
+        save_proxy_pool(lst, source=POOL_SOURCE_WEBSHARE)
+        return lst
+    cached = get_cached_proxy_pool()
+    if cached:
+        log.warning("Webshare API không trả về proxy -> dùng lại %d proxy Webshare lấy được lần trước", len(cached))
+    return cached
 
 
 def load_proxies_from_thinaptm() -> list[str]:
+    if get_provider() == PROVIDER_WEBSHARE:
+        return load_proxies_from_webshare()
+    return _load_proxies_homeproxy()
+
+
+def _load_proxies_homeproxy() -> list[str]:
     """Danh sách proxy của hệ thống = đúng các proxy HomeProxy đang thuê (lấy qua HomeProxy API).
 
     Mọi máy đều nạp cùng danh sách này rồi tự chia đều cho tài khoản của mình. KHÔNG trộn thêm các file proxy khác
@@ -505,12 +618,13 @@ def fetch_proxies_from_homeproxy_api(token: str) -> list[str]:
 
 
 def get_cached_proxy_pool() -> list[str]:
-    """Danh sách HomeProxy lấy được lần gần nhất (cache cũ không ghi nguồn có thể lẫn proxy khác -> bỏ qua)."""
+    """Danh sách proxy lấy được lần gần nhất của NGUỒN ĐANG CHỌN (HomeProxy hoặc Webshare). Cache của nguồn khác hoặc
+    cache cũ không ghi nguồn có thể lẫn proxy khác -> bỏ qua."""
     if os.path.isfile(PROXY_CACHE_FILE):
         try:
             with open(PROXY_CACHE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if d.get("source") == POOL_SOURCE_HOMEPROXY:
+            if d.get("source") == _pool_source():
                 return d.get("proxies", [])
         except Exception:
             pass

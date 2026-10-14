@@ -2246,11 +2246,13 @@ class MuseWorkerSession:
     _DISCONNECTED_JS = ("(function(){var t=(document.body&&document.body.innerText)||'';"
                         "if(/Muse is disconnected|disconnected Muse to protect/i.test(t))return 'disconnected';"
                         "if(/Something went wrong/i.test(t)&&!document.querySelector('textarea'))return 'wrong';"
+                        "if(/(^|[.])instagram[.]com$/i.test(location.hostname)||/redirect-cycle/i.test(location.href))return 'login';"
                         "return '';})()")
 
     def _raise_if_disconnected(self):
         """Trang TK đang ở màn hình lỗi của Muse -> báo lỗi riêng để app cho TK nghỉ (không giao việc tiếp):
         - 'Muse is disconnected' = Muse khoá bảo vệ TK (nghỉ 6 giờ).
+        - Trang chuyển sang instagram.com / redirect-cycle = phiên đăng nhập TK hết hạn, cần lấy cookie mới (khoá TK).
         - 'Something went wrong / Try again' và không còn ô soạn tin = phiên TK hỏng (cookie cũ / Muse cản), nghỉ 1 giờ.
           Màn hình này có thể chớp nhoáng ở TK tốt nên kiểm tra lại sau 2 giây rồi mới kết luận."""
         def _kind():
@@ -2266,6 +2268,11 @@ class MuseWorkerSession:
             err = MuseAccountDisconnectedError(
                 'Muse đã ngắt kết nối TK này ("Muse is disconnected" — Muse khoá bảo vệ, cần gửi ticket cho Muse để mở lại)')
             err.kind = "disconnected"
+            raise err
+        if kind == "login":
+            err = MuseAccountDisconnectedError(
+                'Phiên TK hết hạn: Muse chuyển sang đăng nhập Instagram (redirect-cycle) — cần lấy cookie mới cho TK này')
+            err.kind = "login"
             raise err
         if kind == "wrong":
             err = MuseAccountDisconnectedError(
@@ -2366,8 +2373,13 @@ class MuseWorkerSession:
                 inject_err = f"{type(e).__name__}: {e}"[:120]
             if inject_err:
                 # Ghi rõ lý do (trước đây nuốt mất: 'no-file-input' = trang chưa/không dựng ô soạn tin) và phân biệt
-                # trường hợp TK bị Muse ngắt kết nối.
+                # trường hợp TK bị Muse ngắt kết nối. Qua proxy chậm, trang lỗi / chuyển sang Instagram có thể hiện CHẬM hơn
+                # 15 giây chờ ở trên -> với 'no-file-input' đợi thêm tối đa 12 giây xem trang có hiện màn hình lỗi không.
                 self._raise_if_disconnected()
+                if "no-file-input" in inject_err:
+                    for _ in range(12):
+                        time.sleep(1.0)
+                        self._raise_if_disconnected()
                 raise MuseGenerationError(f"附加参考图失败，已停止生成 ({inject_err})")
             attached = _wait_attached(wait_s)
             if attached:

@@ -309,6 +309,7 @@ class Store:
                 target["expires_at"] = account_expiry(exp, now)
                 target["expiry_anchor"] = None
                 target["enabled"] = True
+                target["muse_locked"] = False      # cookie mới -> mở khoá TK (đã bị khoá vì phiên hết hạn)
                 target["ok"] = None
                 target["note"] = "Đã cập nhật cookie (ghi đè)"
                 target["synced_at"] = now
@@ -446,9 +447,37 @@ class Store:
                 return True
             return False
 
+    _ATTACH_STREAK: dict[str, int] = {}
+
+    def record_attach_fail(self, aid: str, limit: int = 3) -> bool:
+        """Ghi 1 lần TK không đính được ảnh (no-file-input). Đủ `limit` lần liên tiếp -> True (app cho TK nghỉ)."""
+        with self._COND:
+            n = self._ATTACH_STREAK.get(aid, 0) + 1
+            self._ATTACH_STREAK[aid] = n
+            return n >= limit
+
+    _TIMEOUT_STREAK: dict[str, int] = {}
+
+    def record_timeout(self, aid: str, limit: int = 3) -> int:
+        """Ghi 1 lần TK "im lặng" (nhận việc nhưng Muse không trả video, hết giờ chờ). Đủ `limit` lần liên tiếp (không xen
+        lần thành công nào) -> trả về số giây TK cần nghỉ (TK chưa từng ra video nghỉ 3 giờ, TK từng ra video nghỉ 1 giờ), chưa đủ -> 0.
+        Hết giờ nghỉ TK được thử lại; còn timeout thì chuỗi vẫn >= limit nên nghỉ tiếp ngay."""
+        with self._COND:
+            n = self._TIMEOUT_STREAK.get(aid, 0) + 1
+            self._TIMEOUT_STREAK[aid] = n
+            if n < limit:
+                return 0
+            acc = next((a for a in self.accounts if a["id"] == aid), None)
+            never_ok = not int((acc or {}).get("success_count") or 0)
+            seconds = 3 * 3600 if never_ok else 3600
+            self._COOLDOWN_UNTIL[aid] = time.time() + seconds
+            return seconds
+
     def record_vm_ok(self, aid: str):
         """TK vừa render thành công: xóa chuỗi kẹt và giờ nghỉ."""
         with self._COND:
+            self._TIMEOUT_STREAK.pop(aid, None)
+            self._ATTACH_STREAK.pop(aid, None)
             self._STUCK_STREAK.pop(aid, None)
             self._COOLDOWN_UNTIL.pop(aid, None)
             self._COND.notify_all()
