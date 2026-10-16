@@ -54,11 +54,22 @@ def parse_token_count(text) -> float | None:
 
 
 def _reset_date(text, today: date) -> date | None:
-    """'Oct 14' -> ngày reset hạn mức tuần gần nhất (năm hiện tại, hoặc năm sau nếu đã lùi quá xa)."""
-    try:
-        d = datetime.strptime(f"{str(text).strip()} {today.year}", "%b %d %Y").date()
-    except (ValueError, TypeError):
+    """'Oct 14' hoặc '17 tháng 10' -> ngày reset hạn mức tuần gần nhất (năm hiện tại, hoặc năm sau nếu đã lùi quá xa)."""
+    s = str(text or "").strip()
+    if not s:
         return None
+    d = None
+    m_vi = re.search(r"(\d{1,2})\s*(?:tháng|thg)\s*(\d{1,2})", s, re.I)
+    if m_vi:
+        try:
+            d = date(today.year, int(m_vi.group(2)), int(m_vi.group(1)))
+        except ValueError:
+            d = None
+    if d is None:
+        try:
+            d = datetime.strptime(f"{s} {today.year}", "%b %d %Y").date()
+        except (ValueError, TypeError):
+            return None
     if d < today - timedelta(days=180):
         d = d.replace(year=d.year + 1)
     return d
@@ -240,10 +251,27 @@ def load_accounts_with_recovery(accounts_path: str) -> list:
     return []
 
 
+_STORE_INSTANCES: dict[str, "Store"] = {}
+ACCOUNTS_PERSIST_INTERVAL = 3.0
+
+
 class Store:
+    def __new__(cls, cfg):
+        key = os.path.abspath(getattr(cfg, "accounts_file", "") or "")
+        if key and key in _STORE_INSTANCES:
+            return _STORE_INSTANCES[key]
+        inst = super().__new__(cls)
+        if key:
+            _STORE_INSTANCES[key] = inst
+        return inst
+
     def __init__(self, cfg):
+        if getattr(self, "_initialized", False):
+            return
+        self._initialized = True
         self.cfg = cfg
         self._accounts_mtime = 0
+        self._accounts_written_at = 0.0
         self.accounts: list[dict] = []
         # Mỗi lần mở phần mềm: nếu accounts.json lành thì sao lưu 1 bản; nếu hỏng thì tự khôi phục từ bản sao lưu.
         load_accounts_with_recovery(cfg.accounts_file)
@@ -263,22 +291,43 @@ class Store:
             disk_accs = load_accounts_with_recovery(self.cfg.accounts_file)
             mtime = os.path.getmtime(self.cfg.accounts_file)
             for a in disk_accs:
-                # TK cũ chưa có bộ đếm "Video thành công": bắt đầu đếm từ số lượt hiện tại để tỉ lệ thành công không bị lệch
-                if "Muse is disconnected" in (a.get("note") or "") and not a.get("muse_locked"):
+                # TK cũ chưa có cờ muse_locked rõ ràng: chỉ suy ra từ note khi trường muse_locked chưa tồn tại
+                if "Muse is disconnected" in (a.get("note") or "") and "muse_locked" not in a:
                     a["muse_locked"] = True
                 if "success_count" not in a:
                     a["success_count"] = 0
                     a["success_since_use"] = int(a.get("use_count") or 0)
+                if "last_success_at" not in a:
+                    a["last_success_at"] = int(a["last_used"]) if (int(a.get("success_count") or 0) > 0 and a.get("last_used")) else None
                 ce = a.get("cookies_exp") or {}
                 if _is_pos(ce.get("hatch_vml")):
                     a["expires_at"] = int(ce["hatch_vml"])
+                # TK thiếu cookie lõi hatch_vml (kẹt bước đăng nhập OAuth/checkpoint): không thể mở ô tải ảnh -> khoá ngay
+                cks = a.get("cookies") or {}
+                if cks and not cks.get("hatch_vml"):
+                    a["ok"] = False
+                    a["muse_locked"] = True
+                    a["note"] = "Thiếu cookie máy ảo (hatch_vml) do chưa hoàn tất đăng nhập — cần chạy Tự động đăng nhập lại (Relogin)"
+                # Nếu TK được reset/mở khóa từ bên ngoài (ok=True, muse_locked=False), xóa luôn cooldown trong RAM
+                aid = a.get("id")
+                if aid and not a.get("muse_locked") and a.get("ok") is True and "Đã reset" in (a.get("note") or ""):
+                    self._COOLDOWN_UNTIL.pop(aid, None)
+                    self._STUCK_STREAK.pop(aid, None)
+                    self._TIMEOUT_STREAK.pop(aid, None)
+                    self._ATTACH_STREAK.pop(aid, None)
+                    self._OUTCOMES.pop(aid, None)
+                    self._OUTCOME_TS.pop(aid, None)
             self.accounts = disk_accs
             self._accounts_mtime = mtime
         except Exception:
             pass
 
-    def _save_accounts(self):
+    def _save_accounts(self, force: bool = True):
+        now = time.time()
+        if not force and (now - getattr(self, "_accounts_written_at", 0.0)) < ACCOUNTS_PERSIST_INTERVAL:
+            return
         _write(self.cfg.accounts_file, self.accounts)
+        self._accounts_written_at = now
         try:
             self._accounts_mtime = os.path.getmtime(self.cfg.accounts_file)
         except Exception:
@@ -322,7 +371,8 @@ class Store:
                    "cookies_exp": exp, "expires_at": account_expiry(exp, now),
                    "expiry_anchor": None,
                    "enabled": True, "created_at": now,
-                   "last_used": None, "last_keepalive": None, "use_count": 0, "success_count": 0, "success_since_use": 0,
+                   "last_used": None, "last_keepalive": None, "use_count": 0,
+                   "success_count": 0, "success_since_use": 0, "last_success_at": None,
                    "ok": None, "note": "", "synced_at": None}
             self.accounts.append(acc)
             self._save_accounts()
@@ -388,7 +438,7 @@ class Store:
                             self._sticky_count = sticky_n + 1
                             a["last_used"] = time.time()
                             a["use_count"] = a.get("use_count", 0) + 1
-                            self._save_accounts()
+                            self._save_accounts(force=False)
                             return a
             healthy = [a for a in live if a.get("ok") is not False]
             candidates = healthy if healthy else live
@@ -398,15 +448,17 @@ class Store:
             self._sticky_count = 1
             acc["last_used"] = time.time()
             acc["use_count"] = acc.get("use_count", 0) + 1
-            self._save_accounts()
+            self._save_accounts(force=False)
             return acc
 
-    # Số việc đang chạy của từng TK; mỗi TK nhận tối đa MAX_JOBS_PER_ACCOUNT việc cùng lúc (ô "Số video cùng lúc / tài khoản").
+    # Số việc đang chạy của từng TK; mỗi TK nhận tối đa MAX_JOBS_PER_ACCOUNT việc cùng lúc (ô "Số video cùng lúc / tài khoản": 1 hoặc 2).
     _BUSY_COUNT: dict[str, int] = {}
+    _LAST_ACQUIRE_TS: dict[str, float] = {}
     MAX_JOBS_PER_ACCOUNT = 2
-    # Bỏ qua TK hết token (theo hạn mức đã kiểm tra) khi giao việc. Mặc định TẮT: đo thực tế các TK "0 token"
-    # vẫn render thành công, chặn trước sẽ bỏ phí chúng. Bật bằng ô trong tab Tài Khoản Muse.
-    SKIP_EXHAUSTED = False
+    # Khoảng cách tối thiểu (giây) trước khi giao luồng thứ 2 vào cùng 1 tài khoản đang bận để tránh nghẽn máy ảo Muse.
+    SAME_ACCOUNT_STAGGER_SECONDS = 15.0
+    # Bỏ qua TK hết sạch cả gói tuần (100%) lẫn token bổ sung (0 token) khi giao việc.
+    SKIP_EXHAUSTED = True
     _last_all_exhausted_warn = 0.0
     _COND = threading.Condition(_LOCK)
 
@@ -428,7 +480,7 @@ class Store:
         except (TypeError, ValueError):
             n = 2
         with self._COND:
-            Store.MAX_JOBS_PER_ACCOUNT = max(1, min(4, n))
+            Store.MAX_JOBS_PER_ACCOUNT = max(1, min(2, n))
             self._COND.notify_all()
         return Store.MAX_JOBS_PER_ACCOUNT
     # Cooldown (trong RAM, mở lại app là xóa): TK kẹt VM liên tiếp thì cho nghỉ, hết giờ nghỉ được thử lại 1 lần.
@@ -514,7 +566,7 @@ class Store:
         """Số TK dùng được và tổng số 'ô' việc song song hiện có (để gợi ý số luồng hợp lý)."""
         with self._COND:
             base = Store.MAX_JOBS_PER_ACCOUNT
-            live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
+            live = [a for a in self.accounts if a.get("enabled", True) and (a.get("cookies") or {}).get("hatch_vml")]
             usable = [a for a in live if not a.get("muse_locked") and not self.in_cooldown(a["id"])]
             slots = sum(self.effective_limit(a["id"], base) for a in usable)
             return {"accounts_total": len(self.accounts), "accounts_usable": len([a for a in usable if self.effective_limit(a["id"], base) > 0]),
@@ -540,7 +592,7 @@ class Store:
                 self._sync_from_disk()
                 busy = self._BUSY_COUNT
                 limit = Store.MAX_JOBS_PER_ACCOUNT
-                live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
+                live = [a for a in self.accounts if a.get("enabled", True) and (a.get("cookies") or {}).get("hatch_vml")]
                 available = [a for a in live if busy.get(a["id"], 0) < self.effective_limit(a["id"], limit)
                              and not self.in_cooldown(a["id"]) and not a.get("muse_locked")]
                 if exclude_id and len(available) > 1:
@@ -559,23 +611,40 @@ class Store:
                     else:
                         available = [a for a in available if not account_exhausted(a)]
 
+                now_ts = time.time()
+                wait_hint = 2.0
                 if available:
-                    healthy = [a for a in available if a.get("ok") is not False]
-                    candidates = healthy if healthy else available
-                    least_busy = lambda a: (busy.get(a["id"], 0), a.get("last_used") or 0.0, a.get("use_count") or 0)  # noqa: E731
-                    pref = next((a for a in candidates if a["id"] == preferred_id), None) if preferred_id else None
-                    acc = pref if pref else min(candidates, key=least_busy)
+                    # Nếu TK đang có 1 luồng chạy (busy >= 1), bắt buộc chờ cách luồng trước tối thiểu SAME_ACCOUNT_STAGGER_SECONDS
+                    # để 2 luồng không lao vào cùng 1 máy ảo Muse cùng lúc gây nghẽn.
+                    stagger = self.SAME_ACCOUNT_STAGGER_SECONDS
+                    ready = [
+                        a for a in available
+                        if busy.get(a["id"], 0) == 0
+                        or (now_ts - self._LAST_ACQUIRE_TS.get(a["id"], 0.0)) >= stagger
+                    ]
+                    if not ready:
+                        soonest = min(
+                            max(0.2, stagger - (now_ts - self._LAST_ACQUIRE_TS.get(a["id"], 0.0)))
+                            for a in available
+                        )
+                        wait_hint = min(2.0, soonest)
+                    else:
+                        # Ưu tiên tuyệt đối TK đang rảnh hoàn toàn (busy == 0) trước khi chồng việc thứ 2 lên cùng 1 VM Muse
+                        least_busy = lambda a: (busy.get(a["id"], 0), 0 if a.get("ok") is not False else 1, a.get("last_used") or 0.0, a.get("use_count") or 0)  # noqa: E731
+                        pref = next((a for a in ready if a["id"] == preferred_id and a.get("ok") is not False), None) if preferred_id else None
+                        acc = pref if pref else min(ready, key=least_busy)
 
-                    busy[acc["id"]] = busy.get(acc["id"], 0) + 1
-                    acc["last_used"] = time.time()
-                    acc["use_count"] = acc.get("use_count", 0) + 1
-                    self._save_accounts()
-                    return acc
+                        busy[acc["id"]] = busy.get(acc["id"], 0) + 1
+                        self._LAST_ACQUIRE_TS[acc["id"]] = now_ts
+                        acc["last_used"] = now_ts
+                        acc["use_count"] = acc.get("use_count", 0) + 1
+                        self._save_accounts(force=False)
+                        return acc
 
                 rem = deadline - time.monotonic()
                 if rem <= 0:
                     return None
-                self._COND.wait(timeout=min(2.0, rem))
+                self._COND.wait(timeout=min(wait_hint, rem))
 
     def set_locked(self, aid: str, locked: bool, note: str = ""):
         """Khoá/mở khoá TK bị Muse ngắt kết nối. TK khoá KHÔNG được giao việc (kể cả sau khi khởi động lại phần mềm) cho tới
@@ -596,14 +665,58 @@ class Store:
         with self._COND:
             self._COND.notify_all()
 
+    def reset_all_accounts(self) -> int:
+        """Reset toàn bộ tài khoản về trạng thái sẵn sàng hoạt động:
+        - Mở khoá muse_locked = False, enabled = True, ok = True
+        - Xóa mọi bộ đếm cooldown, kẹt VM, timeout, lịch sử chất lượng trong RAM
+        - Gia hạn lại mốc ước tính expires_at (+48h) cho các TK bị đánh dấu quá hạn để cho phép thử lại."""
+        now_ts = int(time.time())
+        with self._COND:
+            self._sync_from_disk()
+            count = 0
+            for a in self.accounts:
+                a["enabled"] = True
+                a["checked_at"] = now_ts
+                cks = a.get("cookies") or {}
+                if not cks.get("hatch_vml"):
+                    a["muse_locked"] = True
+                    a["ok"] = False
+                    a["note"] = "Thiếu cookie máy ảo (hatch_vml) do chưa hoàn tất đăng nhập — cần chạy Tự động đăng nhập lại (Relogin)"
+                    continue
+                a["muse_locked"] = False
+                a["ok"] = True
+                a["note"] = "Đã reset — sẵn sàng chạy lại"
+                ce = dict(a.get("cookies_exp") or {})
+                if _is_pos(ce.get("hatch_vml")) and int(ce["hatch_vml"]) <= now_ts:
+                    ce.pop("hatch_vml", None)
+                    a["cookies_exp"] = ce
+                if not a.get("expires_at") or int(a.get("expires_at") or 0) <= now_ts:
+                    a["expiry_anchor"] = now_ts
+                    a["expires_at"] = account_expiry(ce, now_ts)
+                if a.get("proxy_status") == "dead":
+                    a["proxy_status"] = "unknown"
+                    a.pop("proxy_error", None)
+                count += 1
+            self._COOLDOWN_UNTIL.clear()
+            self._STUCK_STREAK.clear()
+            self._TIMEOUT_STREAK.clear()
+            self._ATTACH_STREAK.clear()
+            self._OUTCOMES.clear()
+            self._OUTCOME_TS.clear()
+            self._save_accounts(force=True)
+            self._COND.notify_all()
+            return count
+
     def record_success(self, aid: str):
         """Cộng 1 vào 'Video thành công' của TK: chỉ gọi khi video đã ra VÀ ghép/lưu xong (khác 'Số lần dùng' = số lượt
         được giao việc, kể cả lượt lỗi)."""
         with _LOCK:
             self._sync_from_disk()
+            now_ts = int(time.time())
             for a in self.accounts:
                 if a["id"] == aid:
                     a["success_count"] = int(a.get("success_count") or 0) + 1
+                    a["last_success_at"] = now_ts
                     break
             else:
                 return

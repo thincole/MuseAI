@@ -767,9 +767,9 @@ def assign_sticky_proxy(acc_id: str, proxy_str: str, ip: str = ""):
     log.info("📌 Đã gán proxy cố định cho TK %s: %s (IP: %s)", acc_id, proxy_str, ip or "Chưa kiểm tra")
 
 
-def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False) -> str | None:
-    """Kiểm tra proxy của tài khoản. Nếu proxy còn sống, giữ nguyên.
-    Nếu chưa có proxy hoặc proxy cũ đã chết (die), tự động chọn proxy mới còn sống từ Pool.
+def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False, force_rotate: bool = False) -> str | None:
+    """Kiểm tra proxy của tài khoản. Nếu proxy còn sống, giữ nguyên (trừ khi force_rotate=True).
+    Nếu chưa có proxy, proxy cũ đã chết (die), hoặc force_rotate=True, tự động chọn proxy mới còn sống từ Pool.
     Nếu người dùng tắt Fake Proxy (is_proxy_enabled=False), trả về None để chạy trực tiếp."""
     if not is_proxy_enabled():
         return None
@@ -785,10 +785,10 @@ def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False) -> st
     if stale:
         log.info("🔀 TK %s đang dùng proxy không còn trong danh sách HomeProxy -> chuyển sang proxy ít TK nhất",
                  acc.get("label", acc_id))
-    if cur_proxy and not force_check and not stale:
+    if cur_proxy and not force_check and not force_rotate and not stale:
         return cur_proxy
 
-    if cur_proxy and not stale:
+    if cur_proxy and not stale and not force_rotate:
         ok, ip_or_err = test_proxy(cur_proxy)
         if ok:
             store.update_account(acc_id, proxy_status="alive", proxy_ip=ip_or_err)
@@ -806,7 +806,8 @@ def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False) -> st
 
     # Ưu tiên proxy đang ít tài khoản nhất (trước đây chọn ngẫu nhiên -> có proxy gánh 20+ TK cùng 1 IP)
     loads = _proxy_loads(pool, exclude_acc=acc_id)
-    available = _least_loaded_first([p for p in pool if p != cur_proxy] or pool, loads)
+    candidates = [p for p in pool if p != cur_proxy] or pool
+    available = _least_loaded_first(candidates, loads)
     for candidate in available:
         ok, ip_or_err = test_proxy(candidate)
         if ok:
@@ -815,6 +816,11 @@ def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False) -> st
 
     log.error("Tất cả proxy trong Pool đều không phản hồi khi cấp cho TK %s!", acc_id)
     return None
+
+
+def rotate_proxy_for_account(acc_id: str) -> str | None:
+    """Buộc đổi sang proxy khác còn sống trong Pool cho tài khoản (dùng khi proxy hiện tại bị chặn vùng 403 hoặc người dùng bấm Đổi)."""
+    return ensure_alive_proxy_for_account(acc_id, force_check=True, force_rotate=True)
 
 
 def sync_all_accounts_with_homeproxy(rebalance: bool = False) -> dict:

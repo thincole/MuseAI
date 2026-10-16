@@ -76,6 +76,43 @@ def _run_ffmpeg_cmd(cmd: list[str], timeout: int = 180, check: bool = False, tex
         )
     return subprocess.run(cmd, **kwargs)
 
+
+_NVENC_AVAILABLE: bool | None = None
+_NVENC_LOCK = threading.Lock()
+
+
+def has_nvenc() -> bool:
+    """Kiểm tra máy có GPU NVIDIA hỗ trợ encode phần cứng h264_nvenc thật sự không (chỉ kiểm tra 1 lần rồi lưu cache)."""
+    global _NVENC_AVAILABLE
+    if os.environ.get("MUSE2API_DISABLE_NVENC", "").strip() == "1":
+        return False
+    if _NVENC_AVAILABLE is not None:
+        return _NVENC_AVAILABLE
+    with _NVENC_LOCK:
+        if _NVENC_AVAILABLE is not None:
+            return _NVENC_AVAILABLE
+        try:
+            res = _run_ffmpeg_cmd(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
+                    "-c:v", "h264_nvenc", "-f", "null", "-",
+                ],
+                timeout=8,
+            )
+            _NVENC_AVAILABLE = (res.returncode == 0)
+            if _NVENC_AVAILABLE:
+                log.info("🚀 [FFmpeg GPU] Đã kích hoạt tăng tốc phần cứng NVIDIA NVENC (h264_nvenc) để ghép video siêu tốc!")
+        except Exception:
+            _NVENC_AVAILABLE = False
+        return _NVENC_AVAILABLE
+
+
+def _video_encode_args(use_nvenc: bool) -> list[str]:
+    if use_nvenc:
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2", "-pix_fmt", "yuv420p"]
+
 # ==================== CẤU HÌNH DATABASE NOVAGATE (đọc từ .env, không ghi cứng secret) ====================
 # Server URL / API key / Client ID để trong .env (file này đã được .gitignore) để không lộ khi commit.
 def get_computer_name() -> str:
@@ -831,20 +868,23 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
                 err1 = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
                 log.warning("concat_videos copy failed: %s; falling back to reencode", err1)
                 _safe_remove(output_path)  # bỏ output dở dang của lần stream-copy
-                # Thử 2: re-encode nếu stream khác codec hoặc timeline
-                # Giới hạn -threads 2 để không chiếm dụng toàn bộ core CPU của máy (tránh đơ máy)
-                cmd_reencode = [
-                    "ffmpeg", "-y",
-                    "-reinit_filter", "0",  # clip Muse có thể đổi định dạng điểm ảnh giữa chừng (xem ghep_anh_12s)
-                    "-f", "concat", "-safe", "0",
-                    "-i", list_file,
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",
-                    output_path
-                ]
-                res = _run_ffmpeg_cmd(cmd_reencode, timeout=240)
+                # Thử 2: re-encode nếu stream khác codec hoặc timeline (ưu tiên GPU NVENC nếu có, tự động fallback về CPU libx264)
+                use_gpu = has_nvenc()
+                for try_gpu in ([True, False] if use_gpu else [False]):
+                    cmd_reencode = [
+                        "ffmpeg", "-y",
+                        "-reinit_filter", "0",  # clip Muse có thể đổi định dạng điểm ảnh giữa chừng (xem ghep_anh_12s)
+                        "-f", "concat", "-safe", "0",
+                        "-i", list_file,
+                        *_video_encode_args(try_gpu),
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        output_path
+                    ]
+                    res = _run_ffmpeg_cmd(cmd_reencode, timeout=240)
+                    if res.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 1000:
+                        break
+                    _safe_remove(output_path)
                 if res.returncode != 0:
                     err2 = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
                     log.error("concat_videos reencode failed: %s", err2)
@@ -1074,10 +1114,13 @@ def release_stuck_jobs(server_url: str | None = None, api_key: str | None = None
 # SP lỗi vì TK Muse hỏng / im lặng / proxy chết thì KHÔNG đánh `failed` (mất SP vĩnh viễn): trả về `pending` để máy khác (hoặc
 # TK khác) làm lại. Lỗi do chính SP (Muse từ chối nội dung, chỉ trả chữ, không có ảnh) vẫn đánh `failed`.
 ACCOUNT_FAULT_MARKERS = (
-    "附加参考图失败", "no-file-input",                       # TK không đính được ảnh (phiên hết hạn / Instagram)
-    "等待生成超时", "Hết thời gian chờ render",               # TK im lặng: nhận việc nhưng không trả video
-    "找不到聊天输入框", "Khởi tạo trang muse.ai",              # trang Muse không mở được (proxy / phiên)
-    "Prompt chưa tới được máy ảo", "máy ảo Muse",            # VM Muse không phản hồi
+    "附加参考图失败", "Đính kèm ảnh tham chiếu thất bại", "no-file-input",   # TK không đính được ảnh (phiên hết hạn / Instagram)
+    "Prompt đã gửi nhưng KHÔNG kèm ảnh tham chiếu",
+    "等待生成超时", "Hết thời gian chờ tạo", "Hết thời gian chờ render",       # TK im lặng: nhận việc nhưng không trả video
+    "找不到聊天输入框", "Không tìm thấy ô nhập chat", "Khởi tạo trang muse.ai",  # trang Muse không mở được (proxy / phiên)
+    "Prompt chưa tới được máy ảo", "máy ảo Muse", "ngừng phản hồi quá",      # VM Muse không phản hồi / treo ngầm
+    "Máy ảo Muse đọc sai đường dẫn ảnh",                                    # VM tìm ảnh ở /home/user/ thay vì /home/hatch/workspace/
+    "Khu vực/Proxy không hỗ trợ", "403 Region Blocked", "区域不可用",         # Proxy bị Muse chặn vùng địa lý
     "Muse is disconnected", "Muse đã ngắt kết nối", "Phiên TK hết hạn", "Something went wrong",
     "ProxyError", "Không có tài khoản nào khả dụng", "tất cả tài khoản đang bận", "Đã hết thời gian chờ tác vụ",
     "Lỗi xác thực tài khoản", "MuseAuthError", "hết hạn ngạch", "额度不足",
@@ -1453,37 +1496,39 @@ def ghep_anh_12s(
 
         # -reinit_filter 0: một số clip Muse đổi định dạng điểm ảnh giữa chừng (vd 36 khung đầu yuv444p rồi yuv420p)
         # -> FFmpeg khởi tạo lại chuỗi bộ lọc, mốc thời gian quay về 0 và vứt ~35 khung -> video ra 10.54s thay vì 12s.
-        cmd = [
+        base_cmd = [
             "ffmpeg", "-y",
             "-reinit_filter", "0", "-i", video_path,
             "-loop", "1", "-t", str(image_dur), "-i", image_path,
-            "-filter_complex", filter_complex_str
+            "-filter_complex", filter_complex_str,
+            *map_args,
         ]
-        cmd.extend(map_args)
-        cmd.extend([
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
-            "-pix_fmt", "yuv420p"
-        ])
-        if has_audio:
-            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
-        cmd.append(output_path)
     except Exception as e:
         log.warning("Lỗi chuẩn bị ghép video 12s: %s", e)
         return False
 
-    # --- Encode (nặng) — giới hạn đồng thời qua FFMPEG_SEMAPHORE ---
+    # --- Encode (nặng) — giới hạn đồng thời qua FFMPEG_SEMAPHORE, ưu tiên GPU NVENC nếu có ---
     ok = False
     with FFMPEG_SEMAPHORE:
         try:
-            res = _run_ffmpeg_cmd(cmd, timeout=90)
-            if res.returncode != 0:
-                err = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
-                log.warning("ghep_anh_12s failed: %s", err)
+            use_gpu = has_nvenc()
+            last_err = ""
+            for try_gpu in ([True, False] if use_gpu else [False]):
+                cmd = list(base_cmd) + _video_encode_args(try_gpu)
+                if has_audio:
+                    cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                cmd.append(output_path)
+                res = _run_ffmpeg_cmd(cmd, timeout=90)
+                if res.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 1000:
+                    ok = True
+                    break
+                last_err = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
+                _safe_remove(output_path)
+            if not ok:
+                log.warning("ghep_anh_12s failed: %s", last_err)
                 return False
-            ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 1000
-            if ok:
-                log.info("✓ [FFmpeg] Đã ghép Outro 12s vào %s thành công (%.2fs)", os.path.basename(output_path), time.time() - t0)
-            return ok
+            log.info("✓ [FFmpeg] Đã ghép Outro 12s vào %s thành công (%.2fs)", os.path.basename(output_path), time.time() - t0)
+            return True
         except Exception as e:
             log.warning("Lỗi ghép video 12s bằng ffmpeg: %s", e)
             return False

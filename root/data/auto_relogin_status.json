@@ -1,0 +1,22 @@
+{
+  "attempts": {},
+  "results": {},
+  "running": false,
+  "heartbeat": 1792028308.0604427,
+  "started_at": 1792028289.964422,
+  "finished_at": 1792028313.4230347,
+  "planned": [
+    {
+      "email": "balinladarrius1171@hotmail.com",
+      "reason": "TK khoá vì phiên hết hạn"
+    }
+  ],
+  "progress": {
+    "done": 1,
+    "total": 1,
+    "ok": 0,
+    "fail": 1
+  },
+  "last_run": null,
+  "last_summary": null
+}

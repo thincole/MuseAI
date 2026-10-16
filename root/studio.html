@@ -1252,12 +1252,15 @@
             <div class="card-title">
               Danh Sách Tài Khoản Trong Hệ Thống
             </div>
-            <div style="display:flex;gap:8px;">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
               <button class="btn-header" id="btnToggleProxyModeAcc" onclick="toggleProxyMode()" style="background:rgba(59,130,246,0.15);border:1px solid #3b82f6;color:#60a5fa;" title="Bật hoặc Tắt Fake Proxy / HomeProxy">
                 🌐 Proxy: đang kiểm tra...
               </button>
               <button class="btn-header" onclick="syncThinAptmProxy()" style="background:rgba(59,130,246,0.15);border:1px solid #3b82f6;color:#60a5fa;" title="Tự động nạp danh sách HomeProxy từ E:\ThinAptm0707 và gán cố định cho từng tài khoản">
                 🌐 Nạp Proxy ThinAptm
+              </button>
+              <button class="btn-header" onclick="resetAllAccounts()" style="background:rgba(16,185,129,0.18);border:1px solid #10b981;color:#34d399;" title="Mở khoá toàn bộ tài khoản bị khoá/lỗi, xóa thời gian nghỉ (cooldown) để chạy lại từ đầu">
+                🔄 Reset Toàn Bộ TK
               </button>
               <button class="btn-header" onclick="triggerKeepaliveAll()">
                 ⚡ Giữ Kết Nối & Đánh Thức VM (Keepalive All)
@@ -1278,6 +1281,35 @@
             <input type="checkbox" id="hideLockedAccounts" onchange="onHideLockedChange()">
             🙈 Ẩn các TK bị khoá (Muse is disconnected) <span id="hiddenLockedCount" style="color:var(--text-dim);"></span>
           </label>
+
+          <div id="reloginCard" style="background:rgba(34,197,94,0.07);border:1px solid rgba(34,197,94,0.3);border-radius:8px;padding:10px 14px;margin-bottom:14px;">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <b style="color:#4ade80;font-size:13px;">🔑 Tự động đăng nhập lại TK hết phiên (kèm kiểm tra hạn mức)</b>
+              <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;" title="Bật: app tự chạy theo chu kỳ bên dưới. Tắt: chỉ chạy khi bấm 'Chạy ngay'.">
+                <input type="checkbox" id="rl_enabled" onchange="saveReloginConfig()"> Tự chạy định kỳ
+              </label>
+              <span style="font-size:12px;color:var(--text-dim);">mỗi</span>
+              <select id="rl_interval" class="shopee-select" onchange="saveReloginConfig()" style="padding:2px 6px;font-size:12px;">
+                <option value="3">3 giờ</option><option value="6">6 giờ</option><option value="12">12 giờ</option><option value="24">24 giờ</option>
+              </select>
+              <span id="rl_state" style="font-size:12px;margin-left:auto;color:#94a3b8;">...</span>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:12px;">
+              <span>Thư mục/file TK (email|mật khẩu|token|client_id):</span>
+              <input type="text" id="rl_sources" class="shopee-input" placeholder="Trống = tự tìm E:\Acc muse" onchange="saveReloginConfig()" style="width:260px;font-size:12px;">
+              <span>Tối đa/lượt</span><input type="number" id="rl_max" min="1" max="200" onchange="saveReloginConfig()" class="shopee-input" style="width:60px;font-size:12px;">
+              <span>Luồng</span><input type="number" id="rl_threads" min="1" max="8" onchange="saveReloginConfig()" class="shopee-input" style="width:50px;font-size:12px;">
+              <label style="cursor:pointer;"><input type="checkbox" id="rl_headless" onchange="saveReloginConfig()"> Chạy ngầm</label>
+              <label style="cursor:pointer;" title="Khi số TK dùng được thấp hơn mức tối thiểu, tự lấy thêm email mới chưa có trong hệ thống từ file TK."><input type="checkbox" id="rl_addnew" onchange="saveReloginConfig()"> Tự bổ sung TK mới khi dưới</label>
+              <input type="number" id="rl_minactive" min="1" max="500" onchange="saveReloginConfig()" class="shopee-input" style="width:60px;font-size:12px;"> TK
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+              <button class="btn-tiny" onclick="runRelogin(true)" title="Chỉ liệt kê TK sẽ được đăng nhập lại và TK bị bỏ qua (kèm lý do), không đăng nhập thật">🔍 Xem kế hoạch</button>
+              <button class="btn-tiny" id="rl_runbtn" onclick="runRelogin(false)" style="background:rgba(34,197,94,0.2);border-color:#22c55e;color:#4ade80;" title="Đăng nhập lại ngay các TK trong kế hoạch (tiến trình riêng, không ảnh hưởng việc đang chạy)">▶ Chạy ngay</button>
+              <span id="rl_msg" style="font-size:12px;color:var(--text-dim);"></span>
+            </div>
+            <div id="rl_plan" style="font-size:11.5px;color:var(--text-dim);margin-top:6px;white-space:pre-wrap;max-height:180px;overflow:auto;"></div>
+          </div>
 
           <div style="background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.25);border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:10px;">
             <span style="font-size:20px;">🛡️</span>
@@ -1672,13 +1704,11 @@
                 <span id="sp_threads_machine_hint" style="font-size:11px;font-weight:600;margin-left:4px;"></span>
               </div>
 
-              <div style="display:flex;align-items:center;gap:6px;background:rgba(56,189,248,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(56,189,248,0.35);" title="Mỗi tài khoản Muse render tối đa bao nhiêu video cùng lúc (mỗi video 1 tab Chrome riêng, ~0,5 GB RAM). Đã thử: 2 video/TK chậm hơn ~14% mỗi video nhưng mỗi TK làm được ~1,7 lần. 3-4 chưa thử kỹ. Quota 2.500 video/TK/tuần không đổi -> càng nhiều video/TK thì TK càng nhanh hết quota.">
+              <div style="display:flex;align-items:center;gap:6px;background:rgba(56,189,248,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(56,189,248,0.35);" title="Mỗi tài khoản Muse chỉ có 1 máy ảo Cloud VM -> chỉ cho phép chạy tối đa 1 hoặc 2 video cùng lúc / tài khoản. Khi chạy 2 video/TK, hệ thống tự động tạo độ trễ lệch pha (15-18s) giữa 2 luồng cùng 1 tài khoản để tránh nghẽn máy ảo.">
                 <span style="font-size:12px;font-weight:700;color:#38bdf8;">🎬 Số video cùng lúc / tài khoản:</span>
                 <select class="shopee-select" id="sp_jobs_per_account" onchange="updateShopeeThreadsHint(); saveShopeeSettings()" style="font-weight:bold;color:#38bdf8;padding:4px 8px;background:#0d1117;">
                   <option value="1">1</option>
                   <option value="2" selected>2 (Khuyên dùng)</option>
-                  <option value="3">3</option>
-                  <option value="4">4</option>
                 </select>
               </div>
 
@@ -2593,6 +2623,119 @@
   let cachedAccounts = [];
   let cachedAliveCount = 0;
 
+  // Ghi chú TK đã lưu từ phiên bản cũ có thể còn tiếng Trung -> hiển thị bằng tiếng Việt
+  const LEGACY_NOTE_VI = [
+    ["等待生成超时，未出现新的生成结果", "Hết thời gian chờ tạo, chưa có kết quả mới"],
+    ["附加参考图失败，已停止生成", "Đính kèm ảnh tham chiếu thất bại, đã dừng tạo"],
+    ["参考图上传未确认，已停止生成", "Chưa xác nhận tải ảnh tham chiếu, đã dừng tạo"],
+    ["提示词发送未确认，已停止生成", "Chưa xác nhận đã gửi prompt, đã dừng tạo"],
+    ["参考图读取失败，已停止生成", "Đọc ảnh tham chiếu thất bại, đã dừng tạo"],
+    ["找不到聊天输入框", "Không tìm thấy ô nhập chat"],
+    ["云端 VM 连接超时", "Kết nối VM đám mây quá thời gian"],
+    ["等待助手首字响应超时", "Hết thời gian chờ trợ lý trả lời chữ đầu tiên"],
+    ["等待助手回复超时", "Hết thời gian chờ trợ lý trả lời"],
+    ["模型未生成媒体，仅返回文本", "Mô hình không sinh video, chỉ phản hồi văn bản"],
+    ["账号额度不足", "Tài khoản hết hạn ngạch"],
+    ["会话认证失败", "Xác thực phiên thất bại"],
+    ["会话已被 muse.ai 登出", "Phiên đã bị muse.ai đăng xuất"],
+    ["客户端已断开连接，终止生成任务", "Máy khách đã ngắt kết nối, dừng tác vụ tạo"],
+    ["未能取回生成结果", "Không lấy lại được kết quả tạo"],
+    ["Tác vụ gián đoạn", "Tác vụ gián đoạn"],
+  ];
+  function translateLegacyNote(text) {
+    let out = text || "";
+    for (const [zh, vi] of LEGACY_NOTE_VI) {
+      if (out.includes(zh)) out = out.split(zh).join(vi);
+    }
+    return out;
+  }
+
+  // ---------- Tự động đăng nhập lại TK hết phiên ----------
+  let reloginTimer = null;
+  const _fmtTs = (t) => t ? new Date(t * 1000).toLocaleString("vi-VN") : "chưa chạy";
+
+  function renderRelogin(d, showPlan) {
+    const c = d.config || {};
+    const set = (id, v, chk) => { const el = document.getElementById(id); if (el && document.activeElement !== el) { if (chk) el.checked = !!v; else el.value = v; } };
+    set("rl_enabled", c.enabled, true); set("rl_interval", String(c.interval_hours)); set("rl_max", c.max_per_run);
+    set("rl_threads", c.threads); set("rl_headless", c.headless, true); set("rl_addnew", c.auto_add_new, true); set("rl_minactive", c.min_active);
+    set("rl_sources", (c.sources || []).join("; "));
+    const st = document.getElementById("rl_state");
+    const pr = d.progress || {};
+    if (st) {
+      if (d.running) st.innerHTML = `<span style="color:#fbbf24;">⏳ Đang chạy: ${pr.done || 0}/${pr.total || 0} (thành công ${pr.ok || 0}, lỗi ${pr.fail || 0})</span>`;
+      else {
+        const ls = d.last_summary;
+        st.textContent = `Lần chạy cuối: ${_fmtTs(d.last_run)}` + (ls ? ` · ${ls.ok || 0} thành công / ${ls.fail || 0} lỗi` + (ls.held ? ` / ${ls.held} cạn hạn mức` : "") : "");
+      }
+    }
+    const btn = document.getElementById("rl_runbtn");
+    if (btn) btn.disabled = !!d.running;
+    const box = document.getElementById("rl_plan");
+    if (box) {
+      const pl = d.plan || {};
+      let txt = "";
+      if (showPlan || d.running) {
+        txt += `TK dùng được: ${pl.active}/${pl.total} · email có thông tin đăng nhập: ${pl.creds}\n`;
+        txt += `Sẽ đăng nhập lại: ${(pl.will_run || []).length}\n`;
+        (pl.will_run || []).slice(0, 40).forEach(i => { txt += `  + ${i.email} — ${i.reason}\n`; });
+        const sk = {}; (pl.skipped || []).forEach(i => { sk[i.reason] = (sk[i.reason] || 0) + 1; });
+        const keys = Object.keys(sk);
+        if (keys.length) txt += "Bỏ qua: " + keys.map(k => `${sk[k]} × ${k}`).join(" · ") + "\n";
+      }
+      const rec = (d.recent || []).slice(0, 12);
+      if (rec.length) {
+        txt += "\nKết quả gần đây:\n" + rec.map(r => `  ${r.status === "ok" ? "✓" : "✗"} ${r.email}${r.kind === "new" ? " (TK mới)" : ""} — ${(r.msg || "").slice(0, 60)}${r.quota ? " · " + r.quota : ""}`).join("\n");
+      }
+      box.textContent = txt;
+    }
+  }
+
+  async function loadRelogin(showPlan) {
+    try {
+      const r = await fetch("/api/relogin/status", { headers: getHeaders() });
+      if (!r.ok) return;
+      const d = await r.json();
+      renderRelogin(d, !!showPlan);
+      if (d.running && !reloginTimer) reloginTimer = setInterval(() => loadRelogin(false), 8000);
+      if (!d.running && reloginTimer) { clearInterval(reloginTimer); reloginTimer = null; }
+    } catch (_) {}
+  }
+
+  async function saveReloginConfig() {
+    const g = (id) => document.getElementById(id);
+    const body = {
+      enabled: g("rl_enabled").checked, interval_hours: parseInt(g("rl_interval").value) || 6,
+      sources: g("rl_sources").value, max_per_run: parseInt(g("rl_max").value) || 20, threads: parseInt(g("rl_threads").value) || 3,
+      headless: g("rl_headless").checked, auto_add_new: g("rl_addnew").checked, min_active: parseInt(g("rl_minactive").value) || 40
+    };
+    try {
+      await fetch("/api/relogin/config", { method: "POST", headers: getHeaders(), body: JSON.stringify(body) });
+      const m = g("rl_msg"); if (m) m.textContent = "✓ Đã lưu";
+      setTimeout(() => { const m2 = g("rl_msg"); if (m2) m2.textContent = ""; }, 2500);
+    } catch (e) { showToast("Lưu cấu hình thất bại: " + e.message, "danger"); }
+  }
+
+  async function runRelogin(dry) {
+    const m = document.getElementById("rl_msg");
+    if (m) m.textContent = dry ? "Đang lập kế hoạch…" : "Đang bắt đầu…";
+    await saveReloginConfig();
+    try {
+      const r = await fetch("/api/relogin/run", { method: "POST", headers: getHeaders(), body: JSON.stringify({ dry_run: !!dry }) });
+      const d = await r.json();
+      if (m) m.textContent = dry ? "" : (d.message || "");
+      if (dry) {
+        renderRelogin({ config: {}, plan: d.plan, recent: [], running: false }, true);
+        await loadRelogin(true);
+      } else {
+        showToast(d.started ? "🔑 Đã bắt đầu đăng nhập lại các TK hết phiên (chạy ngầm)" : (d.message || "Đang có lượt khác chạy"), d.started ? "success" : "warning");
+        await loadRelogin(false);
+      }
+    } catch (e) {
+      if (m) m.textContent = "Lỗi: " + e.message;
+    }
+  }
+
   function isHideLockedOn() {
     const el = document.getElementById("hideLockedAccounts");
     return !!(el && el.checked);
@@ -2642,6 +2785,7 @@
         return;
       }
 
+      if (Date.now() - (window._rlLast || 0) > 20000) { window._rlLast = Date.now(); loadRelogin(false); }
       // Ẩn TK bị khoá (chỉ trên giao diện; TK vẫn bị khoá, không được giao việc)
       const hideLocked = isHideLockedOn();
       const lockedCount = accs.filter(a => a.muse_locked).length;
@@ -2657,7 +2801,7 @@
       tbody.innerHTML = shownAccs.map(a => {
         let statusBadge = `<span class="status-pill unknown">Chưa kiểm tra</span>`;
         if (a.ok === true) statusBadge = `<span class="status-pill good">🟢 Hoạt động</span>`;
-        else if (a.ok === false) statusBadge = `<span class="status-pill bad" title="${a.note || ''}">🔴 Lỗi / Hết hạn</span>`;
+        else if (a.ok === false) statusBadge = `<span class="status-pill bad" title="${translateLegacyNote(a.note || '')}">🔴 Lỗi / Hết hạn</span>`;
 
         let expStr = "Không rõ";
         if (a.expires_at) {
@@ -2672,6 +2816,7 @@
                                  .replace(/会话正常/g, "Phiên hợp lệ")
                                  .replace(/已更新 cookie/g, "Đã cập nhật Cookie")
                                  .replace(/RUNNING/g, "Đang chạy");
+        displayNote = translateLegacyNote(displayNote);
         if (a.muse_locked) displayNote = "🔒 Muse ngắt kết nối TK (Muse is disconnected) — đã khoá, không giao việc · cần gửi ticket cho Muse";
         const noteColor = a.muse_locked ? "#f87171" : (a.ok === true) ? "#34d399" : (a.ok === false ? "#f87171" : "var(--text-dim)");
         const noteHtml = displayNote ? `<div style="font-size:11px;color:${noteColor};margin-top:2px;">${displayNote}</div>` : "";
@@ -2762,13 +2907,60 @@
     return h < 48 ? `${h} giờ trước` : `${Math.round(h / 24)} ngày trước`;
   }
 
+  function formatSuccessTime(ts) {
+    if (!ts) return { short: "", full: "" };
+    const d = new Date(ts * 1000);
+    const pad = n => String(n).padStart(2, "0");
+    const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const hms = `${hm}:${pad(d.getSeconds())}`;
+    const dm = `${pad(d.getDate())}/${pad(d.getMonth() + 1)}`;
+    const full = `${dm}/${d.getFullYear()} ${hms}`;
+    const now = new Date();
+    const sameDay = d.getDate() === now.getDate() && d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+    const rel = ageText(ts);
+    const short = sameDay ? `${rel} (${hm})` : `${rel} (${hm} ${dm})`;
+    return { short, full };
+  }
+
+  function resolveLastSuccessTs(a) {
+    const ok = a.success_count || 0;
+    if (!ok) return 0;
+    let map = window._accSuccessTsMap;
+    if (!map) {
+      try { map = JSON.parse(localStorage.getItem("muse_acc_success_ts_v1") || "{}"); } catch (_) { map = {}; }
+      window._accSuccessTsMap = map;
+    }
+    const prev = map[a.id];
+    const nowSec = Math.floor(Date.now() / 1000);
+    let ts = a.last_success_at ? Math.floor(a.last_success_at) : 0;
+    if (prev && ok > (prev.count || 0)) {
+      ts = Math.max(ts, nowSec);
+      map[a.id] = { count: ok, ts };
+      try { localStorage.setItem("muse_acc_success_ts_v1", JSON.stringify(map)); } catch (_) {}
+    } else if (!prev) {
+      if (!ts && a.last_used) ts = Math.floor(a.last_used);
+      if (ts) {
+        map[a.id] = { count: ok, ts };
+        try { localStorage.setItem("muse_acc_success_ts_v1", JSON.stringify(map)); } catch (_) {}
+      }
+    } else {
+      ts = Math.max(ts, prev.ts || 0);
+    }
+    return ts;
+  }
+
   function successCellHtml(a) {
       const ok = a.success_count || 0, used = Math.max(0, (a.use_count || 0) - (a.success_since_use || 0));
-      if (!used) return `<b>${ok}</b>`;
+      const lastTs = resolveLastSuccessTs(a);
+      const tInfo = formatSuccessTime(lastTs);
+      const timeHtml = ok > 0 && tInfo.short
+        ? `<div style="font-size:10px;color:var(--text-dim);margin-top:2px;" title="Lần cuối tạo video thành công: ${tInfo.full}">🕒 ${tInfo.short}</div>`
+        : (used > 0 ? `<div style="font-size:10px;color:var(--text-dim);margin-top:2px;">Chưa có video</div>` : "");
+      if (!used) return `<b>${ok}</b>${timeHtml}`;
       const rate = Math.min(100, Math.round(ok * 100 / used));
       // Tỉ lệ = video thành công / lượt dùng, đều tính từ lúc bản có cột này. Chỉ cảnh báo khi đã đủ lượt để kết luận.
       const color = used >= 20 && rate < 40 ? "#f87171" : (rate < 70 ? "#fbbf24" : "#4ade80");
-      return `<b>${ok}</b><div style="font-size:10.5px;color:${color};">${rate}% / lượt</div>`;
+      return `<b>${ok}</b><div style="font-size:10.5px;color:${color};">${rate}% / lượt</div>${timeHtml}`;
     }
 
     function quotaCellHtml(q) {
@@ -2971,6 +3163,23 @@
     }
   }
 
+  async function resetAllAccounts() {
+    if (!confirm("Reset lại TOÀN BỘ tài khoản (mở khoá các TK bị khoá/lỗi, xóa mọi thời gian nghỉ cooldown) để chạy lại từ đầu?")) return;
+    try {
+      const res = await fetch("/admin/accounts/reset-all", { method: "POST", headers: getHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        showToast(`✓ Đã reset toàn bộ ${data.reset_count || ""} tài khoản sẵn sàng chạy lại!`, "success");
+        await loadAccounts();
+        await checkServerStatus();
+      } else {
+        showToast(`Không reset được: ${data.detail || data.message || res.status}`, "danger");
+      }
+    } catch (e) {
+      showToast(`Lỗi reset tài khoản: ${e.message}`, "danger");
+    }
+  }
+
   async function deleteAccount(aid) {
     if (!confirm("Bạn có chắc muốn xóa tài khoản này khỏi hệ thống?")) return;
     try {
@@ -3061,7 +3270,10 @@
       if (data.del_img !== undefined) document.getElementById("sp_del_img").checked = !!data.del_img;
       if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
       if (data.auto_claim !== undefined) document.getElementById("sp_auto_claim").checked = !!data.auto_claim;
-      if (data.jobs_per_account) document.getElementById("sp_jobs_per_account").value = String(data.jobs_per_account);
+      if (data.jobs_per_account) {
+        const clampedJobs = Math.max(1, Math.min(2, parseInt(data.jobs_per_account) || 2));
+        document.getElementById("sp_jobs_per_account").value = String(clampedJobs);
+      }
       if (data.skip_exhausted_accounts !== undefined) document.getElementById("skipExhausted").checked = !!data.skip_exhausted_accounts;
       updateShopeeThreadsHint();
       onShopeeDurationChange();
@@ -3139,7 +3351,7 @@
 
   function getShopeeJobsPerAccount() {
     const v = parseInt(document.getElementById("sp_jobs_per_account")?.value) || 2;
-    return Math.max(1, Math.min(4, v));
+    return Math.max(1, Math.min(2, v));
   }
 
   function onShopeeThreadsChange() {
@@ -3405,6 +3617,7 @@
         const results = d.results || {};
         let countFinal = 0, countBoth = 0, countA = 0, countB = 0;
         shopeeClaimedProducts.forEach(p => {
+          p._clipsChecked = true;
           const r = results[String(p.item_id)];
           if (r) {
             if (r.has_final) {
@@ -3788,17 +4001,20 @@
     let clipBFile = is16s ? (prod._clipB || null) : null;
     let finalVideoFile = prod._final_video || null;
 
-    try {
-      const checkRes = await fetch(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}&duration=${checkDuration}`, { headers: getHeaders() });
-      if (checkRes.ok) {
-        const chk = await checkRes.json();
-        if (chk.final_video) finalVideoFile = chk.final_video;
-        if (is16s) {
-          if (chk.clip_a) clipAFile = chk.clip_a;
-          if (chk.clip_b) clipBFile = chk.clip_b;
+    if (!prod._clipsChecked) {
+      try {
+        const checkRes = await fetch(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}&duration=${checkDuration}`, { headers: getHeaders() });
+        if (checkRes.ok) {
+          const chk = await checkRes.json();
+          prod._clipsChecked = true;
+          if (chk.final_video) finalVideoFile = chk.final_video;
+          if (is16s) {
+            if (chk.clip_a) clipAFile = chk.clip_a;
+            if (chk.clip_b) clipBFile = chk.clip_b;
+          }
         }
-      }
-    } catch (_) {}
+      } catch (_) {}
+    }
 
     // TRƯỜNG HỢP 1: ĐÃ CÓ VIDEO HOÀN CHỈNH TRONG THƯ MỤC XUẤT
     if (finalVideoFile) {
@@ -3928,10 +4144,11 @@
     if (effectiveIs16s) {
       appendShopeeLog(`> [Luồng ${workerId}] Chế độ 16s (Prompt A + B): Đang kiểm tra và tạo các clip còn thiếu...`);
 
-      // Xử lý Clip A
-      if (clipAFile) {
-        appendShopeeLog(`⚡ [Luồng ${workerId}] SP ${prod.item_id}: ĐÃ CÓ SẴN CLIP A (${clipAFile}) -> Bỏ qua, không cần tạo lại!`);
-      } else {
+      const makeClipA = async () => {
+        if (clipAFile) {
+          appendShopeeLog(`⚡ [Luồng ${workerId}] SP ${prod.item_id}: ĐÃ CÓ SẴN CLIP A (${clipAFile}) -> Bỏ qua, không cần tạo lại!`);
+          return;
+        }
         appendShopeeLog(`> [Luồng ${workerId}] Đang tạo Clip A (0-8s)...`);
         const rawA = await renderSingleVideoClip(promptData.prompts[0], refImageDataUrl, ar, 8, workerId, "Clip A (0-8s)");
         prod._clipA = rawA;
@@ -3954,12 +4171,13 @@
           clipAFile = rawA;
           appendShopeeLog(`✓ [Luồng ${workerId}] Clip A hoàn tất: ${prod.item_id}-a.mp4`);
         }
-      }
+      };
 
-      // Xử lý Clip B
-      if (clipBFile) {
-        appendShopeeLog(`⚡ [Luồng ${workerId}] SP ${prod.item_id}: ĐÃ CÓ SẴN CLIP B (${clipBFile}) -> Bỏ qua, không cần tạo lại!`);
-      } else {
+      const makeClipB = async () => {
+        if (clipBFile) {
+          appendShopeeLog(`⚡ [Luồng ${workerId}] SP ${prod.item_id}: ĐÃ CÓ SẴN CLIP B (${clipBFile}) -> Bỏ qua, không cần tạo lại!`);
+          return;
+        }
         appendShopeeLog(`> [Luồng ${workerId}] Đang tạo Clip B (8-16s)...`);
         const rawB = await renderSingleVideoClip(promptData.prompts[1], refImageDataUrl, ar, 8, workerId, "Clip B (8-16s)");
         prod._clipB = rawB;
@@ -3982,7 +4200,10 @@
           clipBFile = rawB;
           appendShopeeLog(`✓ [Luồng ${workerId}] Clip B hoàn tất: ${prod.item_id}-b.mp4`);
         }
-      }
+      };
+
+      // Chạy song song cả Clip A và Clip B trên 2 TK độc lập để giảm 50% thời gian chờ mỗi SP 16s
+      await Promise.all([makeClipA(), makeClipB()]);
 
     } else {
       const dur = parseInt(form.duration) || 8;
@@ -4398,10 +4619,10 @@
       }
     }
 
-    // Chuẩn bị sẵn vài SP kế tiếp chưa có luồng nhận, để khi luồng rảnh là gửi render ngay
+    // Chuẩn bị sẵn các SP kế tiếp chưa có luồng nhận (tỉ lệ theo số luồng đang chạy), để khi luồng rảnh là gửi render ngay
     function prefetchUpcoming() {
       if (shopeeStopRequested || shopeeForceStopRequested) return;
-      let slots = SHOPEE_PREFETCH_AHEAD;
+      let slots = Math.max(SHOPEE_PREFETCH_AHEAD, Math.min(32, maxWorkers * 2));
       for (let i = nextIndex; i < shopeeClaimedProducts.length && slots > 0; i++) {
         const p = shopeeClaimedProducts[i];
         if (!p || p._status === "completed" || p._status === "skipped") continue;
@@ -4500,8 +4721,8 @@
       if (shopeeStopRequested || shopeeForceStopRequested) break;
       workerPromises.push(workerLoop(w));
       if (w < maxWorkers) {
-        // Giãn cách khởi động 1.2s giữa các luồng để tránh nghẽn CPU, Chrome CDP và Proxy khi chạy số lượng luồng lớn (20-30 luồng)
-        await new Promise(r => setTimeout(r, 1200));
+        // Giãn cách khởi động 400ms giữa các luồng (nhanh gấp 3 lần mức 1.2s cũ mà vẫn êm CDP/Proxy)
+        await new Promise(r => setTimeout(r, 400));
       }
     }
     await Promise.all(workerPromises);

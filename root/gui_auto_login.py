@@ -41,6 +41,7 @@ DEAD_STATUS = "ACC CHẾT (Muse is disconnected)"
 CHECKPOINT_STATUS = "TK LỖI (Muse chuyển sang Instagram)"
 OTP_READ_ATTEMPTS = 10
 OTP_READ_INTERVAL = 5
+MANUAL_CAPTCHA_WAIT_SEC = 600  # Dừng tối đa 10 phút (600 giây) chờ người dùng nhập Captcha / xác minh bằng tay
 
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
@@ -256,9 +257,11 @@ class LoginWorker(threading.Thread):
         delay_between: int,
         proxy_str: str | None = None,
         use_fingerprint: bool = True,
+        manual_captcha: bool = True,
     ):
         super().__init__()
         self.use_fingerprint = use_fingerprint
+        self.manual_captcha = manual_captcha
         self.worker_id = worker_id
         self.task_queue = task_queue
         self.controller = controller
@@ -449,25 +452,103 @@ class LoginWorker(threading.Thread):
 
     @staticmethod
     def _meta_manual_checkpoint(page) -> bool:
-        """Meta đòi xác minh 'Confirm you're human' (auth.meta.com/checkpoints/...): có thể người dùng xác minh tay."""
+        """Meta/Muse đòi xác minh 'Confirm you're human' hoặc hiện Captcha (auth.meta.com/checkpoints/..., recaptcha/hcaptcha/arkose...)."""
         try:
             url = str(page.url or "").lower()
         except Exception:  # noqa: BLE001
             return False
-        if "auth.meta.com/checkpoints" in url or "/checkpoints/" in url:
+        if any(k in url for k in ("auth.meta.com/checkpoints", "/checkpoints/", "checkpoint", "challenge", "captcha")):
             return True
         try:
-            text = page.run_js("return (document.body && document.body.innerText) || ''") or ""
+            has_captcha = page.run_js("""
+                var t = (document.body && document.body.innerText) || '';
+                if (/confirm you(?:'|\\u2019)?re human|confirm you are human|verify you(?:'|\\u2019)?re human|verify you are human|security check|kiểm tra bảo mật|xác minh bạn là con người/i.test(t)) return true;
+                if (document.querySelector('iframe[src*="captcha" i], iframe[src*="recaptcha" i], iframe[src*="arkose" i], iframe[src*="hcaptcha" i], iframe[src*="funcaptcha" i], [id*="captcha" i], [class*="captcha" i]')) return true;
+                return false;
+            """)
+            return bool(has_captcha)
         except Exception:  # noqa: BLE001
             return False
-        return bool(re.search(r"confirm you(?:'|\u2019)?re human|confirm you are human", str(text), re.IGNORECASE))
 
     def _fail_verify(self, row_idx: int, email: str):
-        """Meta bắt xác minh (Confirm you're human): coi là TK DIE ngay, không chờ xác minh tay; luồng tắt Chrome và sang TK kế."""
-        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Meta bắt xác minh (Confirm you're human) -> báo TK DIE, loại ra (không lưu cookie).")
-        self.controller.update_status(row_idx, "ACC CHẾT (Meta bắt xác minh)", "#ef4444")
-        self.controller.mark_dead(email, "Meta bắt xác minh (Confirm you're human)")
+        """Meta bắt xác minh (Confirm you're human) khi tắt chế độ chờ tay: báo lỗi xác minh, tắt Chrome và sang TK kế."""
+        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Meta bắt xác minh (Confirm you're human) -> bỏ qua TK này (không lưu cookie).")
+        self.controller.update_status(row_idx, "Cần xác minh Captcha tay", "#ef4444")
         self.controller.record_result(False)
+
+    def _wait_manual_captcha(
+        self,
+        page,
+        row_idx: int,
+        email: str,
+        wait_sec: int = MANUAL_CAPTCHA_WAIT_SEC,
+        wait_for_otp_box: bool = False,
+    ) -> tuple[bool, dict, dict]:
+        """Tạm dừng tối đa wait_sec giây (mặc định 10 phút = 600s) để người dùng nhập Captcha / xác minh bằng tay trên trình duyệt."""
+        try:
+            page.activate_tab(0)
+            page.run_cdp("Page.bringToFront")
+        except Exception:  # noqa: BLE001
+            pass
+
+        mins = wait_sec // 60
+        self.controller.log(
+            f"[Luồng {self.worker_id}] [{email}] 🖐 Cần xác minh Captcha bằng tay! "
+            f"Tạm dừng tối đa {mins} phút ({wait_sec}s) để bạn thao tác trên cửa sổ Chrome (Luồng {self.worker_id})..."
+        )
+
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            if not self.controller.is_running:
+                return False, {}, {}
+
+            rem = max(0, int(deadline - time.time()))
+            self.controller.update_status(
+                row_idx,
+                f"🖐 Chờ nhập Captcha tay ({rem // 60:02d}:{rem % 60:02d})...",
+                "#f59e0b",
+            )
+
+            if self._meta_checkpoint(page):
+                self._fail_checkpoint(row_idx, email)
+                return False, {}, {}
+
+            if wait_for_otp_box:
+                try:
+                    is_otp = page.run_js("""
+                        return !!(document.querySelector('input[autocomplete="one-time-code"]') || 
+                                  document.querySelector('input[aria-label="6-digit security code"]') ||
+                                  document.querySelector('input.sr-only'));
+                    """)
+                    if is_otp and not self._meta_manual_checkpoint(page):
+                        self.controller.log(f"[Luồng {self.worker_id}] [{email}] ✓ Đã qua bước xác minh tay! Tiếp tục lấy mã OTP...")
+                        return True, {}, {}
+                except Exception:  # noqa: BLE001
+                    pass
+
+            try:
+                cdp = page.run_cdp("Storage.getCookies")
+                clist = cdp.get("cookies", [])
+                m_cookies = {c["name"]: c["value"] for c in clist if "muse.ai" in c.get("domain", "")}
+                if "hatch_sess" in m_cookies and not self._meta_manual_checkpoint(page):
+                    cookies_exp = {
+                        c["name"]: int(float(c.get("expires", -1)))
+                        for c in clist
+                        if "muse.ai" in c.get("domain", "") and c.get("expires", 0) > 0
+                    }
+                    self.controller.log(f"[Luồng {self.worker_id}] [{email}] ✓ Người dùng đã xác minh Captcha thành công! Tiếp tục nạp cookie...")
+                    return True, m_cookies, cookies_exp
+            except Exception:  # noqa: BLE001
+                pass
+
+            time.sleep(1)
+
+        self.controller.log(
+            f"[Luồng {self.worker_id}] [{email}] ⏰ Quá {mins} phút chờ nhập Captcha bằng tay -> tạm bỏ qua tài khoản này (có thể bấm Retry Lỗi để chạy lại)."
+        )
+        self.controller.update_status(row_idx, "Quá 10p chờ Captcha tay", "#ef4444")
+        self.controller.record_result(False)
+        return False, {}, {}
 
     @staticmethod
     def _muse_disconnected(page, wait_sec: float = 6.0) -> bool:
@@ -630,105 +711,137 @@ class LoginWorker(threading.Thread):
         if self._meta_checkpoint(page):
             self._fail_checkpoint(row_idx, email)
             return
-        if self._meta_manual_checkpoint(page):
-            self._fail_verify(row_idx, email)
-            return
 
-        is_otp = page.run_js("""
-            return !!(document.querySelector('input[autocomplete="one-time-code"]') || 
-                      document.querySelector('input[aria-label="6-digit security code"]') ||
-                      document.querySelector('input.sr-only'));
-        """)
-        if not is_otp:
-            self.controller.update_status(row_idx, "Không hiện ô OTP", "#ef4444")
-            self.controller.record_result(False)
-            return
-
-        # 2. Lấy OTP: email @nguyenmaucole.io.vn đọc qua API hòm thư tạm; email khác (Hotmail OAuth2...) đọc qua DongVanFB
-        if is_mailapi_email(email):
-            otp_code = self._otp_from_mailapi(row_idx, email, mailapi_seen)
-        else:
-            otp_code = self._otp_from_dongvan(page, dongvan_tab, row_idx, acc_line, email)
-
-        if not otp_code:
-            self.controller.update_status(row_idx, f"Không lấy được OTP sau {OTP_READ_ATTEMPTS} lần", "#ef4444")
-            self.controller.record_result(False)
-            return
-
-        self.controller.remember_otp(email, otp_code)
-        self.controller.set_otp(row_idx, otp_code)
-        self.controller.update_status(row_idx, f"Đang điền mã {otp_code}...", "#818cf8")
-        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đã nhận mã OTP mới: {otp_code}. Điền vào Muse.ai...")
-
-        # 3. Điền OTP vào Muse
-        page.activate_tab(0)
-        time.sleep(1)
-
-        page.run_js("""
-            let input = document.querySelector('input[autocomplete="one-time-code"]') || 
-                        document.querySelector('input[aria-label="6-digit security code"]') ||
-                        document.querySelector('input.sr-only');
-            if (input) {
-                input.focus();
-                let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-                setter.call(input, arguments[0]);
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-        """, otp_code)
-
-        time.sleep(2)
-        next_btn = page.ele("text:Next")
-        if next_btn and "disabled" not in str(next_btn.attr("class")).lower() and next_btn.attr("disabled") is None:
-            try:
-                next_btn.click()
-            except Exception:
-                pass
-
-        # 4. Chờ đăng nhập và lấy cookie
-        self.controller.update_status(row_idx, "Chờ xác nhận Muse...", "#a78bfa")
         login_ok = False
         all_cookies = {}
         cookies_exp = {}
 
-        cookie_deadline = time.time() + 34
-        while time.time() < cookie_deadline:
-            if not self.controller.is_running:
-                return
-            time.sleep(2)
-            if self._meta_checkpoint(page):
-                self._fail_checkpoint(row_idx, email)
-                return
-            if self._meta_manual_checkpoint(page):
-                self._fail_verify(row_idx, email)
-                return
-            try:
-                cdp = page.run_cdp("Storage.getCookies")
-                clist = cdp.get("cookies", [])
-                m_cookies = {c["name"]: c["value"] for c in clist if "muse.ai" in c.get("domain", "")}
+        if self._meta_manual_checkpoint(page):
+            if self.manual_captcha:
+                ok_manual, m_cookies, c_exp = self._wait_manual_captcha(
+                    page, row_idx, email, MANUAL_CAPTCHA_WAIT_SEC, wait_for_otp_box=True
+                )
+                if not ok_manual:
+                    return
                 if "hatch_sess" in m_cookies:
                     login_ok = True
                     all_cookies = m_cookies
-                    cookies_exp = {
-                        c["name"]: int(float(c.get("expires", -1)))
-                        for c in clist
-                        if "muse.ai" in c.get("domain", "") and c.get("expires", 0) > 0
-                    }
-                    break
-            except Exception:
-                pass
+                    cookies_exp = c_exp
+                else:
+                    self._otp_not_before = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=2)
+            else:
+                self._fail_verify(row_idx, email)
+                return
 
         if not login_ok:
-            self.controller.update_status(row_idx, "Xác nhận thất bại", "#ef4444")
-            self.controller.record_result(False)
-            return
+            is_otp = page.run_js("""
+                return !!(document.querySelector('input[autocomplete="one-time-code"]') || 
+                          document.querySelector('input[aria-label="6-digit security code"]') ||
+                          document.querySelector('input.sr-only'));
+            """)
+            if not is_otp:
+                self.controller.update_status(row_idx, "Không hiện ô OTP", "#ef4444")
+                self.controller.record_result(False)
+                return
 
-        # 5. Chuyển vào trang làm việc để Muse kích hoạt hatch_gw (Gateway Token)
+            # 2. Lấy OTP: email @nguyenmaucole.io.vn đọc qua API hòm thư tạm; email khác (Hotmail OAuth2...) đọc qua DongVanFB
+            if is_mailapi_email(email):
+                otp_code = self._otp_from_mailapi(row_idx, email, mailapi_seen)
+            else:
+                otp_code = self._otp_from_dongvan(page, dongvan_tab, row_idx, acc_line, email)
+
+            if not otp_code:
+                self.controller.update_status(row_idx, f"Không lấy được OTP sau {OTP_READ_ATTEMPTS} lần", "#ef4444")
+                self.controller.record_result(False)
+                return
+
+            self.controller.remember_otp(email, otp_code)
+            self.controller.set_otp(row_idx, otp_code)
+            self.controller.update_status(row_idx, f"Đang điền mã {otp_code}...", "#818cf8")
+            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đã nhận mã OTP mới: {otp_code}. Điền vào Muse.ai...")
+
+            # 3. Điền OTP vào Muse
+            page.activate_tab(0)
+            time.sleep(1)
+
+            page.run_js("""
+                let input = document.querySelector('input[autocomplete="one-time-code"]') || 
+                            document.querySelector('input[aria-label="6-digit security code"]') ||
+                            document.querySelector('input.sr-only');
+                if (input) {
+                    input.focus();
+                    let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                    setter.call(input, arguments[0]);
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            """, otp_code)
+
+            time.sleep(2)
+            next_btn = page.ele("text:Next")
+            if next_btn and "disabled" not in str(next_btn.attr("class")).lower() and next_btn.attr("disabled") is None:
+                try:
+                    next_btn.click()
+                except Exception:
+                    pass
+
+            # 4. Chờ đăng nhập và lấy cookie (nếu bị yêu cầu nhập Captcha tay sau OTP thì dừng 10 phút chờ người dùng)
+            self.controller.update_status(row_idx, "Chờ xác nhận Muse...", "#a78bfa")
+            need_manual_captcha = False
+
+            cookie_deadline = time.time() + 34
+            while time.time() < cookie_deadline:
+                if not self.controller.is_running:
+                    return
+                time.sleep(2)
+                if self._meta_checkpoint(page):
+                    self._fail_checkpoint(row_idx, email)
+                    return
+                if self._meta_manual_checkpoint(page):
+                    need_manual_captcha = True
+                    break
+                try:
+                    cdp = page.run_cdp("Storage.getCookies")
+                    clist = cdp.get("cookies", [])
+                    m_cookies = {c["name"]: c["value"] for c in clist if "muse.ai" in c.get("domain", "")}
+                    if "hatch_sess" in m_cookies:
+                        login_ok = True
+                        all_cookies = m_cookies
+                        cookies_exp = {
+                            c["name"]: int(float(c.get("expires", -1)))
+                            for c in clist
+                            if "muse.ai" in c.get("domain", "") and c.get("expires", 0) > 0
+                        }
+                        break
+                except Exception:
+                    pass
+
+            if not login_ok:
+                if self.manual_captcha:
+                    ok_manual, m_cookies, c_exp = self._wait_manual_captcha(
+                        page, row_idx, email, MANUAL_CAPTCHA_WAIT_SEC
+                    )
+                    if not ok_manual:
+                        return
+                    login_ok = True
+                    all_cookies = m_cookies
+                    cookies_exp = c_exp
+                else:
+                    if need_manual_captcha:
+                        self._fail_verify(row_idx, email)
+                    else:
+                        self.controller.update_status(row_idx, "Xác nhận thất bại", "#ef4444")
+                        self.controller.record_result(False)
+                    return
+
+        # 5. Chuyển vào trang làm việc để Muse kích hoạt hatch_gw (Gateway Token) và hatch_vml
         self.controller.update_status(row_idx, "Đang nạp hatch_gw...", "#a78bfa")
         try:
             page.get("https://muse.ai/thread/new")
-            for _ in range(6):
+            for _ in range(10):
                 time.sleep(1)
+                if self._meta_manual_checkpoint(page):
+                    break
                 cdp = page.run_cdp("Storage.getCookies")
                 clist = cdp.get("cookies", [])
                 for c in clist:
@@ -736,15 +849,39 @@ class LoginWorker(threading.Thread):
                         all_cookies[c["name"]] = c["value"]
                         if c.get("expires", 0) > 0:
                             cookies_exp[c["name"]] = int(float(c.get("expires")))
-                if "hatch_gw" in all_cookies:
-                    self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đã nhận đầy đủ 4 cookie cốt lõi (kể cả hatch_gw).")
+                if "hatch_gw" in all_cookies and "hatch_vml" in all_cookies:
+                    self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đã nhận đầy đủ 4 cookie cốt lõi (kể cả hatch_gw & hatch_vml).")
                     break
         except Exception:
             pass
 
         if self._meta_manual_checkpoint(page):
-            self._fail_verify(row_idx, email)
-            return
+            if self.manual_captcha:
+                ok_manual, m_cookies, c_exp = self._wait_manual_captcha(
+                    page, row_idx, email, MANUAL_CAPTCHA_WAIT_SEC
+                )
+                if not ok_manual:
+                    return
+                all_cookies.update(m_cookies)
+                cookies_exp.update(c_exp)
+                try:
+                    page.get("https://muse.ai/thread/new")
+                    for _ in range(8):
+                        time.sleep(1)
+                        cdp = page.run_cdp("Storage.getCookies")
+                        for c in cdp.get("cookies", []):
+                            if "muse.ai" in c.get("domain", ""):
+                                all_cookies[c["name"]] = c["value"]
+                                if c.get("expires", 0) > 0:
+                                    cookies_exp[c["name"]] = int(float(c["expires"]))
+                        if "hatch_gw" in all_cookies:
+                            break
+                except Exception:
+                    pass
+            else:
+                self._fail_verify(row_idx, email)
+                return
+
         if self._meta_checkpoint(page):
             self._fail_checkpoint(row_idx, email)
             return
@@ -797,12 +934,14 @@ class WorkerController(QThread):
         use_fingerprint: bool = True,
         proxy_source: str = PROXY_SRC_APP,
         webshare_key: str = "",
+        manual_captcha: bool = True,
     ):
         super().__init__()
         self.proxy_source = proxy_source
         self.webshare_key = webshare_key
         self.use_proxy = use_proxy
         self.use_fingerprint = use_fingerprint
+        self.manual_captcha = manual_captcha
         self._used_otps: dict[str, set[str]] = {}
         self.accounts = accounts
         self.tasks = tasks if tasks is not None else [(idx, acc) for idx, acc in enumerate(accounts)]
@@ -848,6 +987,7 @@ class WorkerController(QThread):
                 delay_between=self.delay_between,
                 proxy_str=worker_proxies[i],
                 use_fingerprint=self.use_fingerprint,
+                manual_captcha=self.manual_captcha,
             )
             workers.append(w)
             w.start()
@@ -1250,6 +1390,14 @@ class MainWindow(QMainWindow):
         self.chk_save_store.setToolTip("Cập nhật trực tiếp vào data/accounts.json")
         row2.addWidget(self.chk_save_store)
 
+        self.chk_manual_captcha = QCheckBox("Chờ xác minh Captcha tay (10 phút)")
+        self.chk_manual_captcha.setChecked(True)
+        self.chk_manual_captcha.setToolTip(
+            "Khi đăng nhập Muse và điền OTP xong nếu bị yêu cầu nhập Captcha / xác minh con người, "
+            "phần mềm sẽ tạm dừng tối đa 10 phút (600s) để bạn thao tác trên trình duyệt Chrome."
+        )
+        row2.addWidget(self.chk_manual_captcha)
+
         row2.addStretch()
         ctrl_layout.addLayout(row2)
 
@@ -1529,6 +1677,10 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(True)
         num_threads = self.spin_threads.value()
         delay = self.spin_delay.value()
+        manual_captcha = self.chk_manual_captcha.isChecked()
+        if manual_captcha and self.chk_headless.isChecked():
+            self.chk_headless.setChecked(False)
+            self.log("[!] Đã tự động bỏ tích 'Chạy ngầm (Ẩn cửa sổ Chrome)' để bạn có thể nhập Captcha bằng tay trên trình duyệt.")
         headless = self.chk_headless.isChecked()
         save_store = self.chk_save_store.isChecked()
 
@@ -1540,6 +1692,7 @@ class MainWindow(QMainWindow):
             delay_between=delay,
             use_proxy=self.chk_proxy.isChecked(),
             use_fingerprint=self.chk_fp.isChecked(),
+            manual_captcha=manual_captcha,
             **self._proxy_source_args(),
         )
         self.controller.log_signal.connect(self.log)
@@ -1559,8 +1712,8 @@ class MainWindow(QMainWindow):
             # Dòng đã thành công thì bỏ qua
             if "thành công" in st.lower() or st.startswith("✓"):
                 continue
-            # TK đã bị Muse khoá (chết): loại ra, không chạy lại
-            if st.startswith("ACC CHẾT"):
+            # TK đã bị Muse khoá vĩnh viễn (Muse is disconnected): loại ra, không chạy lại
+            if st == DEAD_STATUS:
                 continue
             # Dòng chưa chạy bao giờ thì bỏ qua (nếu đang tìm lỗi cụ thể)
             if st == "Sẵn sàng":
@@ -1619,6 +1772,10 @@ class MainWindow(QMainWindow):
 
         num_threads = self.spin_threads.value()
         delay = self.spin_delay.value()
+        manual_captcha = self.chk_manual_captcha.isChecked()
+        if manual_captcha and self.chk_headless.isChecked():
+            self.chk_headless.setChecked(False)
+            self.log("[!] Đã tự động bỏ tích 'Chạy ngầm (Ẩn cửa sổ Chrome)' để bạn có thể nhập Captcha bằng tay trên trình duyệt.")
         headless = self.chk_headless.isChecked()
         save_store = self.chk_save_store.isChecked()
 
@@ -1642,6 +1799,7 @@ class MainWindow(QMainWindow):
             delay_between=delay,
             use_proxy=self.chk_proxy.isChecked(),
             use_fingerprint=self.chk_fp.isChecked(),
+            manual_captcha=manual_captcha,
             tasks=tasks,
             **self._proxy_source_args(),
         )

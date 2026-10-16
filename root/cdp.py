@@ -58,7 +58,7 @@ class CDP:
             try:
                 self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
             except (websocket.WebSocketException, OSError) as exc:
-                raise CDPError(f"{method}: CDP 连接已断开 ({type(exc).__name__})") from None
+                raise CDPError(f"{method}: Kết nối CDP đã ngắt ({type(exc).__name__})") from None
             deadline = time.time() + (timeout or self.timeout)
             while time.time() < deadline:
                 try:
@@ -67,14 +67,14 @@ class CDP:
                     continue
                 except (websocket.WebSocketException, OSError) as exc:
                     # 连接已关闭/损坏：立即失败，避免 100% CPU 空转到 deadline
-                    raise CDPError(f"{method}: CDP 连接已断开 ({type(exc).__name__})") from None
+                    raise CDPError(f"{method}: Kết nối CDP đã ngắt ({type(exc).__name__})") from None
                 except ValueError:  # 非 JSON 帧（例如 close 帧返回的空串）
                     continue
                 if msg.get("id") == mid:
                     if "error" in msg:
                         raise CDPError(f"{method}: {msg['error']}")
                     return msg
-            raise TimeoutError(f"CDP {method} 超时")
+            raise TimeoutError(f"CDP {method} quá thời gian")
 
     def js(self, expr: str, await_promise: bool = False, timeout: float | None = None):
         r = self.send("Runtime.evaluate",
@@ -96,7 +96,7 @@ class CDP:
                 except (websocket.WebSocketTimeoutException, socket.timeout):
                     continue
                 except (websocket.WebSocketException, OSError) as exc:
-                    raise CDPError(f"pump: CDP 连接已断开 ({type(exc).__name__})") from None
+                    raise CDPError(f"pump: Kết nối CDP đã ngắt ({type(exc).__name__})") from None
                 except ValueError:
                     continue
                 if on_event and "method" in ev:

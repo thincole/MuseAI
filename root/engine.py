@@ -50,29 +50,29 @@ def _check_public_http_url(url: str) -> str | None:
     try:
         parsed = urllib.parse.urlsplit(url)
     except ValueError:
-        return "URL 无法解析"
+        return "Không phân tích được URL"
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return "仅允许 http(s) URL"
+        return "Chỉ cho phép URL http(s)"
     try:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
     except ValueError:
-        return "端口非法"
+        return "Cổng không hợp lệ"
     try:
         infos = socket.getaddrinfo(parsed.hostname, port, proto=socket.IPPROTO_TCP)
     except (socket.gaierror, UnicodeError, OSError) as exc:
-        return f"域名解析失败 ({type(exc).__name__})"
+        return f"Phân giải tên miền thất bại ({type(exc).__name__})"
     if not infos:
-        return "域名解析失败"
+        return "Phân giải tên miền thất bại"
     for info in infos:
         try:
             ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
         except ValueError:
-            return "解析到非法地址"
+            return "Phân giải ra địa chỉ không hợp lệ"
         if ip.version == 6 and ip.ipv4_mapped:
             ip = ip.ipv4_mapped
         if (ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved
                 or ip.is_multicast or ip.is_unspecified or not ip.is_global):
-            return f"目标地址 {ip} 不是公网地址"
+            return f"Địa chỉ đích {ip} không phải địa chỉ công cộng"
     return None
 
 
@@ -82,7 +82,7 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         why = _check_public_http_url(newurl)
         if why:
-            raise urllib.error.URLError(f"重定向目标被拒绝: {why}")
+            raise urllib.error.URLError(f"Đích chuyển hướng bị từ chối: {why}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -170,9 +170,9 @@ def _parse_js_json(raw) -> dict:
     try:
         info = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:  # noqa: BLE001
-        return {"ok": False, "err": f"解析失败 {str(raw)[:150]}"}
+        return {"ok": False, "err": f"Phân tích thất bại {str(raw)[:150]}"}
     if not isinstance(info, dict):
-        return {"ok": False, "err": f"解析失败 {str(raw)[:150]}"}
+        return {"ok": False, "err": f"Phân tích thất bại {str(raw)[:150]}"}
     return info
 
 
@@ -187,7 +187,7 @@ def _cdp_extract_media(page: CDP, src: str) -> dict:
         info = _parse_js_json(page.js(_EXTRACT_PREP_JS % (json.dumps(src), json.dumps(key)),
                                       await_promise=True, timeout=600))
         if not info.get("ok"):
-            return {"ok": False, "err": info.get("err", "未知")}
+            return {"ok": False, "err": info.get("err", "không rõ")}
         try:
             size = int(info.get("size") or 0)
         except (TypeError, ValueError):
@@ -251,22 +251,22 @@ def _http_download_media(url: str, proxies: dict | None, cookie_header: str = ""
         # 登录页/错误页不是媒体：交给 CDP 兜底，避免把 HTML 当成品保存
         if base_mime.startswith("text/") or base_mime in (
                 "application/json", "application/xml", "application/xhtml+xml"):
-            return None, f"非媒体响应 ({base_mime})"
+            return None, f"Phản hồi không phải media ({base_mime})"
         try:
             clen = int(resp.headers.get("content-length") or 0)
         except ValueError:
             clen = 0
         if clen > MAX_DIRECT_DOWNLOAD_BYTES:
-            return None, f"超过大小上限 ({clen} bytes)"
+            return None, f"Vượt quá dung lượng tối đa ({clen} bytes)"
         buf = bytearray()
         for chunk in resp.iter_content(chunk_size=1 << 20):
             if not chunk:
                 continue
             buf += chunk
             if len(buf) > MAX_DIRECT_DOWNLOAD_BYTES:
-                return None, "超过大小上限"
+                return None, "Vượt quá dung lượng tối đa"
         if len(buf) <= 1024:
-            return None, f"内容过小 ({len(buf)} bytes)"
+            return None, f"Nội dung quá nhỏ ({len(buf)} bytes)"
         return bytes(buf), mime
 
 # 决定账号生死的核心 cookie（缺失或过期 = 会话失效）
@@ -472,7 +472,7 @@ class MuseEngine:
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 time.sleep(1)
-        raise MuseGenerationError(f"Chromium 启动失败: {last}")
+        raise MuseGenerationError(f"Chromium khởi động thất bại: {last}")
 
     def kill_orphaned_chromes(self):
         """Quét và tiêu diệt triệt để tất cả tiến trình Chrome mồ côi (zombie) thuộc về MuseAI để không chiếm RAM."""
@@ -567,24 +567,26 @@ class MuseEngine:
         except requests.RequestException as exc:
             # 不回显请求内容：异常可能包含带凭据的代理 URL。
             raise MuseGenerationError(
-                f"/api/session 网络请求失败 ({type(exc).__name__})；请检查服务器网络/代理后重试") from None
+                f"/api/session lỗi kết nối mạng ({type(exc).__name__}); hãy kiểm tra mạng/proxy của máy chủ rồi thử lại") from None
         if r.status_code == 401:
-            raise MuseAuthError("会话认证失败 (/api/session HTTP 401)，请在官网确认登录后重新导入 cookie")
+            raise MuseAuthError("Xác thực phiên thất bại (/api/session HTTP 401), hãy đăng nhập lại trên trang chính thức rồi nhập lại cookie")
         if r.status_code != 200:
-            hint = ("访问被拒绝，请检查服务器出口/地区/访问限制；不能据此判定 Cookie 失效"
-                    if r.status_code == 403 else "上游请求未成功，请稍后重试并检查服务器网络")
-            raise MuseGenerationError(f"/api/session HTTP {r.status_code}：{hint}")
+            hint = ("Truy cập bị từ chối, hãy kiểm tra IP ra/khu vực/giới hạn truy cập của máy chủ; không thể kết luận cookie đã hỏng"
+                    if r.status_code == 403 else "Yêu cầu tới máy chủ gốc chưa thành công, hãy thử lại sau và kiểm tra mạng máy chủ")
+            raise MuseGenerationError(f"/api/session HTTP {r.status_code}: {hint}")
         try:
             sj = r.json()
         except ValueError:
-            raise MuseGenerationError("/api/session HTTP 200 返回非 JSON；会话状态未确认") from None
-        if not isinstance(sj, dict) or sj.get("status") != "assigned":
-            raise MuseGenerationError("/api/session HTTP 200 未返回 assigned 会话；请在官网检查账号/工作区状态")
+            raise MuseGenerationError("/api/session HTTP 200 trả về không phải JSON; chưa xác nhận được trạng thái phiên") from None
         for c in r.cookies:
             if c.value:
                 cur_cookies[c.name] = c.value
             if c.expires:
                 cur_exp[c.name] = int(float(c.expires))
+        if not isinstance(sj, dict) or sj.get("status") != "assigned":
+            if not cur_cookies.get("hatch_vml") or sj.get("status") in ("unauthenticated", "logged_out", "unauthorized", None):
+                raise MuseAuthError("Thiếu cookie máy ảo (hatch_vml) hoặc chưa hoàn tất đăng nhập (/api/session không trả về phiên assigned) — cần lấy lại cookie mới")
+            raise MuseGenerationError("/api/session HTTP 200 không trả về phiên assigned; hãy kiểm tra trạng thái tài khoản/không gian làm việc trên trang chính thức")
         vm_id = sj.get("vm_id")
         vm_state = sj.get("vm_state")
         wake_ok = False
@@ -771,7 +773,7 @@ class MuseEngine:
             except MuseAuthError:
                 raise
             except Exception as e:
-                log.warning("预续签 /api/session 失败（继续尝试浏览器加载）: %s", e)
+                log.warning("Gia hạn trước /api/session thất bại (vẫn thử tải bằng trình duyệt): %s", e)
 
         page = self._open_page()
         self._apply_cookies(page, cookies, expires)
@@ -801,9 +803,9 @@ class MuseEngine:
             body = ""
         page.close()
         if re.search(r"log in|sign in|create an account|登录|use another account", body):
-            raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
-                                "请用浏览器扩展重新导入 cookie")
-        raise MuseGenerationError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
+            raise MuseAuthError("Phiên đã bị muse.ai đăng xuất (có thể do đăng nhập nơi khác hoặc bị kiểm soát rủi ro), "
+                                "hãy nhập lại cookie bằng tiện ích trình duyệt")
+        raise MuseGenerationError("Trang muse.ai tải quá thời gian (không thấy ô chat), hãy kiểm tra mạng máy chủ rồi thử lại; chưa xác nhận phiên đã hỏng")
 
     def refresh(self, cookies: dict, expires: dict | None = None):
         if self.page:
@@ -861,9 +863,9 @@ class MuseEngine:
     _MENU_ITEM_JS = (
         "(function(){"
         "var els=[...document.querySelectorAll('div,span,li,[role=menuitem],button')]"
-        ".filter(function(e){return e.offsetParent!==null"
-        "&&(e.textContent||'').trim()==='Settings'"
-        "&&e.getAttribute('aria-label')!=='Settings'"
+        ".filter(function(e){var t=(e.textContent||'').trim();return e.offsetParent!==null"
+        "&&(t==='Settings'||t==='Cài đặt')"
+        "&&e.getAttribute('aria-label')!=='Settings'&&e.getAttribute('aria-label')!=='Cài đặt'"
         "&&e.children.length<=3;});"
         "if(!els.length)return null;"
         "var el=els[els.length-1];var r=el.getBoundingClientRect();"
@@ -873,11 +875,11 @@ class MuseEngine:
     def _read_quota(self, p) -> dict:
         time.sleep(1)
 
-        # 1)+2) Bấm nút Settings (aria-label=Settings) rồi tìm mục "Settings" trong menu bật ra.
+        # 1)+2) Bấm nút Settings / Cài đặt rồi tìm mục "Settings" / "Cài đặt" trong menu bật ra.
         # Qua proxy trang tải chậm: nút có sẵn nhưng giao diện chưa gắn xong sự kiện -> bấm lại tối đa 4 lần.
         menu_pt = None
         for attempt in range(4):
-            raw = p.js(self._CLICK_JS % json.dumps('button[aria-label="Settings"]'))
+            raw = p.js(self._CLICK_JS % json.dumps('button[aria-label="Settings"], button[aria-label="Cài đặt"]'))
             if not raw:
                 time.sleep(2.0)
                 continue
@@ -893,7 +895,7 @@ class MuseEngine:
                 break
             time.sleep(1.5)
         if not menu_pt:
-            raise MuseGenerationError("Settings 菜单未弹出（đã thử 4 lần）")
+            raise MuseGenerationError("Menu Settings không hiện ra (đã thử 4 lần)")
         self._click_point(menu_pt["x"], menu_pt["y"], p)
         time.sleep(3.0)
 
@@ -903,7 +905,7 @@ class MuseEngine:
             txt = p.js(
                 "(function(){var d=document.querySelector('[role=dialog],[aria-modal=true]');"
                 "return d?(d.innerText||''):'';})()") or ""
-            if "% used" in txt or "used (" in txt or "tokens left" in txt:
+            if any(k in txt for k in ("% used", "used (", "tokens left", "Đã dùng", "còn ", "Gói miễn phí")):
                 break
             time.sleep(1.2)
 
@@ -918,29 +920,28 @@ class MuseEngine:
 
     @staticmethod
     def _parse_quota(txt: str) -> dict:
-        """从设置面板文本解析额度字段。"""
+        """从设置面板文本解析额度字段（支持英文与越南语界面）。"""
         lines = [ln.strip() for ln in (txt or "").split("\n") if ln.strip()]
         out: dict = {"raw": "\n".join(lines[:40])}
-        # 计划名：Free plan / xxx plan
+        # 计划名：Free plan / xxx plan / Gói miễn phí
         for ln in lines:
-            m = re.match(r"^(.+?)\s*plan$", ln, re.I)
-            if m:
+            if re.match(r"^(?:.+?\s*plan|Gói\s+.+)$", ln, re.I):
                 out["plan"] = ln
                 break
-        # Weekly limit resets on Sep 30
-        m = re.search(r"Weekly limit resets? on (.+)", txt or "")
+        # Weekly limit resets on Sep 30 / Giới hạn hàng tuần sẽ đặt lại vào 17 tháng 10
+        m = re.search(r"(?:Weekly limit resets? on|Giới hạn hàng tuần sẽ đặt lại vào)\s+(.+)", txt or "", re.I)
         if m:
             out["weekly_reset"] = m.group(1).strip()
-        # 周用量：第一个 "N% used"（出现在 plan 行之后）
-        m = re.search(r"(\d+)%\s*used", txt or "")
+        # 周用量：第一个 "N% used" 或 "Đã dùng N%"
+        m = re.search(r"(?:(\d+)%\s*used|Đã\s*dùng\s*(\d+)%)", txt or "", re.I)
         if m:
-            out["weekly_used_pct"] = int(m.group(1))
-        # 额外代币："0% used (2B tokens left)"
-        m = re.search(r"(\d+)%\s*used\s*\(([^)]+)\)", txt or "")
+            out["weekly_used_pct"] = int(m.group(1) or m.group(2))
+        # 额外代币："0% used (2B tokens left)" 或 "Đã dùng 100% (còn 0 token)"
+        m = re.search(r"(?:(\d+)%\s*used|Đã\s*dùng\s*(\d+)%)\s*\(([^)]+)\)", txt or "", re.I)
         if m:
-            out["extra_used_pct"] = int(m.group(1))
-            out["extra_left"] = m.group(2).strip()
-        if "Never expires" in (txt or ""):
+            out["extra_used_pct"] = int(m.group(1) or m.group(2))
+            out["extra_left"] = m.group(3).strip()
+        if re.search(r"Never expires|Không bao giờ hết hạn", txt or "", re.I):
             out["extra_expires"] = "never"
         out["found"] = bool(out.get("plan") or "weekly_used_pct" in out)
         return out
@@ -1019,7 +1020,7 @@ class MuseEngine:
             "return JSON.stringify({x:Math.round(r.left+r.width/2),"
             "y:Math.round(r.top+r.height/2)});})()")
         if not rect:
-            raise MuseGenerationError("找不到聊天输入框")
+            raise MuseGenerationError("Không tìm thấy ô nhập chat")
         c = json.loads(rect)
         for t in ("mousePressed", "mouseReleased"):
             self.page.send("Input.dispatchMouseEvent",
@@ -1107,7 +1108,7 @@ class MuseEngine:
         fallback_since = 0.0
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
-                raise MuseGenerationError("客户端已断开连接，终止生成任务")
+                raise MuseGenerationError("Máy khách đã ngắt kết nối, dừng tác vụ tạo")
             time.sleep(0.6)
             self._scroll_bottom()
             atts = self.attachments()
@@ -1178,26 +1179,28 @@ class MuseEngine:
             except Exception:
                 st = {}
             tail = st.get("tail") or ""
-            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail):
-                raise MuseGenerationError("账号额度不足")
-            # Sidebar/stale connection text does not prove this generation failed.
-            # The caller's generation deadline remains the bounded timeout.
-            # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件），且并非正在生成媒体的报告
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
+            combined_txt = f"{cur_txt}\n{tail}"
+            if _QUOTA_EXHAUSTED_RE.search(combined_txt):
+                raise MuseGenerationError("Tài khoản đã hết hạn ngạch tạo video 24h (Muse báo hết quota)")
+            if _REGION_BLOCKED_RE.search(combined_txt):
+                raise MuseGenerationError("Khu vực/Proxy không hỗ trợ tạo video (403 Region Blocked)")
+            if _VM_IMAGE_PATH_ERR_RE.search(combined_txt):
+                raise MuseGenerationError("Máy ảo Muse đọc sai đường dẫn ảnh tham chiếu — đổi sang tài khoản khác")
+            # Sidebar/stale connection text does not prove this generation failed.
+            # The caller's generation deadline remains the bounded timeout.
+            # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件）
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
-                # 检查是否包含媒体文件生成关键词（如 .webp, .png, .mp4, imagine_media 等），若是则说明正在产出媒体，绝不能误判为纯文本拒答
                 is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact", cur_txt, re.I))
-                if not is_media_report:
-                    if cur_txt == last_txt:
-                        txt_stable += 1
-                    else:
-                        last_txt, txt_stable = cur_txt, 0
-                    if txt_stable >= 15 and elapsed > 8.0:
-                        raise MuseGenerationError(f"模型未生成媒体，仅返回文本: {cur_txt[:120]}")
+                if cur_txt == last_txt:
+                    txt_stable += 1
                 else:
-                    txt_stable = 0
+                    last_txt, txt_stable = cur_txt, 0
+                need_stable = 35 if is_media_report else 8
+                if txt_stable >= need_stable and elapsed > 6.0:
+                    raise MuseGenerationError(f"Mô hình không sinh video, chỉ phản hồi văn bản: {cur_txt[:120]}")
             else:
                 txt_stable = 0
         return None
@@ -1331,7 +1334,7 @@ class MuseEngine:
                     except Exception:
                         tail = ""
                     if "Still sending" in tail or "Connecting..." in tail:
-                        raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
+                        raise MuseGenerationError("Kết nối VM đám mây quá thời gian (Still sending)")
                 continue
 
             delta = cur[len(sent):] if cur.startswith(sent) else cur
@@ -1343,7 +1346,7 @@ class MuseEngine:
                 break
 
         if not got_first:
-            raise MuseGenerationError("等待助手首字响应超时")
+            raise MuseGenerationError("Hết thời gian chờ trợ lý trả lời chữ đầu tiên")
 
         # 2. 持续捕获增量文本
         while time.time() < deadline:
@@ -1369,7 +1372,7 @@ class MuseEngine:
                 if has_stop and stable >= 32:
                     return
 
-        raise MuseGenerationError("等待助手回复超时")
+        raise MuseGenerationError("Hết thời gian chờ trợ lý trả lời")
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
              timeout: int | None = None, account_id: str | None = None) -> str:
@@ -1386,7 +1389,7 @@ class MuseEngine:
             if data:
                 return data, mime, url
         # blob:/data: 或直连失败：经 CDP 分块读取
-        last = "未知"
+        last = "không rõ"
         for _ in range(retries):
             try:
                 info = _cdp_extract_media(self.page, src)
@@ -1394,9 +1397,9 @@ class MuseEngine:
                 info = {"ok": False, "err": f"{type(exc).__name__}: {str(exc)[:150]}"}
             if info.get("ok"):
                 return info["data"], info.get("mime", ""), info.get("url", "")
-            last = info.get("err", "未知")
+            last = info.get("err", "không rõ")
             time.sleep(2)
-        raise MuseGenerationError(f"未能取回生成结果: {last}")
+        raise MuseGenerationError(f"Không lấy lại được kết quả tạo: {last}")
 
     def _direct_python_download(self, url: str) -> tuple[bytes | None, str, str]:
         """Tải trực tiếp byte media từ URL qua Python requests (bỏ qua CORS trình duyệt)."""
@@ -1484,7 +1487,7 @@ class MuseEngine:
             # SSRF 防护：只允许解析到公网地址的 URL（重定向的每一跳也会校验）
             why = _check_public_http_url(img)
             if why:
-                log.warning("拒绝下载远程参考图（%s）", why)
+                log.warning("Từ chối tải ảnh tham chiếu từ xa (%s)", why)
                 return "", "image/png"
             try:
                 req = urllib.request.Request(img, headers={"User-Agent": "Mozilla/5.0"})
@@ -1493,21 +1496,21 @@ class MuseEngine:
                 with opener.open(req, timeout=20) as resp:
                     mime = resp.headers.get_content_type() or "image/png"
                     if not mime.startswith("image/"):
-                        log.warning("参考图 URL 返回的不是图片 (%s)，已忽略", mime)
+                        log.warning("URL ảnh tham chiếu trả về không phải ảnh (%s), đã bỏ qua", mime)
                         return "", "image/png"
                     # 多读 1 字节用来判断是否超限，避免把超大文件整个读进内存
                     data = resp.read(MAX_REFERENCE_IMAGE_BYTES + 1)
                     if len(data) > MAX_REFERENCE_IMAGE_BYTES:
-                        log.warning("参考图超过 %d MB，已忽略", MAX_REFERENCE_IMAGE_BYTES >> 20)
+                        log.warning("Ảnh tham chiếu vượt quá %d MB, đã bỏ qua", MAX_REFERENCE_IMAGE_BYTES >> 20)
                         return "", "image/png"
                     return base64.b64encode(data).decode("ascii"), mime
             except Exception as e:
-                log.warning("下载远程参考图失败: %s", e)
+                log.warning("Tải ảnh tham chiếu từ xa thất bại: %s", e)
                 return "", "image/png"
         # 不再接受服务器本地文件路径：任何持有 API key 的调用方都能借此读取本机任意文件
         # （.env、accounts.json…）并上传到 muse.ai。本地图片请由客户端转成 data URL 再提交。
         if len(img) < 4096 and os.path.exists(img):
-            log.warning("拒绝使用服务器本地文件作为参考图: %s", os.path.basename(img))
+            log.warning("Từ chối dùng tệp cục bộ của máy chủ làm ảnh tham chiếu: %s", os.path.basename(img))
             return "", "image/png"
         return img, "image/png"
 
@@ -1534,7 +1537,7 @@ class MuseEngine:
             return
         b64, mime = self._normalize_image(image_data)
         if not b64:
-            raise MuseGenerationError("参考图读取失败，已停止生成")
+            raise MuseGenerationError("Đọc ảnh tham chiếu thất bại, đã dừng tạo")
 
         self._clear_attachments()
 
@@ -1583,9 +1586,9 @@ class MuseEngine:
             raw_res = self.page.js(_INJECT_JS % (json.dumps(b64), json.dumps(mime)))
             res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
             if not res_obj.get("ok"):
-                raise MuseGenerationError("附加参考图失败，已停止生成")
+                raise MuseGenerationError("Đính kèm ảnh tham chiếu thất bại, đã dừng tạo")
         except Exception as e:
-            raise MuseGenerationError("附加参考图失败，已停止生成") from e
+            raise MuseGenerationError("Đính kèm ảnh tham chiếu thất bại, đã dừng tạo") from e
 
         # 等待输入框附件确认；历史图片不能证明本次上传成功。
         # 现网 UI 已切中文：确认按钮 aria-label = "附加文件"/"移除附件"；
@@ -1613,7 +1616,7 @@ class MuseEngine:
                 break
             time.sleep(0.3)
         else:
-            raise MuseGenerationError("参考图上传未确认，已停止生成")
+            raise MuseGenerationError("Chưa xác nhận tải ảnh tham chiếu, đã dừng tạo")
         time.sleep(0.5)
     # ---------------- 主流程 ----------------
     def generate(self, cookies: dict, prompt: str, expect: str = "image",
@@ -1633,7 +1636,7 @@ class MuseEngine:
         baseline_src = base.get("src") or ""
         base_agent_cnt = self._agent_count()
         if self._send(prompt) not in ("clicked", "enter-sent"):
-            raise MuseGenerationError("提示词发送未确认，已停止生成")
+            raise MuseGenerationError("Chưa xác nhận đã gửi prompt, đã dừng tạo")
         att = self._wait_attachment(
             baseline_src, timeout, expect, on_progress=on_progress,
             base_agent_cnt=base_agent_cnt, base_att_cnt=len(atts_before),
@@ -1641,7 +1644,7 @@ class MuseEngine:
         )
         if not att:
             self._debug_dump("no-attachment")
-            raise MuseGenerationError("等待生成超时，未出现新的生成结果")
+            raise MuseGenerationError("Hết thời gian chờ tạo, chưa có kết quả mới")
 
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         data = mime = url = None
@@ -1749,7 +1752,7 @@ class MuseEngine:
             except Exception as pe:
                 log.warning("Không thể cấu hình proxy cho TK %s: %s", account_id, pe)
 
-        if not account_id or (now_ts - self._last_http_renew.get(account_id, 0) > 600):
+        if not account_id or not cookies.get("hatch_vml") or (now_ts - self._last_http_renew.get(account_id, 0) > 600):
             try:
                 renew_proxy = f"http://127.0.0.1:{forwarder_port}" if forwarder_port else None
                 renewed = self.renew_session_http(cookies, expires, wake_vm=not BROWSER_MANAGES_VM,
@@ -1760,8 +1763,12 @@ class MuseEngine:
                     expires = renewed["cookies_exp"]
                 if account_id:
                     self._last_http_renew[account_id] = now_ts
+            except MuseAuthError:
+                raise
             except Exception as e:
                 log.warning("Lỗi làm mới session http (%s): %s", account_id, e)
+                if not cookies.get("hatch_vml"):
+                    raise MuseAuthError("Thiếu cookie máy ảo (hatch_vml) và không lấy được phiên từ /api/session — cần lấy lại cookie mới") from e
 
         with self._browser_lock:
             bc_params = {}
@@ -1795,13 +1802,49 @@ class MuseEngine:
         page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
 
         ready = False
-        t_deadline = time.time() + timeout
+        t_start_nav = time.time()
+        t_deadline = t_start_nav + timeout
+        early_err: Exception | None = None
+        wrong_seen_at = 0.0
         while time.time() < t_deadline:
             time.sleep(0.3)
             try:
-                if page.js("!!document.querySelector('textarea')"):
+                st = page.js(
+                    "(function(){"
+                    "if(document.querySelector('textarea'))return 'ready';"
+                    "var t=(document.body&&document.body.innerText)||'';"
+                    "if(/Muse is disconnected|disconnected Muse to protect/i.test(t))return 'disconnected';"
+                    "if(/(^|[.])instagram[.]com$/i.test(location.hostname)||/redirect-cycle/i.test(location.href))return 'login';"
+                    "if(document.readyState==='complete'&&/log in|sign in|create an account|continue with instagram|登录/i.test(t))return 'login';"
+                    "if(/Something went wrong/i.test(t))return 'wrong';"
+                    "return '';})()"
+                ) or ""
+                if st == "ready":
                     ready = True
                     break
+                if st == "disconnected":
+                    err = MuseAccountDisconnectedError(
+                        'Muse đã ngắt kết nối TK này ("Muse is disconnected" — Muse khoá bảo vệ, cần gửi ticket cho Muse để mở lại)')
+                    err.kind = "disconnected"
+                    early_err = err
+                    break
+                if st == "login" and (time.time() - t_start_nav) >= 2.5:
+                    err = MuseAccountDisconnectedError(
+                        'Phiên TK hết hạn: Muse yêu cầu đăng nhập lại (Instagram/Login) — cần lấy cookie mới cho TK này')
+                    err.kind = "login"
+                    early_err = err
+                    break
+                if st == "wrong":
+                    if wrong_seen_at == 0.0:
+                        wrong_seen_at = time.time()
+                    elif (time.time() - wrong_seen_at) >= 3.0:
+                        err = MuseAccountDisconnectedError(
+                            'Trang Muse của TK này báo "Something went wrong / Try again" (phiên TK hỏng hoặc bị Muse cản)')
+                        err.kind = "wrong"
+                        early_err = err
+                        break
+                else:
+                    wrong_seen_at = 0.0
             except Exception:
                 pass
 
@@ -1812,6 +1855,8 @@ class MuseEngine:
                     self.browser.send('Target.disposeBrowserContext', {'browserContextId': bc_id})
             except Exception:
                 pass
+            if early_err is not None:
+                raise early_err
             raise MuseVMUnavailableError("Khởi tạo trang muse.ai cho worker thất bại hoặc timeout")
 
         return MuseWorkerSession(self, bc_id, target_id, page, account_id,
@@ -1978,9 +2023,10 @@ class MuseEngine:
         over_limit = key not in self._slot_keys(session.account_id)
         close_it = error or close_requested or not pooled or expired or not alive or over_limit
         if not close_it:
-            # Còn giữ trong pool: dừng video vừa sinh (đang tự phát lặp) trước khi trả về, lúc phiên
-            # vẫn in_use nên không luồng nào khác đang điều khiển trang này.
+            # Còn giữ trong pool: dừng video vừa sinh (đang tự phát lặp) và điều hướng ngầm về /thread/new
+            # trước khi trả về, lúc phiên vẫn in_use nên tác vụ sau dùng được ngay không tốn 2-4s tải trang.
             session.pause_media()
+            session.pre_navigate_new_thread()
         with cond:
             session.in_use = False
             cur = self._session_pool.get(key)
@@ -2068,9 +2114,61 @@ class MuseEngine:
 
 
 # Prompt hiện "Delivery not confirmed" liên tục quá số giây này thì coi như VM của tài khoản không kết nối được.
-UNDELIVERED_GRACE_SECONDS = 75
+UNDELIVERED_GRACE_SECONDS = 35
 # Sau khi gửi bao lâu mà trang vẫn ở /thread/new và agent chưa trả lời thì coi là prompt không tới được VM.
-STUCK_NEW_THREAD_SECONDS = 150
+STUCK_NEW_THREAD_SECONDS = 65
+# Khi đã sang /thread/<id> mà không còn nút Stop và không có video mới quá số giây này thì coi là VM bị treo ngầm.
+STUCK_INACTIVE_SECONDS = 90
+# Khoảng cách tối thiểu (giây) giữa 2 luồng cùng 1 tài khoản khi nạp ảnh tham chiếu & gửi prompt lên máy ảo Muse
+# để tránh 2 tab cùng ghi vào /home/hatch/workspace/ và gọi sub-agent cùng lúc gây nghẽn/treo VM.
+SAME_ACCOUNT_SEND_DELAY = 18.0
+_ACC_SEND_META_LOCK = threading.Lock()
+_ACC_SEND_LOCKS: dict[str, threading.Lock] = {}
+_ACC_LAST_SEND_TS: dict[str, float] = {}
+
+# Nhận diện đầy đủ các thông báo hết hạn mức 24h / hết quota tạo video (tiếng Trung, Việt, Anh, Tagalog và Scheduled task)
+_QUOTA_EXHAUSTED_RE = re.compile(
+    r"额度不足|积分不足|达到上限|配额已用完|额度已用完|"
+    r"(?:视频|生成|今日|每日|日)[^\n]{0,20}(?:额度|配额|限额)[^\n]{0,25}(?:用完|耗尽|上限|限制|未恢复|没恢复|恢复)|"
+    r"(?:额度|配额|限额)[^\n]{0,20}(?:已用完|耗尽|未恢复|没恢复|还没恢复|恢复后)|"
+    r"(?:用完|耗尽|达到)[^\n]{0,25}(?:视频|生成)[^\n]{0,15}(?:额度|配额|上限|限制)|"
+    r"每日[^\n]{0,20}(?:视频|配额|额度)[^\n]{0,20}(?:用完|耗尽|上限|限制)|"
+    r"24\s*小时[^\n]{0,25}(?:视频|配额|额度|限额)[^\n]{0,20}(?:用完|耗尽|上限|限制|未恢复|没恢复)|"
+    r"触达\s*429\s*限流|429[^\n]{0,20}(?:限流|额度|配额|quota|limit|giới hạn|hạn mức)|"
+    r"(?:记入|加入)排队[^\n]{0,35}(?:额度|恢复后|自动生成)|"
+    r"单次自动重试|今晚[^\n]{0,20}自动重试|one-time auto-retry|"
+    r"đã\s*hết\s*mức\s*sử\s*dụng|out\s*of\s*usage|"
+    r"hết\s*(?:hạn\s*mức|hạn\s*ngạch|mức\s*sử\s*dụng|quota|lượt\s*(?:tạo|video))|đạt\s*giới\s*hạn\s*(?:tạo\s*video|24\s*giờ|24h|hàng\s*ngày)|"
+    r"(?:hạn\s*mức|hạn\s*ngạch|giới\s*hạn|quota)[^\n]{0,55}(?:đã\s*hết|cạn\s*kiệt|chưa\s*khôi\s*phục|vượt\s*quá)|"
+    r"trong\s*24\s*giờ\s*qua[^\n]{0,30}đã\s*hết|"
+    r"out of credits|token limit|quota exceeded|limit reached|"
+    r"video_daily_budget_exhausted|daily_budget_exhausted|"
+    r"24-hour video (?:generation )?(?:limit|quota)|daily video (?:generation )?(?:limit|quota)|"
+    r"video (?:generation )?quota[^\n]{0,30}(?:exhausted|maxed out|reached|used up|limit)|"
+    r"quota is (?:still )?maxed out|naabot na[^\n]{0,30}video limit|"
+    r"Scheduled task[\s\S]{0,120}(?:视频|额度|配额|video|quota|tomorrow|will finish|will generate|Scheduled:)|"
+    r"已为你设置好定时任务[^\n]{0,40}(?:额度|配额)",
+    re.I,
+)
+
+# Nhận diện lỗi IP/Proxy bị chặn khu vực (403 Region Blocked)
+_REGION_BLOCKED_RE = re.compile(
+    r"isn't available in your country or region|"
+    r"not available in your (?:country|region)|"
+    r"区域不可用|地区不可用|国家或地区不可用|"
+    r"không\s*khả\s*dụng\s*tại\s*(?:quốc\s*gia|khu\s*vực)|"
+    r"403[^\n]{0,30}(?:区域|地区|region|country|khu vực|quốc gia)",
+    re.I,
+)
+
+# Nhận diện lỗi máy ảo Muse tìm sai đường dẫn ảnh tham chiếu (/home/user/ thay vì /home/hatch/workspace/)
+_VM_IMAGE_PATH_ERR_RE = re.compile(
+    r"(?:图片|参考图|文件)路径[^\n]{0,15}(?:写错|不存在|找不到|错误)|"
+    r"找不到你刚上传的参考图|无法读取[^\n]{0,15}参考图|"
+    r"không\s*tìm\s*thấy\s*(?:ảnh\s*tham\s*chiếu|tệp\s*ảnh|đường\s*dẫn\s*ảnh)|"
+    r"reference\s*image\s*(?:path\s*)?(?:not\s*found|does\s*not\s*exist)",
+    re.I,
+)
 
 
 class MuseWorkerSession:
@@ -2127,20 +2225,59 @@ class MuseWorkerSession:
         if self.is_closed:
             return False
         try:
-            return bool(self.page.js("!!document.querySelector('textarea')"))
+            # Nếu phiên vừa được pre_navigate_new_thread() điều hướng về /thread/new qua proxy chậm,
+            # đợi tối đa 6s cho textarea kịp render thay vì vội kết luận phiên chết và hủy Browser Context.
+            for _ in range(20):
+                st = self.page.js(
+                    "(function(){"
+                    "if(document.querySelector('textarea'))return 'ok';"
+                    "var h=location.href||'';"
+                    "if(h.indexOf('muse.ai')===-1)return 'dead';"
+                    "var t=(document.body&&document.body.innerText)||'';"
+                    "if(/Muse is disconnected|Something went wrong|log in|sign in/i.test(t))return 'dead';"
+                    "return 'loading';})()",
+                    timeout=5,
+                )
+                if st == "ok":
+                    return True
+                if st == "dead":
+                    return False
+                time.sleep(0.3)
+            return False
         except Exception:
             return False
+
+    def pre_navigate_new_thread(self):
+        """Điều hướng ngầm về /thread/new ngay khi vừa xong việc để tác vụ kế tiếp không phải chờ tải trang."""
+        if self.is_closed:
+            return
+        try:
+            self._clear_attachments()
+            self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+        except Exception:
+            pass
 
     def reset_thread(self, for_chat: bool = False):
         """Làm sạch trang và đảm bảo quay về trạng thái sẵn sàng cho tác vụ tiếp theo."""
         try:
             self._clear_attachments()
-            self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-            t_end = time.time() + 10.0
-            while time.time() < t_end:
-                time.sleep(0.15)
-                if self.page.js("!!document.querySelector('textarea')"):
-                    break
+            already_clean = False
+            if not for_chat:
+                try:
+                    already_clean = bool(self.page.js(
+                        "location.pathname === '/thread/new' && document.readyState === 'complete' && "
+                        "!!document.querySelector('textarea') && "
+                        "!document.querySelector('[class*=\"chat-user-bubble\"]')"
+                    ))
+                except Exception:
+                    already_clean = False
+            if not already_clean:
+                self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+                t_end = time.time() + 10.0
+                while time.time() < t_end:
+                    time.sleep(0.15)
+                    if self.page.js("!!document.querySelector('textarea')"):
+                        break
         except Exception:
             pass
 
@@ -2247,6 +2384,7 @@ class MuseWorkerSession:
                         "if(/Muse is disconnected|disconnected Muse to protect/i.test(t))return 'disconnected';"
                         "if(/Something went wrong/i.test(t)&&!document.querySelector('textarea'))return 'wrong';"
                         "if(/(^|[.])instagram[.]com$/i.test(location.hostname)||/redirect-cycle/i.test(location.href))return 'login';"
+                        "if(document.readyState==='complete'&&!document.querySelector('input[type=\"file\"]')&&/log in|sign in|create an account|continue with instagram|登录/i.test(t))return 'login';"
                         "return '';})()")
 
     def _raise_if_disconnected(self):
@@ -2380,7 +2518,7 @@ class MuseWorkerSession:
                     for _ in range(12):
                         time.sleep(1.0)
                         self._raise_if_disconnected()
-                raise MuseGenerationError(f"附加参考图失败，已停止生成 ({inject_err})")
+                raise MuseGenerationError(f"Đính kèm ảnh tham chiếu thất bại, đã dừng tạo ({inject_err})")
             attached = _wait_attached(wait_s)
             if attached:
                 if attempt > 1:
@@ -2428,7 +2566,7 @@ class MuseWorkerSession:
             "return JSON.stringify({x:Math.round(r.left+r.width/2),"
             "y:Math.round(r.top+r.height/2)});})()")
         if not rect:
-            raise MuseGenerationError("找不到聊天输入框")
+            raise MuseGenerationError("Không tìm thấy ô nhập chat")
         c = json.loads(rect)
         for t in ("mousePressed", "mouseReleased"):
             self.page.send("Input.dispatchMouseEvent",
@@ -2534,9 +2672,13 @@ class MuseWorkerSession:
         last_txt, txt_stable = "", 0
         fallback_since = 0.0
         undelivered_since = 0.0
+        last_active_ts = time.time()
+        last_seen_cnt = base_agent_cnt
+        last_seen_txt = ""
+        resent_once = False
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
-                raise MuseGenerationError("客户端已断开连接，终止生成任务")
+                raise MuseGenerationError("Máy khách đã ngắt kết nối, dừng tác vụ tạo")
             time.sleep(0.6)
             self._scroll_bottom()
             atts = self.attachments()
@@ -2599,26 +2741,42 @@ class MuseWorkerSession:
                     var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
-                    var tail = document.body ? (document.body.innerText||'').slice(-700) : '';
+                    var bodyTxt = document.body ? (document.body.innerText||'') : '';
+                    var tail = bodyTxt.slice(-700);
+                    var outOfUsage = /đã\s*hết\s*mức\s*sử\s*dụng|out\s*of\s*usage/i.test(bodyTxt);
                     // Chữ đỏ "Delivery not confirmed" nằm trong nhóm tin nhắn của CHÍNH prompt vừa gửi
                     // (không lấy chữ "Connecting..." ở thanh bên vì có thể là trạng thái cũ).
                     var groups = [].slice.call(document.querySelectorAll('[class*="group/msg"]'))
                         .filter(function(g){return g.querySelector('[class*="chat-user-bubble"]');});
                     var lastUser = groups.length ? groups[groups.length-1] : null;
                     var undelivered = !!(lastUser && /Delivery not confirmed/i.test(lastUser.innerText||''));
-                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail, undelivered: undelivered,
-                                           new_thread: location.pathname === '/thread/new'});
+                    var ta = document.querySelector('textarea');
+                    var taLen = ta ? (ta.value || '').trim().length : 0;
+                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail,
+                                           out_of_usage: outOfUsage, undelivered: undelivered,
+                                           new_thread: location.pathname === '/thread/new',
+                                           user_cnt: groups.length, ta_len: taLen});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
             except Exception:
                 st = {}
             tail = st.get("tail") or ""
-            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit|quota exceeded|limit reached", tail, re.I):
-                raise MuseGenerationError("Tài khoản đã hết hạn ngạch hoặc đạt giới hạn lượt dùng")
-
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
+
+            combined_txt = f"{cur_txt}\n{tail}"
+            if st.get("out_of_usage") or _QUOTA_EXHAUSTED_RE.search(combined_txt):
+                raise MuseGenerationError("Tài khoản đã hết hạn ngạch tạo video 24h (Muse báo hết quota)")
+            if _REGION_BLOCKED_RE.search(combined_txt):
+                raise MuseGenerationError("Khu vực/Proxy không hỗ trợ tạo video (403 Region Blocked)")
+            if _VM_IMAGE_PATH_ERR_RE.search(combined_txt):
+                raise MuseGenerationError("Máy ảo Muse đọc sai đường dẫn ảnh tham chiếu — đổi sang tài khoản khác")
+
+            if has_stop or cur_cnt != last_seen_cnt or cur_txt != last_seen_txt or len(atts) > base_att_cnt:
+                last_active_ts = time.time()
+                last_seen_cnt = cur_cnt
+                last_seen_txt = cur_txt
 
             # Prompt kẹt "Delivery not confirmed / Connecting...": VM của tài khoản chưa kết nối được nên tin nhắn
             # chưa hề tới Muse. Trước đây phải chờ mù hết timeout (10 phút); giờ quá ngưỡng thì báo lỗi để
@@ -2633,6 +2791,23 @@ class MuseWorkerSession:
                         f"(Delivery not confirmed / Connecting...) — đổi sang tài khoản khác")
             else:
                 undelivered_since = 0.0
+
+            # Nếu sau 12s vẫn ở /thread/new và chữ còn nằm trong textarea (nút Send bị kẹt nhịp đầu do proxy chậm),
+            # tự bấm gửi lại 1 lần để cứu ngay tác vụ mà không phải chờ hết 65s.
+            if not resent_once and st.get("new_thread") and no_reply and not has_stop and elapsed >= 12.0:
+                if (st.get("ta_len") or 0) > 0 or (st.get("user_cnt") or 0) == 0:
+                    resent_once = True
+                    try:
+                        self.page.js(
+                            "(function(){var b=[...document.querySelectorAll('button,[role=button]')]"
+                            ".filter(function(x){return x.offsetParent!==null && !x.disabled;})"
+                            ".find(function(x){return /发送|send/i.test(x.getAttribute('aria-label')||'')"
+                            "||/发送|send/i.test(x.getAttribute('data-testid')||'')"
+                            "||/send/i.test(x.innerText||'');});"
+                            "if(b){b.click();return 'reclicked';}return 'none';})()")
+                    except Exception:
+                        pass
+
             # Tín hiệu sớm hơn: prompt tới được Muse thì trang chuyển sang /thread/<id> và agent trả lời. Kẹt ở
             # /thread/new mà không có trả lời quá ngưỡng = VM không nhận prompt (chữ đỏ chỉ hiện sau ~5 phút).
             if st.get("new_thread") and no_reply and elapsed >= STUCK_NEW_THREAD_SECONDS:
@@ -2644,18 +2819,23 @@ class MuseWorkerSession:
                     f"Prompt chưa tới được máy ảo Muse sau {STUCK_NEW_THREAD_SECONDS}s "
                     f"(vẫn ở /thread/new, agent chưa trả lời) — đổi sang tài khoản khác")
 
+            # Đã sang /thread/<id> nhưng nút Stop biến mất và không có hoạt động mới quá STUCK_INACTIVE_SECONDS -> VM treo ngầm
+            if not st.get("new_thread") and not has_stop and len(atts) <= base_att_cnt:
+                if time.time() - last_active_ts >= STUCK_INACTIVE_SECONDS:
+                    raise MuseVMUnavailableError(
+                        f"Máy ảo Muse ngừng phản hồi quá {STUCK_INACTIVE_SECONDS}s trên thread "
+                        f"(không còn nút Stop và chưa sinh video) — đổi sang tài khoản khác")
+
             # Phát hiện sớm khi mô hình chỉ trả lời bằng văn bản (không có Stop button và không có video sinh ra)
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
                 is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact", cur_txt, re.I))
-                if not is_media_report:
-                    if cur_txt == last_txt:
-                        txt_stable += 1
-                    else:
-                        last_txt, txt_stable = cur_txt, 0
-                    if txt_stable >= 15 and elapsed > 8.0:
-                        raise MuseGenerationError(f"Mô hình không sinh video, chỉ phản hồi văn bản: {cur_txt[:120]}")
+                if cur_txt == last_txt:
+                    txt_stable += 1
                 else:
-                    txt_stable = 0
+                    last_txt, txt_stable = cur_txt, 0
+                need_stable = 35 if is_media_report else 8
+                if txt_stable >= need_stable and elapsed > 6.0:
+                    raise MuseGenerationError(f"Mô hình không sinh video, chỉ phản hồi văn bản: {cur_txt[:120]}")
             else:
                 txt_stable = 0
         return None
@@ -2751,23 +2931,57 @@ class MuseWorkerSession:
 
     def generate(self, prompt: str, expect: str = "video", timeout: int = 240,
                  on_progress=None, reference_image: str | None = None, stop_event=None) -> dict:
-        self._scroll_bottom()
-        if reference_image:
-            self._attach_image(reference_image)
-        else:
-            self._clear_attachments()
-        atts_before = self.attachments()
-        baseline_sources = {a.get(k) for a in atts_before for k in ("src", "vSrc", "iSrc") if a.get(k)}
-        base = atts_before[-1] if atts_before else {}
-        baseline_src = base.get("src") or ""
-        base_agent_cnt = self._agent_count()
-        base_user_msgs, _ = self._user_msg_state()
+        try:
+            if self.page.js("/đã\\s*hết\\s*mức\\s*sử\\s*dụng|out\\s*of\\s*usage/i.test((document.body&&document.body.innerText)||'')"):
+                raise MuseGenerationError("Tài khoản đã hết hạn ngạch tạo video 24h (Muse báo hết quota)")
+        except MuseGenerationError:
+            raise
+        except Exception:
+            pass
 
-        if self._send(prompt) not in ("clicked", "enter-sent"):
-            raise MuseGenerationError("提示词发送未确认，已停止生成")
+        aid = self.account_id or "__default__"
+        with _ACC_SEND_META_LOCK:
+            acc_lock = _ACC_SEND_LOCKS.setdefault(aid, threading.Lock())
 
-        if reference_image:
-            self._ensure_sent_with_image(base_user_msgs)
+        with acc_lock:
+            last_ts = _ACC_LAST_SEND_TS.get(aid, 0.0)
+            gap = time.time() - last_ts
+            if gap < SAME_ACCOUNT_SEND_DELAY:
+                wait_s = SAME_ACCOUNT_SEND_DELAY - gap
+                log.info("⏳ [Chống nghẽn VM] Luồng cùng TK %s chờ %.1fs (cách luồng trước %.0fs) trước khi nạp ảnh & gửi prompt...",
+                         aid, wait_s, SAME_ACCOUNT_SEND_DELAY)
+                wait_end = time.time() + wait_s
+                while time.time() < wait_end:
+                    if stop_event is not None and stop_event.is_set():
+                        raise MuseGenerationError("Tác vụ đã bị hủy bởi người dùng")
+                    time.sleep(min(0.5, max(0.05, wait_end - time.time())))
+                try:
+                    if self.page.js("/đã\\s*hết\\s*mức\\s*sử\\s*dụng|out\\s*of\\s*usage/i.test((document.body&&document.body.innerText)||'')"):
+                        raise MuseGenerationError("Tài khoản đã hết hạn ngạch tạo video 24h (Muse báo hết quota)")
+                except MuseGenerationError:
+                    raise
+                except Exception:
+                    pass
+
+            self._scroll_bottom()
+            if reference_image:
+                self._attach_image(reference_image)
+            else:
+                self._clear_attachments()
+            atts_before = self.attachments()
+            baseline_sources = {a.get(k) for a in atts_before for k in ("src", "vSrc", "iSrc") if a.get(k)}
+            base = atts_before[-1] if atts_before else {}
+            baseline_src = base.get("src") or ""
+            base_agent_cnt = self._agent_count()
+            base_user_msgs, _ = self._user_msg_state()
+
+            if self._send(prompt) not in ("clicked", "enter-sent"):
+                raise MuseGenerationError("Chưa xác nhận đã gửi prompt, đã dừng tạo")
+
+            if reference_image:
+                self._ensure_sent_with_image(base_user_msgs)
+
+            _ACC_LAST_SEND_TS[aid] = time.time()
 
         att = self._wait_attachment(
             baseline_src, timeout, expect, on_progress=on_progress,
@@ -2775,7 +2989,7 @@ class MuseWorkerSession:
             stop_event=stop_event, baseline_sources=baseline_sources
         )
         if not att:
-            raise MuseGenerationError("等待生成超时，未出现新的生成结果")
+            raise MuseGenerationError("Hết thời gian chờ tạo, chưa có kết quả mới")
 
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         candidates = []

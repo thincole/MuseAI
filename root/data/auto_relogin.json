@@ -1,0 +1,16 @@
+{
+  "enabled": false,
+  "interval_hours": 6,
+  "sources": [],
+  "max_per_run": 20,
+  "threads": 3,
+  "expiring_hours": 12,
+  "headless": true,
+  "proxy_source": "app",
+  "auto_add_new": false,
+  "min_active": 40,
+  "max_new_per_run": 10,
+  "retry_hours": 6,
+  "max_fails": 3,
+  "give_up_hours": 72
+}
