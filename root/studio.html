@@ -1268,6 +1268,9 @@
               <button class="btn-header" id="btnQuotaAll" onclick="checkAllQuota()" style="background:rgba(251,191,36,0.15);border:1px solid #fbbf24;color:#fbbf24;" title="Đọc hạn mức token của TẤT CẢ tài khoản (mỗi TK đi qua proxy riêng của nó, 3 TK cùng lúc, ~20-25 giây/TK)">
                 📊 Kiểm tra hạn mức tất cả
               </button>
+              <button class="btn-header" id="btnDeleteLockedAccs" onclick="deleteLockedAccounts()" style="background:rgba(239,68,68,0.18);border:1px solid #ef4444;color:#f87171;" title="Xóa toàn bộ các tài khoản đang bị khoá (Muse is disconnected) khỏi hệ thống">
+                🗑 Xóa TK bị khoá
+              </button>
             </div>
           </div>
 
@@ -1329,12 +1332,13 @@
                 <th>Hạn Sử Dụng</th>
                 <th>Hạn Mức Token</th>
                 <th title="Số video đã ra VÀ ghép xong. Lượt dùng nhiều mà video ít = TK hay lỗi">Video Thành Công</th>
+                <th title="Thời điểm cuối cùng tài khoản xuất và lưu xong video thành công">Lần Cuối TC</th>
                 <th>Thao Tác</th>
               </tr>
             </thead>
             <tbody id="accountsTableBody">
               <tr>
-                <td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">
+                <td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">
                   Đang tải danh sách tài khoản...
                 </td>
               </tr>
@@ -2764,7 +2768,7 @@
           const ej = await res.json();
           err = ej.detail || err;
         } catch (_) {}
-        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--danger);padding:20px;">${err}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--danger);padding:20px;">${err}</td></tr>`;
         return;
       }
 
@@ -2780,7 +2784,7 @@
       if (!accs || accs.length === 0) {
         cachedAliveCount = 0;
         updateShopeeThreadsHint();
-        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
         renderQuotaSummary();
         return;
       }
@@ -2791,9 +2795,13 @@
       const lockedCount = accs.filter(a => a.muse_locked).length;
       const hiddenEl = document.getElementById("hiddenLockedCount");
       if (hiddenEl) hiddenEl.textContent = lockedCount ? `(${hideLocked ? "đang ẩn" : "có"} ${lockedCount} TK bị khoá)` : "";
+      const delLockedBtn = document.getElementById("btnDeleteLockedAccs");
+      if (delLockedBtn && !delLockedBtn.disabled) {
+        delLockedBtn.innerText = lockedCount ? `🗑 Xóa TK bị khoá (${lockedCount})` : "🗑 Xóa TK bị khoá";
+      }
       const shownAccs = hideLocked ? accs.filter(a => !a.muse_locked) : accs;
       if (shownAccs.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--text-dim);padding:30px;">Không có TK nào để hiển thị — ${lockedCount} TK bị khoá đang được ẩn (bỏ chọn "Ẩn các TK bị khoá" để xem).</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">Không có TK nào để hiển thị — ${lockedCount} TK bị khoá đang được ẩn (bỏ chọn "Ẩn các TK bị khoá" để xem).</td></tr>`;
         renderQuotaSummary();
         return;
       }
@@ -2850,6 +2858,7 @@
             <td>${expStr}</td>
             <td id="qc_${a.id}">${quotaCellHtml(a.quota)}</td>
             <td>${successCellHtml(a)}</td>
+            <td>${lastSuccessCellHtml(a)}</td>
             <td>
               <div style="display:flex;gap:6px;">
                 <button class="btn-tiny" onclick="testAccount('${a.id}')">Kiểm Tra</button>
@@ -2864,7 +2873,7 @@
       renderQuotaSummary();
 
     } catch (e) {
-      tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
     }
   }
 
@@ -2908,7 +2917,7 @@
   }
 
   function formatSuccessTime(ts) {
-    if (!ts) return { short: "", full: "" };
+    if (!ts) return { short: "", full: "", clock: "", rel: "" };
     const d = new Date(ts * 1000);
     const pad = n => String(n).padStart(2, "0");
     const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -2918,8 +2927,9 @@
     const now = new Date();
     const sameDay = d.getDate() === now.getDate() && d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
     const rel = ageText(ts);
+    const clock = sameDay ? `${hm} hôm nay` : `${hm} ${dm}`;
     const short = sameDay ? `${rel} (${hm})` : `${rel} (${hm} ${dm})`;
-    return { short, full };
+    return { short, full, clock, rel };
   }
 
   function resolveLastSuccessTs(a) {
@@ -2951,17 +2961,26 @@
 
   function successCellHtml(a) {
       const ok = a.success_count || 0, used = Math.max(0, (a.use_count || 0) - (a.success_since_use || 0));
-      const lastTs = resolveLastSuccessTs(a);
-      const tInfo = formatSuccessTime(lastTs);
-      const timeHtml = ok > 0 && tInfo.short
-        ? `<div style="font-size:10px;color:var(--text-dim);margin-top:2px;" title="Lần cuối tạo video thành công: ${tInfo.full}">🕒 ${tInfo.short}</div>`
-        : (used > 0 ? `<div style="font-size:10px;color:var(--text-dim);margin-top:2px;">Chưa có video</div>` : "");
-      if (!used) return `<b>${ok}</b>${timeHtml}`;
+      if (!used) return `<b>${ok}</b>`;
       const rate = Math.min(100, Math.round(ok * 100 / used));
       // Tỉ lệ = video thành công / lượt dùng, đều tính từ lúc bản có cột này. Chỉ cảnh báo khi đã đủ lượt để kết luận.
       const color = used >= 20 && rate < 40 ? "#f87171" : (rate < 70 ? "#fbbf24" : "#4ade80");
-      return `<b>${ok}</b><div style="font-size:10.5px;color:${color};">${rate}% / lượt</div>${timeHtml}`;
-    }
+      return `<b>${ok}</b><div style="font-size:10.5px;color:${color};">${rate}% / lượt</div>`;
+  }
+
+  function lastSuccessCellHtml(a) {
+      const ok = a.success_count || 0;
+      if (!ok) return `<span style="font-size:11px;color:var(--text-dim);">Chưa có video</span>`;
+      const lastTs = resolveLastSuccessTs(a);
+      if (!lastTs) return `<span style="font-size:11px;color:var(--text-dim);">Không rõ</span>`;
+      const tInfo = formatSuccessTime(lastTs);
+      const minsAgo = (Date.now() / 1000 - lastTs) / 60;
+      const color = minsAgo <= 60 ? "#34d399" : (minsAgo <= 360 ? "#60a5fa" : "var(--text)");
+      return `<div title="Lần cuối tạo video thành công: ${tInfo.full}">
+        <div style="font-size:11.5px;font-weight:600;color:${color};">🕒 ${tInfo.rel}</div>
+        <div style="font-size:10.5px;color:var(--text-dim);font-family:monospace;margin-top:2px;">${tInfo.clock}</div>
+      </div>`;
+  }
 
     function quotaCellHtml(q) {
     const st = quotaState(q);
@@ -3194,6 +3213,52 @@
       }
     } catch (e) {
       showToast(`Lỗi xóa: ${e.message}`, "danger");
+    }
+  }
+
+  async function deleteLockedAccounts() {
+    const locked = (cachedAccounts || []).filter(a => a.muse_locked);
+    if (!locked.length) {
+      showToast("Hiện không có tài khoản nào đang bị khoá (Muse is disconnected)!", "info");
+      return;
+    }
+    const sample = locked.slice(0, 10).map(a => `  • ${a.label || a.id}`).join("\n");
+    const more = locked.length > 10 ? `\n  ... và ${locked.length - 10} tài khoản khác` : "";
+    if (!confirm(`Bạn có chắc muốn XÓA VĨNH VIỄN ${locked.length} tài khoản đang bị khoá (Muse is disconnected) khỏi hệ thống?\n\n${sample}${more}`)) {
+      return;
+    }
+    const btn = document.getElementById("btnDeleteLockedAccs");
+    if (btn) {
+      btn.disabled = true;
+      btn.innerText = `⏳ Đang xóa (0/${locked.length})...`;
+    }
+    let deleted = 0, failed = 0;
+    try {
+      for (let i = 0; i < locked.length; i++) {
+        const a = locked[i];
+        try {
+          const res = await fetch(`/admin/accounts/${a.id}`, {
+            method: "DELETE",
+            headers: getHeaders()
+          });
+          if (res.ok) deleted++;
+          else failed++;
+        } catch (_) {
+          failed++;
+        }
+        if (btn) btn.innerText = `⏳ Đang xóa (${i + 1}/${locked.length})...`;
+      }
+      showToast(
+        `✓ Đã xóa ${deleted}/${locked.length} tài khoản bị khoá khỏi hệ thống!${failed ? ` (${failed} lỗi)` : ""}`,
+        failed ? "warning" : "success"
+      );
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerText = "🗑 Xóa TK bị khoá";
+      }
+      await loadAccounts();
+      await checkServerStatus();
     }
   }
 

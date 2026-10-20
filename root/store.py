@@ -747,7 +747,13 @@ class Store:
                         a["expires_at"] = account_expiry(
                             a.get("cookies_exp"), a.get("expiry_anchor") or a.get("created_at"))
                     if note:
-                        a["note"] = note[:300]
+                        cur_note = a.get("note") or ""
+                        if ("Tự động duy trì" in note or "Phiên hợp lệ (VM:" in note) and any(
+                            k in cur_note for k in ("hết hạn ngạch", "hết sạch", "Tác vụ gián đoạn", "403 Region", "chặn khu vực")
+                        ):
+                            pass
+                        else:
+                            a["note"] = note[:300]
                     a["checked_at"] = now_ts
             self._save_accounts()
 

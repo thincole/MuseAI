@@ -1172,7 +1172,15 @@ class MuseEngine:
                     var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
-                    var tail = document.body ? (document.body.innerText||'').slice(-700) : '';
+                    var allGroups = [].slice.call(document.querySelectorAll('[class*="group/msg"]'));
+                    var uGroups = allGroups.filter(function(g){return g.querySelector('[class*="chat-user-bubble"]');});
+                    var lastUser = uGroups.length ? uGroups[uGroups.length-1] : null;
+                    var lastUserIdx = lastUser ? allGroups.indexOf(lastUser) : -1;
+                    var afterUserTxt = (lastUserIdx >= 0 ? allGroups.slice(lastUserIdx + 1) : [])
+                        .map(function(g){return (g.innerText||'').trim();}).join('\\n');
+                    var alertTxt = [].slice.call(document.querySelectorAll('[role="alert"],[data-sonner-toast]'))
+                        .map(function(el){return (el.innerText||'').trim();}).join('\\n');
+                    var tail = (afterUserTxt + '\\n' + alertTxt).trim().slice(-700);
                     return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
@@ -1182,12 +1190,15 @@ class MuseEngine:
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
-            combined_txt = f"{cur_txt}\n{tail}"
-            if _QUOTA_EXHAUSTED_RE.search(combined_txt):
+            active_agent_txt = cur_txt if cur_cnt > base_agent_cnt else ""
+            combined_txt = f"{active_agent_txt}\n{tail}".strip()
+            if combined_txt and re.search(r"đã\s*hết\s*mức\s*sử\s*dụng|out\s*of\s*usage|out\s*of\s*credits|token\s*limit|0\s*tokens?\s*left", combined_txt, re.I):
+                raise MuseGenerationError("Tài khoản đã hết sạch 100% Token (0 tokens left — chờ ngày reset tuần)")
+            if combined_txt and _QUOTA_EXHAUSTED_RE.search(combined_txt):
                 raise MuseGenerationError("Tài khoản đã hết hạn ngạch tạo video 24h (Muse báo hết quota)")
-            if _REGION_BLOCKED_RE.search(combined_txt):
+            if combined_txt and _REGION_BLOCKED_RE.search(combined_txt):
                 raise MuseGenerationError("Khu vực/Proxy không hỗ trợ tạo video (403 Region Blocked)")
-            if _VM_IMAGE_PATH_ERR_RE.search(combined_txt):
+            if combined_txt and _VM_IMAGE_PATH_ERR_RE.search(combined_txt):
                 raise MuseGenerationError("Máy ảo Muse đọc sai đường dẫn ảnh tham chiếu — đổi sang tài khoản khác")
             # Sidebar/stale connection text does not prove this generation failed.
             # The caller's generation deadline remains the bounded timeout.
@@ -2139,10 +2150,13 @@ _QUOTA_EXHAUSTED_RE = re.compile(
     r"单次自动重试|今晚[^\n]{0,20}自动重试|one-time auto-retry|"
     r"đã\s*hết\s*mức\s*sử\s*dụng|out\s*of\s*usage|"
     r"hết\s*(?:hạn\s*mức|hạn\s*ngạch|mức\s*sử\s*dụng|quota|lượt\s*(?:tạo|video))|đạt\s*giới\s*hạn\s*(?:tạo\s*video|24\s*giờ|24h|hàng\s*ngày)|"
-    r"(?:hạn\s*mức|hạn\s*ngạch|giới\s*hạn|quota)[^\n]{0,55}(?:đã\s*hết|cạn\s*kiệt|chưa\s*khôi\s*phục|vượt\s*quá)|"
-    r"trong\s*24\s*giờ\s*qua[^\n]{0,30}đã\s*hết|"
+    r"(?:hạn\s*mức|hạn\s*ngạch|giới\s*hạn|quota)[^\n]{0,55}(?:đã\s*hết|vẫn\s*đang\s*hết|đang\s*hết|cạn\s*kiệt|chưa\s*khôi\s*phục|vượt\s*quá)|"
+    r"trong\s*24\s*giờ\s*qua[^\n]{0,30}(?:đã\s*hết|đang\s*hết)|"
+    r"(?:đã\s*xếp\s*hàng|đưa\s*vào\s*danh\s*sách\s*chờ|thêm\s*vào\s*danh\s*sách\s*chờ|đã\s*vào\s*hàng\s*đợi)[^\n]{0,80}(?:retry|thử\s*lại|hạn\s*mức|quota|đang\s*nợ|video)?|"
     r"out of credits|token limit|quota exceeded|limit reached|"
     r"video_daily_budget_exhausted|daily_budget_exhausted|"
+    r"video\s*budget\s*is\s*(?:still\s*)?exhausted|budget\s*window\s*resets|pagkatapos\s*ng\s*budget\s*reset|"
+    r"(?:added\s*to|queued\s*for|in)\s*the\s*retry\s*(?:run|batch)|batch\s*retry\s*(?:at|after)|videos?\s*owed\s*in\s*total|video\s*\d+\s*of\s*\d+\s*owed|"
     r"24-hour video (?:generation )?(?:limit|quota)|daily video (?:generation )?(?:limit|quota)|"
     r"video (?:generation )?quota[^\n]{0,30}(?:exhausted|maxed out|reached|used up|limit)|"
     r"quota is (?:still )?maxed out|naabot na[^\n]{0,30}video limit|"
@@ -2151,13 +2165,16 @@ _QUOTA_EXHAUSTED_RE = re.compile(
     re.I,
 )
 
-# Nhận diện lỗi IP/Proxy bị chặn khu vực (403 Region Blocked)
+# Nhận diện lỗi IP/Proxy hoặc gốc tài khoản bị chặn khu vực (403 Region Blocked / video_not_available)
 _REGION_BLOCKED_RE = re.compile(
     r"isn't available in your country or region|"
     r"not available in your (?:country|region)|"
+    r"video_not_available|"
+    r"region(?:al)?\s*(?:restriction|block)|"
     r"区域不可用|地区不可用|国家或地区不可用|"
-    r"không\s*khả\s*dụng\s*tại\s*(?:quốc\s*gia|khu\s*vực)|"
-    r"403[^\n]{0,30}(?:区域|地区|region|country|khu vực|quốc gia)",
+    r"không\s*(?:khả\s*dụng|được\s*hỗ\s*trợ|hỗ\s*trợ)\s*tại\s*(?:quốc\s*gia|khu\s*vực|vùng)|"
+    r"(?:giới\s*hạn|hạn\s*chế|chặn)\s*(?:khu\s*vực|vùng\s*địa\s*lý|quốc\s*gia)|"
+    r"403[^\n]{0,30}(?:区域|地区|region|country|khu vực|quốc gia|downstream)",
     re.I,
 )
 
@@ -2742,13 +2759,18 @@ class MuseWorkerSession:
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
                     var bodyTxt = document.body ? (document.body.innerText||'') : '';
-                    var tail = bodyTxt.slice(-700);
-                    var outOfUsage = /đã\s*hết\s*mức\s*sử\s*dụng|out\s*of\s*usage/i.test(bodyTxt);
+                    var outOfUsage = /đã\\s*hết\\s*mức\\s*sử\\s*dụng|out\\s*of\\s*usage/i.test(bodyTxt);
                     // Chữ đỏ "Delivery not confirmed" nằm trong nhóm tin nhắn của CHÍNH prompt vừa gửi
                     // (không lấy chữ "Connecting..." ở thanh bên vì có thể là trạng thái cũ).
-                    var groups = [].slice.call(document.querySelectorAll('[class*="group/msg"]'))
-                        .filter(function(g){return g.querySelector('[class*="chat-user-bubble"]');});
+                    var allGroups = [].slice.call(document.querySelectorAll('[class*="group/msg"]'));
+                    var groups = allGroups.filter(function(g){return g.querySelector('[class*="chat-user-bubble"]');});
                     var lastUser = groups.length ? groups[groups.length-1] : null;
+                    var lastUserIdx = lastUser ? allGroups.indexOf(lastUser) : -1;
+                    var afterUserTxt = (lastUserIdx >= 0 ? allGroups.slice(lastUserIdx + 1) : [])
+                        .map(function(g){return (g.innerText||'').trim();}).join('\\n');
+                    var alertTxt = [].slice.call(document.querySelectorAll('[role="alert"],[data-sonner-toast]'))
+                        .map(function(el){return (el.innerText||'').trim();}).join('\\n');
+                    var tail = (afterUserTxt + '\\n' + alertTxt).trim().slice(-700);
                     var undelivered = !!(lastUser && /Delivery not confirmed/i.test(lastUser.innerText||''));
                     var ta = document.querySelector('textarea');
                     var taLen = ta ? (ta.value || '').trim().length : 0;
@@ -2765,12 +2787,15 @@ class MuseWorkerSession:
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
 
-            combined_txt = f"{cur_txt}\n{tail}"
-            if st.get("out_of_usage") or _QUOTA_EXHAUSTED_RE.search(combined_txt):
+            active_agent_txt = cur_txt if cur_cnt > base_agent_cnt else ""
+            combined_txt = f"{active_agent_txt}\n{tail}".strip()
+            if st.get("out_of_usage") or (combined_txt and re.search(r"đã\s*hết\s*mức\s*sử\s*dụng|out\s*of\s*usage|out\s*of\s*credits|token\s*limit|0\s*tokens?\s*left", combined_txt, re.I)):
+                raise MuseGenerationError("Tài khoản đã hết sạch 100% Token (0 tokens left — chờ ngày reset tuần)")
+            if combined_txt and _QUOTA_EXHAUSTED_RE.search(combined_txt):
                 raise MuseGenerationError("Tài khoản đã hết hạn ngạch tạo video 24h (Muse báo hết quota)")
-            if _REGION_BLOCKED_RE.search(combined_txt):
+            if combined_txt and _REGION_BLOCKED_RE.search(combined_txt):
                 raise MuseGenerationError("Khu vực/Proxy không hỗ trợ tạo video (403 Region Blocked)")
-            if _VM_IMAGE_PATH_ERR_RE.search(combined_txt):
+            if combined_txt and _VM_IMAGE_PATH_ERR_RE.search(combined_txt):
                 raise MuseGenerationError("Máy ảo Muse đọc sai đường dẫn ảnh tham chiếu — đổi sang tài khoản khác")
 
             if has_stop or cur_cnt != last_seen_cnt or cur_txt != last_seen_txt or len(atts) > base_att_cnt:
@@ -2933,7 +2958,7 @@ class MuseWorkerSession:
                  on_progress=None, reference_image: str | None = None, stop_event=None) -> dict:
         try:
             if self.page.js("/đã\\s*hết\\s*mức\\s*sử\\s*dụng|out\\s*of\\s*usage/i.test((document.body&&document.body.innerText)||'')"):
-                raise MuseGenerationError("Tài khoản đã hết hạn ngạch tạo video 24h (Muse báo hết quota)")
+                raise MuseGenerationError("Tài khoản đã hết sạch 100% Token (0 tokens left — chờ ngày reset tuần)")
         except MuseGenerationError:
             raise
         except Exception:
@@ -2957,7 +2982,7 @@ class MuseWorkerSession:
                     time.sleep(min(0.5, max(0.05, wait_end - time.time())))
                 try:
                     if self.page.js("/đã\\s*hết\\s*mức\\s*sử\\s*dụng|out\\s*of\\s*usage/i.test((document.body&&document.body.innerText)||'')"):
-                        raise MuseGenerationError("Tài khoản đã hết hạn ngạch tạo video 24h (Muse báo hết quota)")
+                        raise MuseGenerationError("Tài khoản đã hết sạch 100% Token (0 tokens left — chờ ngày reset tuần)")
                 except MuseGenerationError:
                     raise
                 except Exception:
