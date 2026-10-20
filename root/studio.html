@@ -909,7 +909,8 @@
     }
     .shopee-console {
       width: 100%;
-      height: 240px;
+      height: 360px;
+      max-height: 360px;
       background: #030712;
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -918,9 +919,42 @@
       font-size: 11.5px;
       color: #e2e8f0;
       line-height: 1.55;
-      overflow-y: auto;
+      overflow-y: scroll;
       white-space: pre-wrap;
       word-break: break-all;
+    }
+    .shopee-console::-webkit-scrollbar {
+      width: 12px;
+    }
+    .shopee-console::-webkit-scrollbar-track {
+      background: rgba(15, 23, 42, 0.95);
+      border-left: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 0 8px 8px 0;
+    }
+    .shopee-console::-webkit-scrollbar-thumb {
+      background: rgba(96, 165, 250, 0.5);
+      border-radius: 6px;
+      border: 2px solid rgba(15, 23, 42, 0.95);
+      min-height: 36px;
+    }
+    .shopee-console::-webkit-scrollbar-thumb:hover {
+      background: rgba(96, 165, 250, 0.85);
+    }
+    .console-scroll-btn {
+      background: rgba(30, 41, 59, 0.85);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      color: #cbd5e1;
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 10.5px;
+      cursor: pointer;
+      line-height: 1.3;
+      transition: all 0.15s;
+    }
+    .console-scroll-btn:hover {
+      background: rgba(59, 130, 246, 0.3);
+      border-color: #60a5fa;
+      color: #fff;
     }
 
     /* Modals / Toasts */
@@ -1268,6 +1302,9 @@
               <button class="btn-header" id="btnQuotaAll" onclick="checkAllQuota()" style="background:rgba(251,191,36,0.15);border:1px solid #fbbf24;color:#fbbf24;" title="Đọc hạn mức token của TẤT CẢ tài khoản (mỗi TK đi qua proxy riêng của nó, 3 TK cùng lúc, ~20-25 giây/TK)">
                 📊 Kiểm tra hạn mức tất cả
               </button>
+              <button class="btn-header" id="btnInviteCodes" onclick="collectInviteCodes(event)" style="background:rgba(168,85,247,0.15);border:1px solid #a855f7;color:#c084fc;" title="Lấy mã mời (Invite friends) của TẤT CẢ tài khoản rồi lưu ra data/invite_codes.txt dạng user|code. Giữ Shift khi bấm = lấy lại cả TK đã có mã.">
+                🎁 Lấy mã mời
+              </button>
               <button class="btn-header" id="btnDeleteLockedAccs" onclick="deleteLockedAccounts()" style="background:rgba(239,68,68,0.18);border:1px solid #ef4444;color:#f87171;" title="Xóa toàn bộ các tài khoản đang bị khoá (Muse is disconnected) khỏi hệ thống">
                 🗑 Xóa TK bị khoá
               </button>
@@ -1326,6 +1363,7 @@
             <thead>
               <tr>
                 <th>Tên Tài Khoản</th>
+                <th title="Mã mời bạn bè (Invite friends) — bấm vào mã để copy nhanh (giữ Shift + bấm = copy dạng user|code)">Mã Mời</th>
                 <th>Trạng Thái</th>
                 <th>Proxy Cố Định</th>
                 <th>Số Cookie</th>
@@ -1338,7 +1376,7 @@
             </thead>
             <tbody id="accountsTableBody">
               <tr>
-                <td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">
+                <td colspan="10" style="text-align:center;color:var(--text-dim);padding:30px;">
                   Đang tải danh sách tài khoản...
                 </td>
               </tr>
@@ -1487,12 +1525,18 @@
         </div>
 
         <!-- Card 1: Cài đặt Video & Prompt -->
-        <div class="shopee-card">
-          <div class="shopee-card-title">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-            ⚙ Cài đặt Video & Prompt
+        <div class="shopee-card" id="cardVideoPromptSettings">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="shopee-card-title" onclick="toggleVideoPromptCard()" style="margin-bottom:0; cursor:pointer; user-select:none;" title="Bấm để thu nhỏ hoặc mở rộng phần này">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+              ⚙ Cài đặt Video & Prompt
+            </div>
+            <button type="button" class="shopee-btn" id="btnToggleVideoPrompt" onclick="event.stopPropagation(); toggleVideoPromptCard();" style="background:#1e293b; color:#93c5fd; border:1px solid #3b82f6; font-size:11px; padding:4px 10px; font-weight:700;" title="Thu nhỏ / Mở rộng phần này">
+              <span id="iconToggleVideoPrompt">▲ Thu nhỏ</span>
+            </button>
           </div>
 
+          <div id="bodyVideoPromptSettings" style="margin-top:10px;">
           <!-- Row 1: Tỉ lệ, Khung cảnh, Độ dài, Ngôn ngữ -->
           <div class="shopee-row">
             <span class="shopee-lbl">Tỉ lệ:</span>
@@ -1581,7 +1625,7 @@
           </div>
 
           <!-- Row 3: Đặt tên video, Lưu Video -->
-          <div class="shopee-row">
+          <div class="shopee-row" style="margin-bottom:0;">
             <span class="shopee-lbl">Đặt tên video:</span>
             <select class="shopee-select" id="sp_naming" style="min-width:160px;">
               <option value="Theo Item ID" selected>Theo Item ID</option>
@@ -1592,6 +1636,7 @@
             <span class="shopee-lbl" style="margin-left:8px;">Lưu Video:</span>
             <input type="text" class="shopee-input" id="sp_out_dir" value="F:/Video AI/PH/shopapi" style="width:360px;">
             <button type="button" class="shopee-btn shopee-btn-blue" onclick="pickShopeeFolder()">Chọn</button>
+          </div>
           </div>
         </div>
 
@@ -1743,18 +1788,34 @@
             <span><b>Bảo vệ tải CPU/RAM:</b> Dù bạn có 50 hay 100 tài khoản, hệ thống chỉ chạy đồng thời đúng số luồng bạn chọn ở trên. Các tài khoản trong kho sẽ tự động mượn luân phiên (xoay tua), máy tính chạy cực kỳ êm ái và không bao giờ bị đơ giật!</span>
           </div>
 
-          <!-- Console view for claimed products -->
-          <div class="shopee-console" id="shopeeProductsConsole">
-            Chưa có sản phẩm nào. Bấm [📥 Nhận SP] để nhận lô sản phẩm từ Database!
-          </div>
+          <!-- Chia đôi 2 cột ngang nhau: Cột trái = Danh sách sản phẩm | Cột phải = Nhật ký xử lý -->
+          <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start;">
+            <div style="min-width:0;">
+              <div style="font-size:11px;color:var(--text-dim);display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <span>📦 Danh sách sản phẩm trong hàng đợi:</span>
+                <span style="display:inline-flex;gap:4px;">
+                  <button type="button" class="console-scroll-btn" onclick="const el=document.getElementById('shopeeProductsConsole');if(el)el.scrollTop=0;" title="Cuộn lên đầu danh sách sản phẩm">⬆ Đầu</button>
+                  <button type="button" class="console-scroll-btn" onclick="const el=document.getElementById('shopeeProductsConsole');if(el)el.scrollTop=el.scrollHeight;" title="Cuộn xuống cuối danh sách sản phẩm">⬇ Cuối</button>
+                </span>
+              </div>
+              <div class="shopee-console" id="shopeeProductsConsole" style="height:360px;max-height:360px;overflow-y:scroll;">
+                Chưa có sản phẩm nào. Bấm [📥 Nhận SP] để nhận lô sản phẩm từ Database!
+              </div>
+            </div>
 
-          <!-- Live Log output -->
-          <div style="margin-top:10px;font-size:11px;color:var(--text-dim);display:flex;justify-content:space-between;">
-            <span>Nhật ký xử lý:</span>
-            <span id="shopeeElapsedTimer">Thời gian: 0s</span>
-          </div>
-          <div class="shopee-console" id="shopeeLiveLog" style="height:140px;margin-top:4px;color:#94a3b8;font-size:11px;">
-            [Hệ thống] Sẵn sàng nhận lô sản phẩm và tạo video qua Muse.ai.
+            <div style="min-width:0;">
+              <div style="font-size:11px;color:var(--text-dim);display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <span>📜 Nhật ký xử lý:</span>
+                <span style="display:inline-flex;align-items:center;gap:8px;">
+                  <span id="shopeeElapsedTimer">Thời gian: 0s</span>
+                  <button type="button" class="console-scroll-btn" onclick="const el=document.getElementById('shopeeLiveLog');if(el)el.scrollTop=0;" title="Cuộn lên đầu nhật ký">⬆ Đầu</button>
+                  <button type="button" class="console-scroll-btn" onclick="const el=document.getElementById('shopeeLiveLog');if(el)el.scrollTop=el.scrollHeight;" title="Cuộn xuống cuối nhật ký">⬇ Cuối</button>
+                </span>
+              </div>
+              <div class="shopee-console" id="shopeeLiveLog" style="height:360px;max-height:360px;overflow-y:scroll;color:#94a3b8;font-size:11px;">
+                [Hệ thống] Sẵn sàng nhận lô sản phẩm và tạo video qua Muse.ai.
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -2784,7 +2845,7 @@
       if (!accs || accs.length === 0) {
         cachedAliveCount = 0;
         updateShopeeThreadsHint();
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
         renderQuotaSummary();
         return;
       }
@@ -2801,7 +2862,7 @@
       }
       const shownAccs = hideLocked ? accs.filter(a => !a.muse_locked) : accs;
       if (shownAccs.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--text-dim);padding:30px;">Không có TK nào để hiển thị — ${lockedCount} TK bị khoá đang được ẩn (bỏ chọn "Ẩn các TK bị khoá" để xem).</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-dim);padding:30px;">Không có TK nào để hiển thị — ${lockedCount} TK bị khoá đang được ẩn (bỏ chọn "Ẩn các TK bị khoá" để xem).</td></tr>`;
         renderQuotaSummary();
         return;
       }
@@ -2852,6 +2913,7 @@
         return `
           <tr>
             <td><b>${a.label || a.id}</b><br><span style="font-size:11px;color:var(--text-dim);font-family:monospace;">ID: ${a.id}</span>${noteHtml}</td>
+            <td id="ic_${a.id}">${inviteCellHtml(a)}</td>
             <td>${statusBadge}</td>
             <td>${proxyHtml}</td>
             <td>${cookieCount} cookies</td>
@@ -2861,6 +2923,7 @@
             <td>${lastSuccessCellHtml(a)}</td>
             <td>
               <div style="display:flex;gap:6px;">
+                <button class="btn-tiny" id="ob_${a.id}" onclick="openAccountBrowser('${a.id}')" title="Mở TK này trên 1 cửa sổ Chrome thật (đăng nhập sẵn bằng cookie, đi qua đúng proxy của TK) để thao tác trực tiếp" style="border-color:#3b82f6;color:#60a5fa;">Mở</button>
                 <button class="btn-tiny" onclick="testAccount('${a.id}')">Kiểm Tra</button>
                 <button class="btn-tiny" id="qb_${a.id}" onclick="checkAccountQuota('${a.id}')" title="Đọc hạn mức token của tài khoản này (qua proxy riêng của nó)">Hạn mức</button>
                 ${a.muse_locked ? `<button class="btn-tiny" onclick="unlockAccount('${a.id}')" title="Mở khoá để phần mềm giao việc lại cho TK này">Mở khoá</button>` : ""}
@@ -2873,7 +2936,7 @@
       renderQuotaSummary();
 
     } catch (e) {
-      tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--danger);padding:20px;">Lỗi tải tài khoản: ${e.message}</td></tr>`;
     }
   }
 
@@ -3168,6 +3231,133 @@
       loadAccounts();
     } catch (e) {
       showToast(`Lỗi test: ${e.message}`, "danger");
+    }
+  }
+
+  function inviteCellHtml(a) {
+    const inv = a.invite || {};
+    const code = (inv.code || "").trim();
+    const safeLabel = String(a.label || a.id || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/"/g, "&quot;");
+    if (code) {
+      const uses = typeof inv.uses_left === "number" ? `<div style="font-size:10.5px;color:var(--text-dim);margin-top:3px;">Còn ${inv.uses_left} lượt</div>` : "";
+      return `
+        <div style="display:flex;flex-direction:column;align-items:flex-start;">
+          <div style="display:flex;align-items:center;gap:4px;">
+            <span onclick="copyInviteCode('${code}', '${safeLabel}', event)"
+                  title="Bấm để copy mã '${code}' (Giữ Shift + bấm = copy '${safeLabel}|${code}')"
+                  style="cursor:pointer;user-select:all;font-family:Consolas,monospace;font-weight:700;font-size:12.5px;letter-spacing:0.6px;color:#e9d5ff;background:rgba(168,85,247,0.18);border:1px solid rgba(168,85,247,0.5);border-radius:6px;padding:2px 8px;display:inline-flex;align-items:center;gap:4px;transition:all 0.15s;">
+              🎁 ${code} <span style="font-size:10.5px;opacity:0.85;">📋</span>
+            </span>
+            <button class="btn-tiny" id="icb_${a.id}" onclick="fetchOneInviteCode('${a.id}')" title="Lấy lại / cập nhật mã mời và số lượt còn lại của TK này" style="padding:2px 5px;font-size:10.5px;flex:0;">↻</button>
+          </div>
+          ${uses}
+        </div>
+      `;
+    }
+    const errTip = inv.error ? ` title="Lần thử trước: ${String(inv.error).replace(/"/g, '&quot;')}"` : "";
+    const errDot = inv.error ? `<span style="color:#f87171;font-size:10.5px;"${errTip}>⚠ Lỗi</span> ` : `<span style="color:var(--text-dim);font-size:11px;">Chưa có</span> `;
+    return `
+      <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
+        ${errDot}
+        <button class="btn-tiny" id="icb_${a.id}" onclick="fetchOneInviteCode('${a.id}')" title="Lấy mã mời cho tài khoản này" style="padding:2px 7px;border-color:rgba(168,85,247,0.45);color:#c084fc;flex:0;white-space:nowrap;">🎁 Lấy mã</button>
+      </div>
+    `;
+  }
+
+  async function copyInviteCode(code, label, ev) {
+    const text = (ev && ev.shiftKey && label) ? `${label}|${code}` : code;
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(`Đã copy: ${text}`, "success");
+    } catch (e) {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      showToast(`Đã copy: ${text}`, "success");
+    }
+  }
+
+  async function fetchOneInviteCode(aid) {
+    const btn = document.getElementById(`icb_${aid}`);
+    const cell = document.getElementById(`ic_${aid}`);
+    if (btn) { btn.disabled = true; btn.innerText = "⏳..."; }
+    try {
+      const res = await fetch(`/admin/accounts/${aid}/invite-code`, { method: "POST", headers: getHeaders() });
+      const d = await res.json().catch(() => ({}));
+      if (res.ok && d.ok && d.code) {
+        showToast(`🎁 Đã lấy mã mời: ${d.code}${typeof d.uses_left === "number" ? " (còn " + d.uses_left + " lượt)" : ""}`, "success");
+      } else {
+        showToast(`Không lấy được mã mời: ${d.error || d.detail || res.status}`, "danger");
+      }
+      loadAccounts();
+    } catch (e) {
+      showToast(`Lỗi lấy mã mời: ${e.message}`, "danger");
+      if (btn) { btn.disabled = false; btn.innerText = "🎁 Lấy mã"; }
+    }
+  }
+
+  let invitePollTimer = null;
+  async function collectInviteCodes(ev) {
+    const btn = document.getElementById("btnInviteCodes");
+    const force = !!(ev && ev.shiftKey);
+    try {
+      const res = await fetch("/admin/invite-codes/collect", {
+        method: "POST", headers: { ...getHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ force, workers: 3 })
+      });
+      const d = await res.json();
+      if (!res.ok) { showToast(`Không bắt đầu được: ${d.detail || res.status}`, "danger"); return; }
+      if (!d.started && !d.running) { showToast(d.message || "Không bắt đầu được", "danger"); return; }
+      if (d.started && d.total === 0) {
+        showToast("Tất cả TK đã có mã trong 6 giờ qua -> mở file luôn (giữ Shift khi bấm để lấy lại).", "info");
+        openInviteFile();
+        return;
+      }
+      showToast(`Bắt đầu lấy mã mời cho ${d.total} TK (3 TK cùng lúc, ~25 giây/TK)...`, "info");
+    } catch (e) {
+      showToast(`Lỗi: ${e.message}`, "danger"); return;
+    }
+    if (invitePollTimer) clearInterval(invitePollTimer);
+    invitePollTimer = setInterval(async () => {
+      try {
+        const s = await (await fetch("/admin/invite-codes/status", { headers: getHeaders() })).json();
+        if (btn) btn.innerText = s.running ? `🎁 Đang lấy mã ${s.done}/${s.total} (✓${s.ok} ✗${s.failed})` : "🎁 Lấy mã mời";
+        loadAccounts();
+        if (!s.running) {
+          clearInterval(invitePollTimer); invitePollTimer = null;
+          showToast(`Xong: lấy được ${s.ok}/${s.total} TK (file có ${s.codes_total} mã) -> data/invite_codes.txt`, "success");
+          openInviteFile();
+        }
+      } catch (e) { /* thử lại nhịp sau */ }
+    }, 3000);
+  }
+
+  async function openInviteFile() {
+    try {
+      const r = await (await fetch("/admin/invite-codes/open", { method: "POST", headers: getHeaders() })).json();
+      if (r && r.file) showToast(`Đã mở ${r.file} (${r.lines} dòng user|code)`, "info");
+    } catch (e) { showToast(`Không mở được file: ${e.message}`, "danger"); }
+  }
+
+  async function openAccountBrowser(aid) {
+    const btn = document.getElementById(`ob_${aid}`);
+    if (btn) { btn.disabled = true; btn.innerText = "Đang mở..."; }
+    showToast("Đang mở Chrome cho tài khoản (qua proxy riêng của TK)...", "info");
+    try {
+      const res = await fetch(`/admin/accounts/${aid}/open-browser`, { method: "POST", headers: getHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        showToast(`Đã mở Chrome cho ${data.label || "TK"}${data.proxy ? " (proxy " + data.proxy.split(":")[0] + ")" : ""}. Nếu Muse đòi đăng nhập Instagram = cookie TK đã hết hạn.`, "success");
+      } else {
+        showToast(`Không mở được: ${data.detail || data.message || res.status}`, "danger");
+      }
+    } catch (e) {
+      showToast(`Lỗi mở trình duyệt: ${e.message}`, "danger");
+    } finally {
+      if (btn) { btn.disabled = false; btn.innerText = "Mở"; }
     }
   }
 
@@ -4505,7 +4695,8 @@
     // Số SP đã bị gỡ khỏi đầu danh sách khi tự nhận thêm SP (giữ số thứ tự đặt tên file liên tục)
     let seqBase = 0;
     const seenItemIds = new Set(shopeeClaimedProducts.map(p => String(p && p.item_id)));
-    const autoClaim = !!form.auto_claim;
+    const isPureImportedBatch = shopeeClaimedProducts.length > 0 && shopeeClaimedProducts.every(p => p && p._is_imported);
+    const autoClaim = !!form.auto_claim && !isPureImportedBatch;
     const autoClaimThreshold = Math.max(100, maxWorkers * 5);
     let autoClaimPromise = null;
     let autoClaimEmptyAt = 0;
@@ -5454,7 +5645,7 @@
     showToast("Đã làm mới dữ liệu!", "info");
   }
 
-  // ==================== BROWSER PROTECTION CARD COLLAPSE ====================
+  // ==================== BROWSER PROTECTION & VIDEO PROMPT CARD COLLAPSE ====================
   function toggleBrowserProtectionCard() {
     const body = document.getElementById("bodyBrowserProtection");
     const icon = document.getElementById("iconToggleBrowserProtection");
@@ -5474,6 +5665,25 @@
     }
   }
 
+  function toggleVideoPromptCard() {
+    const body = document.getElementById("bodyVideoPromptSettings");
+    const icon = document.getElementById("iconToggleVideoPrompt");
+    const btn = document.getElementById("btnToggleVideoPrompt");
+    if (!body || !icon) return;
+    const isHidden = body.style.display === "none";
+    if (isHidden) {
+      body.style.display = "block";
+      icon.innerText = "▲ Thu nhỏ";
+      if (btn) btn.title = "Thu nhỏ phần cấu hình này";
+      localStorage.setItem("shopee_video_prompt_collapsed", "false");
+    } else {
+      body.style.display = "none";
+      icon.innerText = "▼ Mở rộng";
+      if (btn) btn.title = "Mở rộng xem chi tiết phần này";
+      localStorage.setItem("shopee_video_prompt_collapsed", "true");
+    }
+  }
+
   function initBrowserProtectionCollapse() {
     const saved = localStorage.getItem("shopee_browser_protection_collapsed");
     if (saved === "true") {
@@ -5483,6 +5693,16 @@
       if (body) body.style.display = "none";
       if (icon) icon.innerText = "▼ Mở rộng";
       if (btn) btn.title = "Mở rộng xem chi tiết phần này";
+    }
+
+    const savedVP = localStorage.getItem("shopee_video_prompt_collapsed");
+    if (savedVP === "true") {
+      const bodyVP = document.getElementById("bodyVideoPromptSettings");
+      const iconVP = document.getElementById("iconToggleVideoPrompt");
+      const btnVP = document.getElementById("btnToggleVideoPrompt");
+      if (bodyVP) bodyVP.style.display = "none";
+      if (iconVP) iconVP.innerText = "▼ Mở rộng";
+      if (btnVP) btnVP.title = "Mở rộng xem chi tiết phần này";
     }
   }
   // ==================== DATABASE CONFIG MODAL ====================

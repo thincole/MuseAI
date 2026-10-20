@@ -1285,17 +1285,56 @@ def _read_capped(resp, cap: int = MAX_IMAGE_BYTES) -> bytes:
     return bytes(buf)
 
 
+def _candidate_shopee_cdn_urls(url: str) -> list[str]:
+    """Chuẩn hóa URL ảnh Shopee (bỏ @resize / _tn để lấy ảnh gốc chất lượng cao) và tạo URL dự phòng giữa
+    cf.shopee.<mkt>/file/<hash> và down-<mkt>.img.susercontent.com/file/<hash>."""
+    u = url.strip()
+    if "@resize" in u:
+        u = u.split("@resize")[0]
+    if u.endswith("_tn"):
+        u = u[:-3]
+    elif "_tn." in u:
+        u = u.replace("_tn.", ".")
+    cands = [u]
+    m_cf = re.match(r"^https?://cf\.shopee\.([a-z.]+)/file/(.+)$", u, re.IGNORECASE)
+    if m_cf:
+        dom, fhash = m_cf.group(1).lower(), m_cf.group(2)
+        mkt_short = {"vn": "vn", "ph": "ph", "co.id": "id", "com.my": "my", "co.th": "th", "sg": "sg", "tw": "tw"}.get(dom, "ph")
+        alt = f"https://down-{mkt_short}.img.susercontent.com/file/{fhash}"
+        if alt not in cands:
+            cands.append(alt)
+    m_sc = re.match(r"^https?://down-([a-z]+)\.img\.susercontent\.com/file/(.+)$", u, re.IGNORECASE)
+    if m_sc:
+        mkt_short, fhash = m_sc.group(1).lower(), m_sc.group(2)
+        dom = {"vn": "vn", "ph": "ph", "id": "co.id", "my": "com.my", "th": "co.th", "sg": "sg", "tw": "tw"}.get(mkt_short, "ph")
+        alt = f"https://cf.shopee.{dom}/file/{fhash}"
+        if alt not in cands:
+            cands.append(alt)
+    return cands
+
+
 def _fetch_image_bytes(image_url: str, timeout: int = 15, require_image_type: bool = True) -> tuple[bytes, str]:
-    """Tải ảnh an toàn. Trả về (data, content_type). ValueError = bị từ chối (không nên thử lại)."""
-    url = _validate_public_http_url(image_url)
-    req = urllib.request.Request(url, headers=_IMAGE_HEADERS)
-    with _IMAGE_OPENER.open(req, timeout=timeout) as resp:
-        raw_ct = resp.headers.get("Content-Type") or ""
-        ctype = raw_ct.split(";", 1)[0].strip().lower()
-        if require_image_type and ctype and not ctype.startswith("image/"):
-            raise ValueError(f"URL không trả về ảnh (Content-Type: {ctype})")
-        data = _read_capped(resp, MAX_IMAGE_BYTES)
-    return data, (ctype or "image/jpeg")
+    """Tải ảnh an toàn (tự động thử sang CDN dự phòng susercontent.com <-> cf.shopee nếu cần).
+    Trả về (data, content_type). ValueError = bị từ chối (không nên thử lại)."""
+    base_url = _validate_public_http_url(image_url)
+    last_exc: Exception | None = None
+    for cand in _candidate_shopee_cdn_urls(base_url):
+        try:
+            url = _validate_public_http_url(cand)
+            req = urllib.request.Request(url, headers=_IMAGE_HEADERS)
+            with _IMAGE_OPENER.open(req, timeout=timeout) as resp:
+                raw_ct = resp.headers.get("Content-Type") or ""
+                ctype = raw_ct.split(";", 1)[0].strip().lower()
+                if require_image_type and ctype and not ctype.startswith("image/"):
+                    raise ValueError(f"URL không trả về ảnh (Content-Type: {ctype})")
+                data = _read_capped(resp, MAX_IMAGE_BYTES)
+            return data, (ctype or "image/jpeg")
+        except ValueError:
+            raise
+        except Exception as e:
+            last_exc = e
+    raise last_exc or RuntimeError("Không tải được ảnh từ Shopee CDN")
+
 
 
 def download_image_as_data_url(image_url: str, retries: int = 3) -> str | None:

@@ -856,6 +856,119 @@ def _kick_webshare_refresh():
     threading.Thread(target=_webshare_refresh_now, args=(True,), daemon=True).start()
 
 
+# ---------- Tự chữa proxy chết ----------
+# Proxy HomeProxy hết hạn/chết thì mọi TK gắn vào nó đều lỗi "Khởi tạo trang muse.ai" mỗi giờ mà KHÔNG bao giờ được đổi
+# (danh sách proxy cache vẫn còn proxy đó). Giờ: thấy TK lỗi khởi tạo trang -> test proxy của nó; chết thật (2 lần) ->
+# nạp lại danh sách HomeProxy và chuyển các TK trên proxy chết sang proxy sống ít TK nhất, rồi xoá giờ nghỉ để chạy lại ngay.
+_PROXY_HEAL_LOCK = threading.Lock()
+_PROXY_TEST_TS: dict[str, float] = {}      # proxy -> lần test gần nhất (mỗi proxy test tối đa 1 lần / 10 phút)
+_PROXY_SYNC_TS = [0.0]                     # lần nạp lại + chia lại proxy gần nhất (tối đa 1 lần / 15 phút)
+
+
+def _proxy_dead(p: str) -> tuple[bool, str]:
+    import proxy_manager
+    ok, info = proxy_manager.test_proxy(p, 10.0)
+    if ok:
+        return False, info
+    time.sleep(3)
+    ok, info = proxy_manager.test_proxy(p, 15.0)
+    return (not ok), info
+
+
+def _resync_dead_proxies(reason: str) -> int:
+    """Nạp lại danh sách HomeProxy, chuyển TK đang ở proxy chết sang proxy sống. Trả về số TK được đổi proxy."""
+    import proxy_manager
+    with _PROXY_HEAL_LOCK:
+        if time.time() - _PROXY_SYNC_TS[0] < 900:
+            return 0
+        _PROXY_SYNC_TS[0] = time.time()
+    before = {a["id"]: a.get("proxy") for a in store.list_accounts()}
+    try:
+        res = proxy_manager.sync_all_accounts_with_homeproxy()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("🩺 [Proxy] Nạp lại / chia lại proxy lỗi: %s", exc)
+        return 0
+    moved = 0
+    for a in store.list_accounts():
+        if before.get(a["id"]) and a.get("proxy") and a.get("proxy") != before.get(a["id"]):
+            moved += 1
+            try:
+                engine.close_session_for_account(a["id"])
+            except Exception:  # noqa: BLE001
+                pass
+            store.clear_cooldown(a["id"])
+    log.warning("🩺 [Proxy] %s -> nạp lại HomeProxy: %s/%s proxy sống, đã chuyển %d TK sang proxy sống và cho chạy lại ngay",
+                reason, res.get("alive_proxies"), res.get("total_proxies"), moved)
+    return moved
+
+
+def _check_account_proxy(acc_id: str):
+    """Chạy nền khi TK lỗi khởi tạo trang muse.ai: proxy chết -> chia lại proxy."""
+    try:
+        import proxy_manager
+        if not proxy_manager.is_proxy_enabled():
+            return
+        acc = store.get_account(acc_id) or {}
+        p = acc.get("proxy")
+        if not p:
+            return
+        with _PROXY_HEAL_LOCK:
+            if time.time() - _PROXY_TEST_TS.get(p, 0.0) < 600:
+                return
+            _PROXY_TEST_TS[p] = time.time()
+        dead, info = _proxy_dead(p)
+        if dead:
+            store.update_account(acc_id, proxy_status="dead", proxy_error=str(info)[:200])
+            _resync_dead_proxies(f"Proxy {p.split(':')[0]} của TK {acc.get('label') or acc_id} đã chết ({str(info)[:80]})")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("🩺 [Proxy] Kiểm tra proxy TK %s lỗi: %s", acc_id, exc)
+
+
+def _kick_proxy_check(acc_id: str):
+    threading.Thread(target=_check_account_proxy, args=(acc_id,), daemon=True).start()
+
+
+def _proxy_health_sweep():
+    """Định kỳ: test mọi proxy đang có TK dùng; có proxy chết -> chia lại ngay (không chờ TK lỗi)."""
+    import concurrent.futures
+    import proxy_manager
+    if not proxy_manager.is_proxy_enabled():
+        return
+    in_use = sorted({a.get("proxy") for a in store.list_accounts() if a.get("proxy")})
+    if not in_use:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        dead = [p for p, (d, _i) in zip(in_use, ex.map(_proxy_dead, in_use)) if d]
+    if dead:
+        _resync_dead_proxies(f"Quét định kỳ: {len(dead)}/{len(in_use)} proxy đang dùng đã chết ({', '.join(p.split(':')[0] for p in dead[:5])})")
+
+
+# Muse từ chối NỘI DUNG của SP (ảnh có người / thuốc / thuốc lá / bản quyền / kiểm duyệt): lỗi do SP, không do TK.
+# -> không trừ điểm chất lượng TK, không đem SP đi thử tiếp ở TK khác (TK khác cũng từ chối, chỉ tốn lượt).
+_REFUSAL_RE = re.compile(
+    r"kiểm\s*duyệt|bản\s*quyền|thuốc\s*(?:lá|thú\s*y)|veterinary|marlboro|từ\s*chối\s*(?:sản\s*xuất|tạo)|"
+    r"ảnh\s*tham\s*chiếu\s*(?:là\s*collage|có\s*người|có\s*bé|đang\s*có|cho\s*thấy\s*người|là\s*nhóm\s*người)|"
+    r"không\s*(?:làm|thể\s*tạo|thể\s*làm)\s*video[^\n]{0,60}(?:cho\s*(?:sản\s*phẩm|mẫu|món)|được)|"
+    r"无法生成|做不了|can'?t\s*(?:create|make|generate)\s*(?:this|that|a\s*video\s*for)|against\s*(?:our|the)\s*polic",
+    re.I,
+)
+_TEXT_ONLY_STREAK: dict[str, int] = {}
+
+
+def _quota_has_tokens(acc: dict) -> bool:
+    """Lần kiểm tra hạn mức gần nhất cho thấy TK vẫn còn token (token bổ sung > 0 hoặc gói tuần chưa dùng hết)."""
+    q = (acc or {}).get("quota") or {}
+    if not q.get("found"):
+        return False
+    try:
+        from store import parse_token_count
+        tokens = parse_token_count(q.get("extra_left"))
+    except Exception:  # noqa: BLE001
+        tokens = None
+    weekly = q.get("weekly_used_pct")
+    return bool((tokens or 0) > 0 or (weekly is not None and weekly < 100))
+
+
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None) -> tuple[dict, str | None]:
@@ -884,6 +997,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
             first = False
             disconnected = False
             fast_skip = False
+            refusal_stop = False
 
             session = None
             try:
@@ -906,6 +1020,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 )
                 store.touch_keepalive(cur_acc["id"], True, "Phiên hợp lệ · Sẵn sàng")
                 store.record_vm_ok(cur_acc["id"])
+                _TEXT_ONLY_STREAK.pop(cur_acc["id"], None)
                 engine.release_session(session, error=False)
                 session = None
                 return res, cur_acc["id"]
@@ -936,16 +1051,36 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 err_str = str(exc)
                 disconnected = isinstance(exc, MuseAccountDisconnectedError)
                 is_token_out = "hết sạch 100% Token" in err_str or "0 tokens left" in err_str
-                is_quota = is_token_out or "hết hạn ngạch" in err_str or "额度不足" in err_str
+                # Muse báo "hết mức sử dụng" nhưng lần kiểm tra hạn mức gần nhất TK vẫn còn token: thường là chạm trần 24h
+                # (cửa sổ trượt) chứ chưa cạn token -> chỉ nghỉ 1 giờ như hạn mức 24h, không khoá cả ngày.
+                token_out_soft = is_token_out and _quota_has_tokens(cur_acc)
+                if token_out_soft:
+                    is_token_out = False
+                is_quota = token_out_soft or is_token_out or "hết hạn ngạch" in err_str or "额度不足" in err_str
                 is_region = "Khu vực/Proxy không hỗ trợ" in err_str or "403 Region Blocked" in err_str
                 is_vm_path = "Máy ảo Muse đọc sai đường dẫn ảnh" in err_str
                 is_init_fail = "Khởi tạo trang muse.ai" in err_str or "no-file-input" in err_str
+                is_text_only = "chỉ phản hồi văn bản" in err_str
+                refusal_stop = is_text_only and bool(_REFUSAL_RE.search(err_str))
                 fast_skip = disconnected or is_quota or is_region or is_vm_path or is_init_fail
                 log.warning("✗ [Video Gen] Lỗi tạo video với TK %s: %s", cur_acc["id"], exc)
-                if not fast_skip:
+                if not fast_skip and not refusal_stop:
                     store.record_outcome(cur_acc["id"], False)
+                if is_text_only and not refusal_stop:
+                    # TK trả lời bằng chữ (không rõ lý do) 3 lần liên tiếp: thường là TK đang bị Muse hạn chế ngầm -> nghỉ 30 phút
+                    n_txt = _TEXT_ONLY_STREAK.get(cur_acc["id"], 0) + 1
+                    _TEXT_ONLY_STREAK[cur_acc["id"]] = n_txt
+                    if n_txt >= 3:
+                        _TEXT_ONLY_STREAK[cur_acc["id"]] = 0
+                        store.block_until(cur_acc["id"], 1800)
+                        log.warning("😴 [Cooldown] TK %s (%s) chỉ trả lời bằng chữ %d lần liên tiếp -> nghỉ 30 phút, luồng dùng TK khác",
+                                    cur_acc["id"], cur_acc.get("label"), n_txt)
+                if refusal_stop:
+                    log.info("⛔ [Từ chối nội dung] Muse từ chối SP này (lỗi do SP, không do TK %s) -> dừng, không thử TK khác",
+                             cur_acc["id"])
                 if "Khởi tạo trang muse.ai" in err_str or "ProxyError" in err_str:
                     _kick_webshare_refresh()   # trang không mở được: có thể proxy Webshare đã bị thay -> nạp lại danh sách
+                    _kick_proxy_check(cur_acc["id"])   # proxy HomeProxy chết / hết hạn -> tự chia lại proxy sống
                 if disconnected:
                     # TK đang ở màn hình lỗi của Muse: mọi lần thử tiếp đều lỗi ngay -> cho TK nghỉ và đánh dấu đỏ ở tab Tài Khoản
                     # Muse. "Muse is disconnected" (Muse khoá TK) nghỉ 6 giờ; "Something went wrong" (phiên hỏng, có thể chớp
@@ -993,6 +1128,9 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 elif is_quota:
                     # Muse TỪ CHỐI thật vì hết hạn mức 24h: cho TK nghỉ 1 giờ (thử lại mỗi 1h để bắt kịp ngay khi cửa sổ 24h mở lại), đóng luôn các phiên khác của TK này
                     store.block_until(cur_acc["id"], 3600)
+                    if token_out_soft:
+                        store.mark(cur_acc["id"], True,
+                                   "Muse báo hết mức sử dụng nhưng TK vẫn còn token -> coi là chạm trần 24h, nghỉ 1 giờ rồi thử lại")
                     try:
                         engine.close_session_for_account(cur_acc["id"])
                     except Exception:
@@ -1076,6 +1214,8 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                         pass
                     session = None
 
+            if refusal_stop:
+                break
             if fast_skip and disc_skips < 12:
                 disc_skips += 1
                 continue
@@ -1901,6 +2041,324 @@ def unlock_account(aid: str, _=Depends(admin_auth)):
     return {"ok": True}
 
 
+# ---------- Mở TK trên cửa sổ Chrome thật để người dùng thao tác tay ----------
+# Mỗi TK 1 profile Chrome riêng (data/manual_profiles/<id>), đi qua ĐÚNG proxy cố định của TK (Meta thấy cùng IP với lúc
+# phần mềm chạy), cùng User-Agent với phiên tự động. Cookie mới nhất trong kho được bơm lại mỗi lần bấm "Mở".
+_MANUAL_BROWSERS: dict[str, tuple] = {}   # aid -> (Popen, cdp_port)
+_MANUAL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/131.0.0.0 Safari/537.36")
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _open_manual_browser(aid: str) -> dict:
+    import subprocess
+    from cdp import CDP, http_json
+    from engine import _BROWSER_SKIP_COOKIES
+    acc = store.get_account(aid)
+    if not acc:
+        raise HTTPException(404, "Tài khoản không tồn tại")
+    cookies = dict(acc.get("cookies") or {})
+    if not cookies:
+        raise HTTPException(400, "TK chưa có cookie")
+    if BROWSER_MANAGES_VM:
+        cookies = {k: v for k, v in cookies.items() if k not in _BROWSER_SKIP_COOKIES}
+
+    proxy_str, fwd_port = None, None
+    try:
+        import proxy_manager
+        if proxy_manager.is_proxy_enabled():
+            proxy_str = proxy_manager.ensure_alive_proxy_for_account(aid)
+            if proxy_str:
+                fwd_port = proxy_manager.start_local_forwarder(proxy_str)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Mở trình duyệt TK %s: không cấu hình được proxy: %s", aid, exc)
+    if proxy_str and not fwd_port:
+        raise HTTPException(502, "Không khởi động được proxy của TK (không mở trực tiếp để tránh lộ IP máy)")
+
+    prev = _MANUAL_BROWSERS.get(aid)
+    port = None
+    if prev and prev[0].poll() is None:
+        port = prev[1]          # cửa sổ của TK này đang mở: bơm lại cookie mới nhất, tải lại muse.ai và đưa cửa sổ lên trước
+    else:
+        port = _free_port()
+        prof = os.path.join(CFG.data_dir, "manual_profiles", aid)
+        os.makedirs(prof, exist_ok=True)
+        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            try:
+                os.unlink(os.path.join(prof, lock_name))
+            except OSError:
+                pass
+        args = [
+            CFG.chromium,
+            f"--user-data-dir={prof}",
+            f"--remote-debugging-port={port}",
+            f"--remote-allow-origins=http://127.0.0.1:{port},http://localhost:{port}",
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp", "--force-webrtc-ip-handling-policy",
+            "--lang=en-US,en", f"--user-agent={_MANUAL_UA}",
+            "--window-size=1366,860",
+        ]
+        if fwd_port:
+            args += [f"--proxy-server=http://127.0.0.1:{fwd_port}", "--proxy-bypass-list=<-loopback>"]
+        args.append("about:blank")
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _MANUAL_BROWSERS[aid] = (proc, port)
+
+    ws = None
+    for _ in range(40):
+        try:
+            targets = http_json(f"http://127.0.0.1:{port}/json/list", timeout=2) or []
+            page_t = next((t for t in targets if t.get("type") == "page"), None)
+            if page_t and page_t.get("webSocketDebuggerUrl"):
+                ws = page_t["webSocketDebuggerUrl"]
+                break
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.5)
+    if not ws:
+        raise HTTPException(500, "Không kết nối được tới cửa sổ Chrome vừa mở (kiểm tra đường dẫn Chrome / MUSE2API_CHROMIUM)")
+    page = CDP(ws, timeout=30)
+    try:
+        page.send("Network.enable")
+        engine._apply_cookies(page, cookies, acc.get("cookies_exp"))
+        page.send("Page.navigate", {"url": "https://muse.ai/"})
+        try:
+            page.send("Page.bringToFront")
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        try:
+            page.close()
+        except Exception:  # noqa: BLE001
+            pass
+    log.info("🖥️ [Mở TK] Đã mở Chrome cho TK %s (%s) qua proxy %s", acc.get("label"), aid, proxy_str or "Direct")
+    return {"ok": True, "proxy": proxy_str, "label": acc.get("label")}
+
+
+@app.post("/admin/accounts/{aid}/open-browser")
+async def open_account_browser(aid: str, _=Depends(admin_auth)):
+    return await asyncio.to_thread(_open_manual_browser, aid)
+
+
+# ---------- Lấy mã mời (Invite friends) của toàn bộ TK -> data/invite_codes.txt (user|code) ----------
+# Mã mời đi qua kênh mã hoá của máy ảo (không có API HTTP thường) nên phải mở trang: mỗi TK 1 phiên ẩn (Browser Context
+# riêng, đúng proxy của TK), bấm nút "Invite" ở đầu khung chat rồi đọc mã trong popover (bấm "Reveal" nếu mã còn bị che).
+INVITE_FILE = os.path.join(CFG.data_dir, "invite_codes.txt")
+_INVITE_JOB: dict = {"running": False, "total": 0, "done": 0, "ok": 0, "failed": 0, "started_at": 0, "finished_at": 0,
+                     "current": [], "file": INVITE_FILE}
+_INVITE_LOCK = threading.Lock()
+
+_INVITE_READ_JS = r"""(function(){
+  var root=[...document.querySelectorAll('[role=dialog],[data-radix-popper-content-wrapper]')]
+    .find(function(e){return /Invite friends/i.test(e.innerText||'');});
+  if(!root) return JSON.stringify({open:false});
+  var code=null;
+  var sp=root.querySelector('[data-pel-impression="invite_code_revealed_impression"]');
+  if(sp) code=(sp.getAttribute('title')||sp.textContent||'').trim();
+  if(!code){var st=[...root.querySelectorAll('[role=status]')].map(function(e){return e.textContent||'';}).join(' ');
+    var m=st.match(/Invite code revealed:\s*([A-Z0-9]{4,12})/i); if(m) code=m[1];}
+  var txt=root.innerText||'';
+  var uses=(txt.match(/(\d+)\s+uses?\s+left/i)||[])[1];
+  var reveal=!!root.querySelector('[aria-label="Reveal invite code"]');
+  return JSON.stringify({open:true, code:code, uses_left:uses?parseInt(uses):null, reveal:reveal, text:txt.slice(0,300)});
+})()"""
+
+
+def _fetch_invite_code(acc: dict) -> dict:
+    """Mở phiên ẩn cho TK, về khung chat chính (vì /thread/new là Side Chat chỉ hiện 'Back to main chat' chứ không hiện nút Invite),
+    bấm Invite và đọc mã. Trả về {"code","uses_left"} hoặc {"error"}."""
+    session = None
+    try:
+        session = engine.create_worker_session(cookies=acc["cookies"], expires=acc.get("cookies_exp"),
+                                               account_id=acc["id"], timeout=75, ttl_seconds=300, max_tasks=1)
+        page = session.page
+        btn_js = (
+            "(function(){"
+            "var b=[...document.querySelectorAll('button,[role=button]')]"
+            ".find(function(x){return /^\\s*invite\\s*$/i.test(x.innerText||'')||x.getAttribute('data-pel-click')==='invite_friends_open_click';});"
+            "if(b){b.click();return true;}"
+            "var back=[...document.querySelectorAll('button,[role=button],a')]"
+            ".find(function(x){return /back to main chat/i.test((x.innerText||x.getAttribute('aria-label')||'').trim());});"
+            "if(back){back.click();return 'back';}"
+            "return false;})()"
+        )
+        clicked = False
+        navigated_home = False
+        for i in range(45):                       # chờ về Main Chat + nút Invite hiện (~3-8 giây)
+            r = page.js(btn_js)
+            if r is True:
+                clicked = True
+                break
+            if r is False and i == 4 and not navigated_home:
+                navigated_home = True
+                try:
+                    page.send("Page.navigate", {"url": "https://muse.ai/"})
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(0.75)
+        if not clicked:
+            return {"error": "Không thấy nút Invite (TK chưa được Muse bật tính năng mời bạn)"}
+        info: dict = {}
+        revealed_click = False
+        for _ in range(40):
+            time.sleep(0.5)
+            try:
+                raw = page.js(_INVITE_READ_JS)
+                info = json.loads(raw) if isinstance(raw, str) and raw else {}
+            except Exception:  # noqa: BLE001
+                info = {}
+            if info.get("code"):
+                return {"code": info["code"].upper(), "uses_left": info.get("uses_left")}
+            if info.get("open") and info.get("reveal") and not revealed_click:
+                revealed_click = True
+                page.js("(function(){var c=document.querySelector('[aria-label=\"Reveal invite code\"]');if(c)c.click();})()")
+        return {"error": "Đã mở popover Invite nhưng không đọc được mã" if info.get("open") else "Popover Invite không mở được"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:150]}"}
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _write_invite_file() -> int:
+    rows = []
+    for a in store.list_accounts():
+        inv = a.get("invite") or {}
+        if inv.get("code"):
+            rows.append(f"{a.get('label') or a['id']}|{inv['code']}")
+    tmp = INVITE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(rows) + ("\n" if rows else ""))
+    os.replace(tmp, INVITE_FILE)
+    return len(rows)
+
+
+def _invite_job(ids: list[str], workers: int):
+    import concurrent.futures
+
+    def one(aid: str):
+        acc = store.get_account(aid)
+        if not acc:
+            return
+        label = acc.get("label") or aid
+        ok = False
+        with _INVITE_LOCK:
+            _INVITE_JOB["current"].append(label)
+        try:
+            res = _fetch_invite_code(acc)
+            old = acc.get("invite") or {}
+            if res.get("code"):
+                store.update_account(aid, invite={"code": res["code"], "uses_left": res.get("uses_left"),
+                                                  "checked_at": int(time.time())})
+                ok = True
+                log.info("🎁 [Mã mời] %s -> %s (còn %s lượt)", label, res["code"], res.get("uses_left"))
+            else:
+                # giữ mã cũ (nếu từng lấy được), chỉ ghi lỗi lần này
+                store.update_account(aid, invite={**old, "error": res.get("error"), "checked_at": int(time.time())})
+                ok = False
+                log.info("🎁 [Mã mời] %s -> lỗi: %s", label, res.get("error"))
+        finally:
+            with _INVITE_LOCK:
+                _INVITE_JOB["done"] += 1
+                _INVITE_JOB["ok" if ok else "failed"] += 1
+                if label in _INVITE_JOB["current"]:
+                    _INVITE_JOB["current"].remove(label)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            list(ex.map(one, ids))
+    finally:
+        try:
+            n = _write_invite_file()
+            log.info("🎁 [Mã mời] Xong: %d/%d TK lấy được mã -> %s (tổng %d dòng)", _INVITE_JOB["ok"], _INVITE_JOB["total"], INVITE_FILE, n)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Ghi file mã mời lỗi: %s", exc)
+        with _INVITE_LOCK:
+            _INVITE_JOB["running"] = False
+            _INVITE_JOB["finished_at"] = int(time.time())
+
+
+@app.post("/admin/invite-codes/collect")
+def collect_invite_codes(req: dict | None = None, _=Depends(admin_auth)):
+    """Bắt đầu lấy mã mời cho toàn bộ TK (chạy nền). force=true: lấy lại cả TK đã có mã trong 6 giờ qua."""
+    req = req or {}
+    with _INVITE_LOCK:
+        if _INVITE_JOB["running"]:
+            return {"started": False, "message": "Đang lấy mã mời, chờ xong lượt hiện tại", **_INVITE_JOB}
+        now = int(time.time())
+        force = bool(req.get("force"))
+        ids = []
+        for a in store.list_accounts():
+            if not a.get("enabled", True) or a.get("muse_locked"):
+                continue
+            inv = a.get("invite") or {}
+            if not force and inv.get("code") and now - int(inv.get("checked_at") or 0) < 6 * 3600:
+                continue
+            ids.append(a["id"])
+        workers = max(1, min(6, int(req.get("workers") or 3)))
+        _INVITE_JOB.update(running=True, total=len(ids), done=0, ok=0, failed=0, started_at=now, finished_at=0, current=[])
+    threading.Thread(target=_invite_job, args=(ids, workers), daemon=True).start()
+    return {"started": True, **_INVITE_JOB}
+
+
+@app.get("/admin/invite-codes/status")
+def invite_codes_status(_=Depends(admin_auth)):
+    have = sum(1 for a in store.list_accounts() if (a.get("invite") or {}).get("code"))
+    with _INVITE_LOCK:
+        return {**_INVITE_JOB, "current": list(_INVITE_JOB["current"]), "codes_total": have}
+
+
+@app.get("/admin/invite-codes/download")
+def invite_codes_download(_=Depends(admin_auth)):
+    _write_invite_file()
+    return FileResponse(INVITE_FILE, media_type="text/plain; charset=utf-8", filename="invite_codes.txt")
+
+
+@app.post("/admin/invite-codes/open")
+def invite_codes_open(_=Depends(admin_auth)):
+    n = _write_invite_file()
+    try:
+        if os.name == "nt":
+            os.startfile(INVITE_FILE)  # noqa: S606 — mở bằng trình soạn thảo mặc định (Notepad)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Không mở được file mã mời: %s", exc)
+    return {"ok": True, "file": INVITE_FILE, "lines": n}
+
+
+@app.post("/admin/accounts/{aid}/invite-code")
+async def get_single_account_invite_code(aid: str, _=Depends(admin_auth)):
+    """Lấy mã mời cho 1 tài khoản cụ thể, lưu vào kho và cập nhật file data/invite_codes.txt."""
+    acc = store.get_account(aid)
+    if not acc:
+        raise HTTPException(404, "Tài khoản không tồn tại")
+    if not acc.get("cookies"):
+        raise HTTPException(400, "Tài khoản chưa có cookie")
+
+    def _run():
+        res = _fetch_invite_code(acc)
+        old = acc.get("invite") or {}
+        if res.get("code"):
+            inv = {"code": res["code"], "uses_left": res.get("uses_left"), "checked_at": int(time.time())}
+            store.update_account(aid, invite=inv)
+            _write_invite_file()
+            log.info("🎁 [Mã mời] %s -> %s (còn %s lượt)", acc.get("label") or aid, res["code"], res.get("uses_left"))
+            return {"ok": True, **inv}
+        inv = {**old, "error": res.get("error"), "checked_at": int(time.time())}
+        store.update_account(aid, invite=inv)
+        return {"ok": False, "error": res.get("error") or "Không lấy được mã mời", **inv}
+
+    return await asyncio.to_thread(_run)
+
+
 @app.post("/admin/accounts/reset-all")
 def reset_all_accounts_api(_=Depends(admin_auth)):
     """Reset toàn bộ tài khoản (mở khoá muse_locked, xóa cooldown/lỗi/timeout và đóng các phiên trình duyệt cũ) để chạy lại từ đầu."""
@@ -2649,7 +3107,9 @@ def shopee_job_status(req: dict):
 @app.post("/api/shopee/import-links")
 def import_shopee_links(req: dict):
     """Nhập danh sách link Shopee từ nội dung file text hoặc mảng link."""
+    import importlib
     import shopee_scraper
+    importlib.reload(shopee_scraper)
 
     content = req.get("content", "")
     file_path = req.get("file_path", "")
@@ -2719,7 +3179,9 @@ def import_shopee_links(req: dict):
 @app.post("/api/shopee/fetch-single-link")
 def fetch_single_shopee_link(req: dict):
     """Cào thông tin tiêu đề, ảnh từ 1 link Shopee đơn lẻ."""
+    import importlib
     import shopee_scraper
+    importlib.reload(shopee_scraper)
     url = (req.get("url") or "").strip()
     if not url:
         raise HTTPException(400, "Thiếu URL sản phẩm Shopee")
@@ -4541,11 +5003,18 @@ async def _maintenance_loop():
     """Việc nền định kỳ: làm mới danh sách proxy Webshare (10 phút) và trả về hàng chờ các SP kẹt `processing` quá lâu (30 phút)."""
     await asyncio.sleep(60)
     last_reclaim = 0.0
+    last_proxy_sweep = 0.0
     while True:
         try:
             await asyncio.to_thread(_webshare_refresh_now, False)
         except Exception as exc:  # noqa: BLE001
             log.warning("Làm mới Webshare định kỳ lỗi: %s", exc)
+        try:
+            if time.time() - last_proxy_sweep >= 1800:
+                last_proxy_sweep = time.time()
+                await asyncio.to_thread(_proxy_health_sweep)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Quét sức khoẻ proxy lỗi: %s", exc)
         try:
             import auto_relogin as ar
             rcfg = ar.load_config()

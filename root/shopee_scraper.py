@@ -25,7 +25,13 @@ except Exception as _cffi_err:  # noqa: BLE001
     log.warning("curl_cffi không dùng được (%s: %s) -> cào Shopee bằng requests thường",
                 type(_cffi_err).__name__, _cffi_err)
 
-FACEBOOK_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+# Sử dụng WhatsApp Link-Preview User-Agent: Shopee đã chặn facebookexternalhit/Twitterbot/Googlebot (HTTP 403),
+# nhưng mở hoàn toàn SSR meta og:title + og:image (down-*.img.susercontent.com) cho WhatsApp preview bot.
+FACEBOOK_UA = "WhatsApp/2.23.20.0"
+FALLBACK_UAS = (
+    "WhatsApp/2.23.20.0",
+    "WhatsApp/2.24.12.78 A",
+)
 
 RE_OG_TITLE = re.compile(r'<meta[^>]*property=["\']og:title["\'][^>]*content=["\']([^"\']*)["\']', re.IGNORECASE)
 RE_OG_TITLE_ALT = re.compile(r'<meta[^>]*content=["\']([^"\']*)["\'][^>]*property=["\']og:title["\']', re.IGNORECASE)
@@ -37,7 +43,7 @@ RE_OG_IMAGE = re.compile(r'<meta[^>]*property=["\']og:image["\'][^>]*content=["\
 RE_OG_IMAGE_ALT = re.compile(r'<meta[^>]*content=["\']([^"\']*)["\'][^>]*property=["\']og:image["\']', re.IGNORECASE)
 
 RE_URL_DASH_I = re.compile(r'-i\.(\d+)\.(\d+)')
-RE_URL_PRODUCT = re.compile(r'product/(\d+)/(\d+)')
+RE_URL_PRODUCT = re.compile(r'(?:product|opaanlp)/(\d+)/(\d+)')
 RE_URL_ANY_ID = re.compile(r'(\d{8,15})')
 
 
@@ -59,9 +65,9 @@ def extract_ids_from_url(url: str) -> tuple[str, str]:
 
 
 def resolve_canonical_url(url: str) -> str:
-    """Chuẩn hóa URL sản phẩm Shopee."""
+    """Chuẩn hóa URL sản phẩm Shopee về dạng /product/{shop_id}/{item_id}."""
     shop_id, item_id = extract_ids_from_url(url)
-    if shop_id and item_id:
+    if shop_id and item_id and shop_id != "0":
         domain = urllib.parse.urlparse(url).netloc or "shopee.vn"
         return f"https://{domain}/product/{shop_id}/{item_id}"
     return url
@@ -87,44 +93,130 @@ def parse_shopee_links(text: str) -> list[str]:
     return valid_links
 
 
+def _clean_shopee_image_url(img_url: str) -> str:
+    s = html_mod.unescape(str(img_url or "")).strip()
+    if not s:
+        return ""
+    if s.startswith("//"):
+        s = "https:" + s
+    if "@resize" in s:
+        s = s.split("@resize")[0]
+    if s.endswith("_tn"):
+        s = s[:-3]
+    elif "_tn." in s:
+        s = s.replace("_tn.", ".")
+    return s
+
+
+def _http_get_html(target_url: str, timeout: int = 15, ua: str = FACEBOOK_UA) -> tuple[str, str, int]:
+    """Tải HTML từ Shopee với User-Agent chỉ định. Trả về (html, final_url, status_code)."""
+    if HAS_CURL_CFFI:
+        try:
+            resp = cffi_requests.get(
+                target_url,
+                impersonate="chrome124",
+                headers={"User-Agent": ua},
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            return resp.text or "", str(resp.url or target_url), int(resp.status_code or 0)
+        except Exception as e:  # noqa: BLE001
+            log.warning("curl_cffi lỗi khi cào %s (%s) -> thử lại bằng requests", target_url, e)
+    import requests as std_requests
+    resp = std_requests.get(
+        target_url,
+        headers={"User-Agent": ua},
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    return resp.text or "", str(resp.url or target_url), int(resp.status_code or 0)
+
+
+def _lookup_db_product(item_id: str) -> dict | None:
+    """Fallback tra cứu tên, ảnh và shop_id từ PostgreSQL shopee_products khi link bị Shopee ẩn hoặc chỉ có item_id."""
+    iid = str(item_id or "").strip()
+    if not iid.isdigit():
+        return None
+    try:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(
+            host=os.environ.get("SHOPEE_DB_HOST", "100.79.170.67"),
+            port=int(os.environ.get("SHOPEE_DB_PORT", "5432")),
+            dbname=os.environ.get("SHOPEE_DB_NAME", "shopee_db"),
+            user=os.environ.get("SHOPEE_DB_USER", "postgres"),
+            password=os.environ.get("SHOPEE_DB_PASS", "postgres123"),
+            connect_timeout=3,
+        )
+        try:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            cur.execute(
+                "SELECT item_id, shop_id, market, name, image_url FROM shopee_products WHERE item_id = %s LIMIT 1;",
+                (int(iid),),
+            )
+            row = cur.fetchone()
+            cur.close()
+            if row:
+                mkt = str(row.get("market") or "PH").lower()
+                mkt_dom = {"vn": "vn", "ph": "ph", "id": "co.id", "my": "com.my", "th": "co.th", "sg": "sg", "tw": "tw"}.get(mkt, "ph")
+                raw_img = _clean_shopee_image_url(row.get("image_url") or "")
+                if raw_img and not raw_img.startswith(("http://", "https://", "data:")):
+                    raw_img = f"https://cf.shopee.{mkt_dom}/file/{raw_img}"
+                return {
+                    "item_id": str(row["item_id"]),
+                    "shop_id": str(row.get("shop_id") or ""),
+                    "market": str(row.get("market") or ""),
+                    "name": str(row.get("name") or "").strip(),
+                    "image": raw_img,
+                }
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def fetch_shopee_product(url: str, timeout: int = 15) -> dict | None:
     """Cào thông tin chi tiết (tiêu đề, ảnh, mô tả) của 1 link Shopee."""
     raw_url = url.strip()
-    target_url = resolve_canonical_url(raw_url)
     shop_id, item_id = extract_ids_from_url(raw_url)
+
+    # Nếu URL chỉ có item_id (hoặc shop_id == "0"), thử tra shop_id từ Database trước để tạo canonical URL chuẩn
+    db_row = None
+    if item_id and item_id.isdigit() and (not shop_id or shop_id == "0"):
+        db_row = _lookup_db_product(item_id)
+        if db_row and db_row.get("shop_id") and db_row["shop_id"] != "0":
+            shop_id = db_row["shop_id"]
+            domain = urllib.parse.urlparse(raw_url).netloc or "shopee.vn"
+            target_url = f"https://{domain}/product/{shop_id}/{item_id}"
+        else:
+            target_url = resolve_canonical_url(raw_url)
+    else:
+        target_url = resolve_canonical_url(raw_url)
 
     html = ""
     final_url = target_url
 
     try:
-        resp = None
-        if HAS_CURL_CFFI:
-            try:
-                resp = cffi_requests.get(
-                    target_url,
-                    impersonate="chrome124",
-                    headers={"User-Agent": FACEBOOK_UA},
-                    timeout=timeout,
-                    allow_redirects=True
-                )
-            except Exception as e:  # noqa: BLE001 - curl_cffi lỗi lúc chạy (vd bản cũ không có chrome124)
-                log.warning("curl_cffi lỗi khi cào %s (%s) -> thử lại bằng requests", target_url, e)
-        if resp is not None:
-            html = resp.text
-            final_url = str(resp.url)
-        else:
-            import requests as std_requests
-            resp = std_requests.get(
-                target_url,
-                headers={"User-Agent": FACEBOOK_UA},
-                timeout=timeout,
-                allow_redirects=True
-            )
-            html = resp.text
-            final_url = str(resp.url)
+        for ua in FALLBACK_UAS:
+            html, final_url, status_code = _http_get_html(target_url, timeout=timeout, ua=ua)
+            # Nếu link rút gọn (s.shopee.*, shp.ee) redirect sang /opaanlp/{shop}/{item}, chuyển về /product/{shop}/{item}
+            s_id, i_id = extract_ids_from_url(final_url)
+            if s_id and i_id and s_id != "0":
+                shop_id, item_id = s_id, i_id
+                if not (RE_OG_IMAGE.search(html) or RE_OG_IMAGE_ALT.search(html)):
+                    dom = urllib.parse.urlparse(final_url).netloc or urllib.parse.urlparse(target_url).netloc or "shopee.vn"
+                    canon_after = f"https://{dom}/product/{s_id}/{i_id}"
+                    if canon_after != target_url:
+                        html, final_url, status_code = _http_get_html(canon_after, timeout=timeout, ua=ua)
+            if status_code == 200 and (RE_OG_IMAGE.search(html) or RE_OG_IMAGE_ALT.search(html)):
+                break
     except Exception as e:
         log.warning(f"Lỗi khi cào link {target_url}: {e}")
-        return None
+        if not db_row and item_id and item_id.isdigit():
+            db_row = _lookup_db_product(item_id)
+        if not db_row:
+            return None
 
     # Cập nhật lại shop_id và item_id từ URL cuối cùng sau redirect (ví dụ shp.ee -> shopee.vn/...-i.123.456)
     if not item_id or item_id.startswith("-") or len(item_id) < 6:
@@ -152,17 +244,23 @@ def fetch_shopee_product(url: str, timeout: int = 15) -> dict | None:
     m_title = RE_OG_TITLE.search(html) or RE_OG_TITLE_ALT.search(html)
     if m_title:
         title = html_mod.unescape(m_title.group(1)).strip()
-        # Loại bỏ các đuôi thương hiệu của Shopee
-        for sep in [" | Shopee Việt Nam", " | Shopee Philippines", " | Shopee", " - Shopee"]:
+        for sep in [" | Shopee Việt Nam", " | Shopee Philippines", " | Shopee Malaysia", " | Shopee Indonesia", " | Shopee Thailand", " | Shopee Singapore", " | Shopee", " - Shopee"]:
             idx = title.find(sep)
             if idx > 0:
                 title = title[:idx].strip()
                 break
         info["name"] = title
 
-    # Nếu Shopee trả về trang chặn anti-bot (không có og:title hợp lý)
-    if "Mua và Bán Trên Ứng Dụng" in info["name"] or "Shopee Verification" in info["name"]:
-        info["name"] = f"Shopee Product {info['item_id']}"
+    # Nếu Shopee trả về trang chủ / anti-bot (không có og:title sản phẩm thật)
+    bad_titles = (
+        "Mua và Bán Trên Ứng Dụng",
+        "Shopee Verification",
+        "Shop Online with Promos and Vouchers",
+        "Shopee Việt Nam",
+        "Shopee Philippines",
+    )
+    if any(bt in info["name"] for bt in bad_titles):
+        info["name"] = ""
 
     # 2. Trích xuất Mô tả (og:description)
     m_desc = RE_OG_DESC.search(html) or RE_OG_DESC_ALT.search(html)
@@ -172,13 +270,21 @@ def fetch_shopee_product(url: str, timeout: int = 15) -> dict | None:
     # 3. Trích xuất Ảnh đại diện (og:image)
     m_img = RE_OG_IMAGE.search(html) or RE_OG_IMAGE_ALT.search(html)
     if m_img:
-        img_url = html_mod.unescape(m_img.group(1)).strip()
-        if "@resize" in img_url:
-            img_url = img_url.split("@resize")[0]
-        if "_tn" in img_url:
-            img_url = img_url.replace("_tn", "")
-        info["image"] = img_url
-        info["images"] = [img_url]
+        img_url = _clean_shopee_image_url(m_img.group(1))
+        if img_url:
+            info["image"] = img_url
+            info["images"] = [img_url]
+
+    # 4. Fallback sang PostgreSQL Database nếu SP bị ẩn trên web hoặc thiếu ảnh/tên
+    if (not info["image"] or not info["name"]) and info["item_id"].isdigit():
+        if db_row is None:
+            db_row = _lookup_db_product(info["item_id"])
+        if db_row:
+            if not info["name"] and db_row.get("name"):
+                info["name"] = db_row["name"]
+            if not info["image"] and db_row.get("image"):
+                info["image"] = db_row["image"]
+                info["images"] = [db_row["image"]]
 
     # Nếu không có tên, đặt tên mặc định theo item_id
     if not info["name"]:
@@ -229,6 +335,7 @@ def scrape_multiple_shopee_links(links: list[str], max_workers: int = 5) -> list
             try:
                 prod_info = future.result()
                 if prod_info:
+                    prod_info["_input_url"] = link
                     results.append(prod_info)
                 else:
                     _, iid = extract_ids_from_url(link)
@@ -238,6 +345,7 @@ def scrape_multiple_shopee_links(links: list[str], max_workers: int = 5) -> list
                         "image": "",
                         "images": [],
                         "url": link,
+                        "_input_url": link,
                         "_status": "waiting",
                         "_need_fetch": True,
                         "_is_imported": True
@@ -251,6 +359,7 @@ def scrape_multiple_shopee_links(links: list[str], max_workers: int = 5) -> list
                     "image": "",
                     "images": [],
                     "url": link,
+                    "_input_url": link,
                     "_status": "waiting",
                     "_need_fetch": True,
                     "_is_imported": True
@@ -258,5 +367,8 @@ def scrape_multiple_shopee_links(links: list[str], max_workers: int = 5) -> list
 
     # Giữ nguyên thứ tự ban đầu của danh sách link
     link_order = {link: i for i, link in enumerate(links)}
-    results.sort(key=lambda p: link_order.get(p.get("url", ""), 999999))
+    results.sort(key=lambda p: link_order.get(p.get("_input_url") or p.get("url", ""), 999999))
+    for p in results:
+        p.pop("_input_url", None)
     return results
+

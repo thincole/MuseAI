@@ -582,6 +582,14 @@ class Store:
             self._COOLDOWN_UNTIL.pop(aid, None)
             self._COND.notify_all()
 
+    def clear_cooldown(self, aid: str):
+        """Xoá giờ nghỉ + chuỗi kẹt VM của TK (không ghi kết quả thành công). Dùng sau khi TK vừa được đổi sang proxy sống."""
+        with self._COND:
+            self._STUCK_STREAK.pop(aid, None)
+            self._TIMEOUT_STREAK.pop(aid, None)
+            self._COOLDOWN_UNTIL.pop(aid, None)
+            self._COND.notify_all()
+
     def acquire_account(self, preferred_id: str | None = None, exclude_id: str | None = None,
                         timeout: float = 60.0) -> dict | None:
         """Thuê tài khoản cho luồng render worker. Mỗi tài khoản phục vụ tối đa MAX_JOBS_PER_ACCOUNT luồng cùng lúc,

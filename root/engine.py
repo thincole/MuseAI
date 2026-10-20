@@ -1204,7 +1204,7 @@ class MuseEngine:
             # The caller's generation deadline remains the bounded timeout.
             # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件）
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
-                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact", cur_txt, re.I))
+                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact|\bdone\b|is\s+ready|delivered|passed\s+QC|đã\s+xong|xong\s+rồi|hoàn\s+(?:tất|thiện)|đính\s+kèm\s+bên\s+dưới", cur_txt, re.I))
                 if cur_txt == last_txt:
                     txt_stable += 1
                 else:
@@ -2161,7 +2161,17 @@ _QUOTA_EXHAUSTED_RE = re.compile(
     r"video (?:generation )?quota[^\n]{0,30}(?:exhausted|maxed out|reached|used up|limit)|"
     r"quota is (?:still )?maxed out|naabot na[^\n]{0,30}video limit|"
     r"Scheduled task[\s\S]{0,120}(?:视频|额度|配额|video|quota|tomorrow|will finish|will generate|Scheduled:)|"
-    r"已为你设置好定时任务[^\n]{0,40}(?:额度|配额)",
+    r"已为你设置好定时任务[^\n]{0,40}(?:额度|配额)|"
+    # Các câu Muse trả lời bằng chữ khi hết hạn mức 24h (thu thập từ log thật 20/10) — trước đây lọt thành "chỉ phản hồi văn bản"
+    r"(?:hạn\s*mức|quota|giới\s*hạn|ngân\s*sách|dung\s*lượng)[^\n]{0,40}(?:video|24\s*(?:giờ|h)|trong\s*ngày|hàng\s*ngày)[^\n]{0,45}"
+    r"(?:cạn|hết|đầy|chưa\s*(?:mở|reset|hồi|khôi\s*phục|được\s*làm\s*mới)|đã\s*dùng\s*hết)|"
+    r"hết\s*(?:giới\s*hạn|lượt)|chạm\s*(?:tới\s*|đến\s*)?giới\s*hạn|"
+    r"video\s*limit|(?:daily\s*)?video\s*budget|"
+    r"(?:lỗi|báo|error|code|mã)\s*:?\s*429|429\s*(?:ulit|error|lỗi)|"
+    # Agent đã tự lập hàng chờ / lịch chạy lại (vì nó biết TK hết hạn mức) -> không tạo video, chỉ ghi nhận
+    r"(?:vào|trong|ở|joining)\s*(?:the\s*)?(?:[\d:]+\s*)?(?:hàng\s*(?:chờ|đợi)|danh\s*sách\s*chờ|retry)|retry\s*run|lượt\s*chạy\s*lại|"
+    r"chạy\s*lại\s*lúc|thử\s*lại\s*(?:toàn\s*bộ\s*)?lúc|xếp\s*thứ\s*\d|auto-queue|"
+    r"(?:^|\n)\s*#\d{3,4}\s*(?:đã\s*nhận|nhận|received)",
     re.I,
 )
 
@@ -2853,7 +2863,7 @@ class MuseWorkerSession:
 
             # Phát hiện sớm khi mô hình chỉ trả lời bằng văn bản (không có Stop button và không có video sinh ra)
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
-                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact", cur_txt, re.I))
+                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact|\bdone\b|is\s+ready|delivered|passed\s+QC|đã\s+xong|xong\s+rồi|hoàn\s+(?:tất|thiện)|đính\s+kèm\s+bên\s+dưới", cur_txt, re.I))
                 if cur_txt == last_txt:
                     txt_stable += 1
                 else:
