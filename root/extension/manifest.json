@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Nhập Cookie MuseAI Video Studio",
+  "version": "1.0.0",
+  "description": "Tự động trích xuất Cookie đăng nhập từ muse.ai và đồng bộ vào ứng dụng MuseAI Studio chỉ với 1 click.",
+  "permissions": ["cookies", "storage", "activeTab"],
+  "host_permissions": [
+    "https://muse.ai/*",
+    "https://*.muse.ai/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_title": "Nhập Cookie MuseAI",
+    "default_popup": "popup.html"
+  }
+}

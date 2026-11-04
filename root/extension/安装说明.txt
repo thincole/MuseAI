@@ -1,0 +1,29 @@
+HƯỚNG DẪN CÀI ĐẶT TIỆN ÍCH NHẬP COOKIE MUSEAI CHO CHROME / EDGE
+=============================================================
+
+Tiện ích này giúp bạn đồng bộ toàn bộ Cookie phiên đăng nhập từ muse.ai
+vào ứng dụng MuseAI Video Studio chỉ với 1 click chuột.
+
+-------------------------------------------------------------
+BƯỚC 1: CÀI ĐẶT VÀO TRÌNH DUYỆT (CHỈ CẦN LÀM 1 LẦN)
+-------------------------------------------------------------
+1. Mở trình duyệt Chrome hoặc Microsoft Edge.
+2. Trên thanh địa chỉ, nhập:
+   - Nếu dùng Chrome: chrome://extensions
+   - Nếu dùng Edge  : edge://extensions
+   sau đó nhấn Enter.
+3. Bật công tắc "Chế độ dành cho nhà phát triển" (Developer mode).
+4. Nhấn nút "Tải tiện ích đã giải nén" (Load unpacked).
+5. Trỏ tới thư mục:
+   E:\0 - MuseAI\extension
+6. Nhấn "Select Folder" (Chọn thư mục).
+7. Tiện ích sẽ xuất hiện ngay trên trình duyệt của bạn.
+
+-------------------------------------------------------------
+BƯỚC 2: SỬ DỤNG
+-------------------------------------------------------------
+1. Trên trình duyệt này, mở trang https://muse.ai/ và đăng nhập tài khoản của bạn.
+2. Bấm vào biểu tượng tiện ích MuseAI trên thanh công cụ góc phải trình duyệt.
+3. Nhập API Key (lấy trong tab Cài Đặt của phần mềm MuseAI Studio).
+4. Nhấn nút: [ 🚀 ĐỌC COOKIE VÀ NHẬP VÀO STUDIO ].
+5. Tiện ích sẽ tự động đọc toàn bộ Cookie và gửi về phần mềm MuseAI để bắt đầu tạo video ngay lập tức!

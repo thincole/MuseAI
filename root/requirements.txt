@@ -1,0 +1,21 @@
+# Core API & Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+python-multipart>=0.0.9
+requests>=2.31.0
+websocket-client>=1.8.0
+
+# Desktop GUI (pywebview & WebView2)
+pywebview>=5.0.0
+pythonnet>=3.0.0
+
+# Auto-Login & Cookie Harvest Tools
+DrissionPage>=4.0.0
+PyQt6>=6.6.0
+
+# Shopee Scraper
+curl_cffi>=0.7.0
+
+# Database (kiểm tra SP trùng / trạng thái trên PostgreSQL)
+psycopg2-binary>=2.9.9

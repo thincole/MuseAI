@@ -1,0 +1,71 @@
+# ====================================================================
+# MuseAI Video Studio - Git Ignore (root/)
+# ====================================================================
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Environment & Credentials
+.env
+.env.local
+*.key
+*.pem
+
+# Runtime & User Data (chỉ giữ accounts.example.json và .gitkeep)
+proxy.txt
+data/*
+!data/accounts.example.json
+!data/media/
+data/media/*
+!data/media/.gitkeep
+!data/downloads/
+data/downloads/*
+!data/downloads/.gitkeep
+!data/shopee_images_cache/
+data/shopee_images_cache/*
+!data/shopee_images_cache/.gitkeep
+chrome-profile/
+muse2api-profiles/
+
+# Sensitive user data
+*-MUSE.txt
+*MUSE*.txt
+*khoa*.txt
+muse*lỗi*.txt
+
+# Developer Admin Scripts
+upload-github.bat
+tools/upload_github.py
+
+# Logs & Backups
+log.txt*
+*.log
+*.bak
+*.bak*
+*.swp
+*~
+
+# Archives
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z

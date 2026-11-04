@@ -1,0 +1,5 @@
+# Phụ thuộc cho các công cụ chạy trên Windows desktop (không cần cho server/Docker)
+#   pip install -r requirements.txt -r requirements-desktop.txt
+DrissionPage>=4.0       # auto_login_muse.py, gui_auto_login.py, tools/fix_missing_gw.py
+PyQt6>=6.5              # gui_auto_login.py
+pywebview>=5.0          # desktop_app.py (import webview)

@@ -1,0 +1,75 @@
+# ====================================================================
+# MuseAI Video Studio - Git Ignore
+# ====================================================================
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+
+# IDE & Agent folders
+.claude/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Environment & Credentials
+.env
+.env.local
+root/.env
+root/.env.local
+*.key
+*.pem
+
+# Runtime & User Data (chỉ giữ accounts.example.json và .gitkeep, tuyệt đối không đẩy dữ liệu tài khoản/proxy/profile)
+root/proxy.txt
+root/data/*
+!root/data/accounts.example.json
+!root/data/media/
+root/data/media/*
+!root/data/media/.gitkeep
+!root/data/downloads/
+root/data/downloads/*
+!root/data/downloads/.gitkeep
+!root/data/shopee_images_cache/
+root/data/shopee_images_cache/*
+!root/data/shopee_images_cache/.gitkeep
+root/chrome-profile/
+root/muse2api-profiles/
+
+# Sensitive user data (chứa email, mật khẩu, cookie, proxy)
+*-MUSE.txt
+*MUSE*.txt
+*khoa*.txt
+muse*lỗi*.txt
+
+# Developer Admin Scripts (chỉ giữ trên máy chính, không đưa lên GitHub)
+upload-github.bat
+root/upload-github.bat
+root/tools/upload_github.py
+
+# Logs & Backups
+log.txt*
+*.log
+*.bak
+*.bak*
+*.swp
+*~
+
+# Archives
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z
