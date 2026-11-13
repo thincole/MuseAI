@@ -38,7 +38,7 @@ log = logging.getLogger("hub_manager")
 hub_router = APIRouter()
 
 # Mỗi tài khoản Muse.ai cho phép chạy tối đa 2 luồng đồng thời
-MAX_CONCURRENT_PER_ACCOUNT = 2
+MAX_CONCURRENT_PER_ACCOUNT = 1
 DEFAULT_HUB_SERVER = "http://100.79.170.67:18610"
 HUB_CONFIG_FILE = os.path.join(CFG.data_dir, "hub_config.json")
 
@@ -617,6 +617,22 @@ class AccountHubManager:
 
         if feedback.get("quota") and isinstance(feedback["quota"], dict):
             self.store.update_account(aid, quota=feedback["quota"])
+        elif "hết sạch 100% Token" in err_msg or "0 tokens left" in err_msg:
+            from datetime import date, timedelta
+            from store import parse_token_count
+            q_cur = dict(acc.get("quota") or {})
+            if (parse_token_count(q_cur.get("extra_left")) or 0) <= 0:
+                q_cur.update({
+                    "plan": q_cur.get("plan") or "Free plan",
+                    "weekly_used_pct": 100,
+                    "extra_used_pct": 100,
+                    "extra_left": "0 tokens left",
+                    "extra_expires": q_cur.get("extra_expires") or "never",
+                    "weekly_reset": (date.today() + timedelta(days=7)).strftime("%b %d"),
+                    "found": True,
+                    "checked_at": int(time.time()),
+                })
+                self.store.update_account(aid, quota=q_cur)
 
         if feedback.get("proxy"):
             self.store.update_account(

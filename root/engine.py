@@ -391,7 +391,7 @@ class MuseEngine:
         self._browser_lock = threading.Lock()
         # Khóa: mã TK (ô 0) hoặc "mãTK#i" (ô i) khi 1 TK chạy nhiều video cùng lúc — xem _slot_keys
         self._session_pool: dict[str, "MuseWorkerSession"] = {}
-        self.max_jobs_per_account = 2
+        self.max_jobs_per_account = 1
         self._pool_lock = threading.Lock()
         self.proc_started_at = time.time()
         self.browser_ttl_seconds = int(getattr(cfg, "browser_ttl_seconds", 1800))

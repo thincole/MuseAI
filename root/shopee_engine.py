@@ -29,11 +29,15 @@ log = logging.getLogger("shopee_engine")
 
 
 def _ffmpeg_concurrency() -> int:
-    try:
-        n = int(os.environ.get("MUSE2API_FFMPEG_CONCURRENCY", "4").strip() or "4")
-    except (TypeError, ValueError):
-        n = 4
-    return max(1, min(n, 16))
+    env_val = os.environ.get("MUSE2API_FFMPEG_CONCURRENCY", "").strip()
+    if env_val:
+        try:
+            return max(1, min(int(env_val), 64))
+        except (TypeError, ValueError):
+            pass
+    # Tự động mở rộng số luồng ghép FFmpeg theo số luồng CPU của máy (VD: 56 luồng CPU -> 24 luồng ghép đồng thời)
+    cpu_threads = os.cpu_count() or 8
+    return max(8, min(32, cpu_threads // 2))
 
 
 # Concurrency Limiter: giới hạn số tiến trình FFmpeg encode/ghép video chạy đồng thời
@@ -45,6 +49,32 @@ def _ffmpeg_concurrency() -> int:
 FFMPEG_CONCURRENCY = _ffmpeg_concurrency()
 FFMPEG_SEMAPHORE = threading.BoundedSemaphore(FFMPEG_CONCURRENCY)
 FFMPEG_LOCK = FFMPEG_SEMAPHORE  # Giữ tên cũ để tương thích ngược (nếu module khác import).
+_FFMPEG_CONF_LOCK = threading.Lock()
+
+
+def set_ffmpeg_concurrency(n) -> int:
+    """Thay đổi động số luồng FFmpeg ghép video chạy đồng thời ngay trong RAM (đánh thức ngay các luồng đang chờ)."""
+    global FFMPEG_CONCURRENCY, FFMPEG_SEMAPHORE, FFMPEG_LOCK
+    try:
+        val = max(1, min(int(n), 64))
+    except (TypeError, ValueError):
+        val = _ffmpeg_concurrency()
+    with _FFMPEG_CONF_LOCK:
+        old_val = FFMPEG_CONCURRENCY
+        FFMPEG_CONCURRENCY = val
+        try:
+            with FFMPEG_SEMAPHORE._cond:
+                old_init = getattr(FFMPEG_SEMAPHORE, "_initial_value", old_val)
+                diff = val - old_init
+                FFMPEG_SEMAPHORE._initial_value = val
+                FFMPEG_SEMAPHORE._value = max(0, FFMPEG_SEMAPHORE._value + diff)
+                if diff > 0:
+                    FFMPEG_SEMAPHORE._cond.notify_all()
+        except Exception:
+            FFMPEG_SEMAPHORE = threading.BoundedSemaphore(val)
+            FFMPEG_LOCK = FFMPEG_SEMAPHORE
+    log.info("🎞️ [FFmpeg] Đã đặt số luồng ghép video đồng thời: %d luồng", FFMPEG_CONCURRENCY)
+    return FFMPEG_CONCURRENCY
 
 
 def _safe_remove(path: str | None) -> None:

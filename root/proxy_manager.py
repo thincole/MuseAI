@@ -931,15 +931,28 @@ def sync_all_accounts_with_homeproxy(rebalance: bool = False) -> dict:
 
     alive_ip = dict(alive_proxies)
     cap = -(-len(accounts) // len(alive_ip)) if alive_ip else 0
+    base_cap = (len(accounts) // len(alive_ip)) if alive_ip else 0
+    extra_slots = (len(accounts) % len(alive_ip)) if alive_ip else 0
+    extra_used = 0
     loads = {p: 0 for p in alive_ip}
     keep, to_assign = [], []
     for a in accounts:
         p = a.get("proxy")
-        if p in loads and (not rebalance or loads[p] < cap):
-            loads[p] += 1
-            keep.append(a)
-        else:
-            to_assign.append(a)
+        if p in loads:
+            if not rebalance:
+                loads[p] += 1
+                keep.append(a)
+                continue
+            if loads[p] < base_cap:
+                loads[p] += 1
+                keep.append(a)
+                continue
+            if loads[p] == base_cap and extra_used < extra_slots:
+                loads[p] += 1
+                extra_used += 1
+                keep.append(a)
+                continue
+        to_assign.append(a)
     # Số TK đang vượt mức chia đều (chỉ báo, không tự chuyển nếu người dùng chưa xác nhận)
     overloaded = sum(max(0, n - cap) for n in loads.values()) if not rebalance else 0
     rebalanced = 0
@@ -985,4 +998,26 @@ def get_forwarder_url_for_account(acc_id: str) -> str | None:
     except Exception as e:
         log.warning("Không thể lấy forwarder url cho TK %s: %s", acc_id, e)
     return None
+
+
+def import_proxies_from_txt(raw_text: str, filename: str = "") -> dict:
+    """Nhập danh sách proxy từ nội dung file .txt, lưu vào cấu hình Manual Proxy và chia đều cho toàn bộ tài khoản đang có."""
+    good, invalid = normalize_proxy_lines(raw_text)
+    if not good:
+        raise ValueError(
+            "Không tìm thấy dòng proxy hợp lệ nào trong file .txt! "
+            "Hỗ trợ định dạng: host:port:user:pass, user:pass@host:port hoặc host:port (mỗi dòng 1 proxy)."
+        )
+    set_manual_proxies(good)
+    set_provider(PROVIDER_MANUAL)
+    set_proxy_enabled(True)
+    save_proxy_pool(good, source=POOL_SOURCE_MANUAL)
+    res = sync_all_accounts_with_homeproxy(rebalance=True)
+    res["provider"] = PROVIDER_MANUAL
+    res["invalid_lines"] = invalid[:20]
+    res["filename"] = filename
+    log.info("📂 [Proxy TXT] Đã nhập %d proxy từ '%s' (%d sống) và chia đều cho %d tài khoản (tối đa %d TK/proxy)",
+             len(good), filename or "file .txt", res.get("alive_proxies", 0),
+             res.get("total_accounts", 0), res.get("max_accounts_per_proxy", 0))
+    return res
 

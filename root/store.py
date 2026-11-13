@@ -11,7 +11,7 @@ import uuid
 from collections import deque
 from datetime import date, datetime, timedelta
 
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 # Khóa riêng cho tasks.json: ghi task không được chặn việc thuê/trả tài khoản (_LOCK).
 _TASK_LOCK = threading.Lock()
 
@@ -417,13 +417,15 @@ class Store:
 
     # ---------- 账号 ----------
     def add_account(self, cookies: dict, label: str = "",
-                    cookies_exp: dict | None = None) -> dict:
+                    cookies_exp: dict | None = None,
+                    enabled: bool = False) -> dict:
         with _LOCK:
             self._sync_from_disk()
             exp = {k: int(v) for k, v in (cookies_exp or {}).items()
                    if _is_pos(v)}
             now = int(time.time())
             clean_label = (label or "").strip()
+            init_enabled = bool(enabled)
 
             # Nếu trong Studio đã có tài khoản (trùng email/label) thì ghi đè chứ không ghi mới
             matched = [
@@ -440,10 +442,14 @@ class Store:
                 target["cookies_exp"] = exp
                 target["expires_at"] = account_expiry(exp, now)
                 target["expiry_anchor"] = None
-                target["enabled"] = True
+                target["enabled"] = init_enabled
                 target["muse_locked"] = False      # cookie mới -> mở khoá TK (đã bị khoá vì phiên hết hạn)
                 target["ok"] = None
-                target["note"] = "Đã cập nhật cookie (ghi đè)"
+                target["note"] = (
+                    "Đã cập nhật cookie (ghi đè)"
+                    if init_enabled
+                    else "Mới nhập (ghi đè) — đang TẮT, bấm Bật để giao việc"
+                )
                 target["synced_at"] = now
                 self._save_accounts()
                 return target
@@ -452,10 +458,12 @@ class Store:
             acc = {"id": aid, "label": clean_label or aid, "cookies": cookies,
                    "cookies_exp": exp, "expires_at": account_expiry(exp, now),
                    "expiry_anchor": None,
-                   "enabled": True, "created_at": now,
+                   "enabled": init_enabled, "created_at": now,
                    "last_used": None, "last_keepalive": None, "use_count": 0,
                    "success_count": 0, "success_since_use": 0, "last_success_at": None,
-                   "ok": None, "note": "", "synced_at": None}
+                   "ok": None,
+                   "note": "" if init_enabled else "Mới nhập — đang TẮT, bấm Bật để giao việc",
+                   "synced_at": None}
             self.accounts.append(acc)
             self._save_accounts()
             return acc
@@ -546,7 +554,7 @@ class Store:
     # Số việc đang chạy của từng TK; mỗi TK nhận tối đa MAX_JOBS_PER_ACCOUNT việc cùng lúc (ô "Số video cùng lúc / tài khoản": 1 hoặc 2).
     _BUSY_COUNT: dict[str, int] = {}
     _LAST_ACQUIRE_TS: dict[str, float] = {}
-    MAX_JOBS_PER_ACCOUNT = 2
+    MAX_JOBS_PER_ACCOUNT = 1
     # Khoảng cách tối thiểu (giây) trước khi giao luồng thứ 2 vào cùng 1 tài khoản đang bận để tránh nghẽn máy ảo Muse.
     SAME_ACCOUNT_STAGGER_SECONDS = 15.0
     # Bỏ qua TK hết sạch cả gói tuần (100%) lẫn token bổ sung (0 token) khi giao việc.
@@ -570,12 +578,8 @@ class Store:
             self._COND.notify_all()
 
     def set_max_jobs_per_account(self, n) -> int:
-        try:
-            n = int(n)
-        except (TypeError, ValueError):
-            n = 2
         with self._COND:
-            Store.MAX_JOBS_PER_ACCOUNT = max(1, min(2, n))
+            Store.MAX_JOBS_PER_ACCOUNT = 1
             self._COND.notify_all()
         return Store.MAX_JOBS_PER_ACCOUNT
     # Cooldown (trong RAM, mở lại app là xóa): TK kẹt VM liên tiếp thì cho nghỉ, hết giờ nghỉ được thử lại 1 lần.
@@ -677,7 +681,7 @@ class Store:
         """Số TK dùng được và tổng số 'ô' việc song song hiện có (để gợi ý số luồng hợp lý)."""
         if self.is_hub_client():
             st = self._fetch_hub_status() or {}
-            base = int(st.get("max_slots_per_account") or Store.MAX_JOBS_PER_ACCOUNT or 2)
+            base = int(st.get("max_slots_per_account") or Store.MAX_JOBS_PER_ACCOUNT or 1)
             total = int(st.get("total_accounts") or 0)
             usable = int(st.get("alive_accounts") or 0)
             slots = int(st.get("total_slots") or (usable * base))
@@ -866,7 +870,8 @@ class Store:
             self._sync_from_disk()
             count = 0
             for a in self.accounts:
-                a["enabled"] = True
+                if a.get("enabled") is None:
+                    a["enabled"] = True
                 a["checked_at"] = now_ts
                 cks = a.get("cookies") or {}
                 if not cks.get("hatch_vml"):
@@ -1029,7 +1034,7 @@ class Store:
           - 读不到且锚点为空                -> 把锚点钉在当下（只钉一次）；
           - 补入全新会话 cookie（重登）      -> 调用方显式传 expiry_anchor=now 重置。
         """
-        with _LOCK:
+        with self._COND:
             self._sync_from_disk()
             for a in self.accounts:
                 if a["id"] == aid:
@@ -1044,9 +1049,26 @@ class Store:
                             a["expiry_anchor"] = int(time.time())
                         a["expires_at"] = account_expiry(
                             ce, a.get("expiry_anchor") or a.get("created_at"))
+                    if "enabled" in kw and kw["enabled"] is not None:
+                        if kw["enabled"] and (a.get("note") or "").startswith("Mới nhập"):
+                            a["note"] = "Đã bật — sẵn sàng nhận việc"
                     self._save_accounts()
+                    self._COND.notify_all()
                     return a
         return None
+
+    def set_all_enabled(self, enabled: bool) -> int:
+        """Bật hoặc Tắt giao việc cho toàn bộ tài khoản trong hệ thống."""
+        flag = bool(enabled)
+        with self._COND:
+            self._sync_from_disk()
+            for a in self.accounts:
+                a["enabled"] = flag
+                if flag and (a.get("note") or "").startswith("Mới nhập"):
+                    a["note"] = "Đã bật — sẵn sàng nhận việc"
+            self._save_accounts(force=True)
+            self._COND.notify_all()
+            return len(self.accounts)
 
     def stats(self) -> dict:
         if self.is_hub_client():

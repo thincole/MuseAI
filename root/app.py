@@ -455,6 +455,7 @@ class AccountRequest(BaseModel):
     cookie_header: str | None = None
     batch: str | None = None          # 多行文本，每行一个账号
     expires: dict[str, int] = Field(default_factory=dict)   # cookie 名 -> 过期时间戳
+    enabled: bool = False             # Mặc định tài khoản mới import vào ở trạng thái TẮT (không giao việc)
 
 
 class AccountPatch(BaseModel):
@@ -1209,13 +1210,20 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 else:
                     store.mark(cur_acc["id"], True, f"Tác vụ gián đoạn: {err_str[:75]}")
                 if is_token_out:
-                    q_cur = cur_acc.get("quota") or {}
-                    if not q_cur.get("found"):
-                        store.update_account(cur_acc["id"], quota={
-                            "plan": "Free plan", "weekly_used_pct": 100, "extra_used_pct": 100,
-                            "extra_left": "0 tokens left", "extra_expires": "never",
-                            "found": True, "checked_at": int(time.time())
-                        })
+                    from datetime import date, timedelta
+                    q_cur = dict(cur_acc.get("quota") or {})
+                    next_reset = (date.today() + timedelta(days=7)).strftime("%b %d")
+                    q_cur.update({
+                        "plan": q_cur.get("plan") or "Free plan",
+                        "weekly_used_pct": 100,
+                        "extra_used_pct": 100,
+                        "extra_left": "0 tokens left",
+                        "extra_expires": q_cur.get("extra_expires") or "never",
+                        "weekly_reset": next_reset,
+                        "found": True,
+                        "checked_at": int(time.time()),
+                    })
+                    store.update_account(cur_acc["id"], quota=q_cur)
                     store.block_until(cur_acc["id"], 24 * 3600)
                     try:
                         engine.close_session_for_account(cur_acc["id"])
@@ -1961,7 +1969,7 @@ def _build_hub_ui_info(request: Request) -> tuple[bool, dict]:
         "total_slots": int(hub_st.get("total_slots", 0)),
         "used_slots": int(hub_st.get("used_slots", 0)),
         "available_slots": int(hub_st.get("available_slots", 0)),
-        "max_slots_per_account": int(hub_st.get("max_slots_per_account", 2)),
+        "max_slots_per_account": int(hub_st.get("max_slots_per_account", 1)),
         "connected_clients_count": len(hub_st.get("connected_clients") or {}),
         "hub_connected": bool(hub_st and "total_accounts" in hub_st),
     }
@@ -2042,9 +2050,10 @@ def add_account(req: AccountRequest, _=Depends(admin_auth)):
 
     if req.batch:
         for label, cookies in parse_batch(req.batch):
-            acc = store.add_account(cookies, label)
+            acc = store.add_account(cookies, label, enabled=req.enabled)
             seen.append(cookies)
             added.append({"id": acc["id"], "label": acc["label"],
+                          "enabled": acc.get("enabled", False),
                           "cookie_count": len(cookies),
                           "expires_at": acc.get("expires_at")})
 
@@ -2052,9 +2061,10 @@ def add_account(req: AccountRequest, _=Depends(admin_auth)):
     if req.cookie_header:
         cookies.update(parse_cookie_text(req.cookie_header))
     if cookies:
-        acc = store.add_account(cookies, req.label, cookies_exp=req.expires)
+        acc = store.add_account(cookies, req.label, cookies_exp=req.expires, enabled=req.enabled)
         seen.append(cookies)
         added.append({"id": acc["id"], "label": acc["label"],
+                      "enabled": acc.get("enabled", False),
                       "cookie_count": len(cookies),
                       "expires_at": acc.get("expires_at")})
 
@@ -2075,8 +2085,26 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(admin_auth)):
     acc = store.update_account(aid, label=req.label, enabled=req.enabled)
     if not acc:
         raise HTTPException(404, "Tài khoản không tồn tại")
+    if req.enabled is False:
+        try:
+            engine.close_session_for_account(aid)
+        except Exception:
+            pass
     return {k: v for k, v in acc.items() if k != "cookies"} | {
         "cookie_count": len(acc.get("cookies", {}))}
+
+
+@app.post("/admin/accounts/toggle-all")
+def toggle_all_accounts(payload: dict = Body(default={}), _=Depends(admin_auth)):
+    enabled = bool(payload.get("enabled", True))
+    count = store.set_all_enabled(enabled)
+    if not enabled:
+        try:
+            for a in store.list_accounts():
+                engine.close_session_for_account(a["id"])
+        except Exception:
+            pass
+    return {"ok": True, "enabled": enabled, "count": count}
 
 
 @app.delete("/admin/accounts/{aid}")
@@ -2524,7 +2552,7 @@ def collect_invite_codes(req: dict | None = None, _=Depends(admin_auth)):
         force = bool(req.get("force"))
         ids = []
         for a in store.list_accounts():
-            if not a.get("enabled", True) or a.get("muse_locked"):
+            if a.get("muse_locked"):
                 continue
             inv = a.get("invite") or {}
             if not force and inv.get("code") and now - int(inv.get("checked_at") or 0) < 6 * 3600:
@@ -3041,7 +3069,8 @@ def _get_shopee_settings() -> dict:
         "min_sold": "0",
         "min_price": "0",
         "max_price": "",
-        "jobs_per_account": 2,
+        "jobs_per_account": 1,
+        "ffmpeg_concurrency": shopee_engine.FFMPEG_CONCURRENCY,
         "skip_exhausted_accounts": True
     }
     if os.path.isfile(SHOPEE_SETTINGS_FILE):
@@ -3051,6 +3080,7 @@ def _get_shopee_settings() -> dict:
                 default_settings.update(saved)
         except Exception:
             pass
+    default_settings["jobs_per_account"] = 1
     return default_settings
 
 
@@ -3060,9 +3090,9 @@ def get_shopee_settings():
 
 
 def _apply_jobs_per_account(value) -> int:
-    """Áp dụng ô "Số video cùng lúc / tài khoản" (1-2) cho bộ cấp TK và pool phiên Chrome."""
-    n = store.set_max_jobs_per_account(value)
-    engine.max_jobs_per_account = n
+    """Cố định mỗi tài khoản chỉ chạy tối đa 1 luồng video tại một thời điểm."""
+    n = store.set_max_jobs_per_account(1)
+    engine.max_jobs_per_account = 1
     return n
 
 
@@ -3073,9 +3103,11 @@ def save_shopee_settings(settings: dict):
         json.dump(settings, f, ensure_ascii=False, indent=2)
     if "jobs_per_account" in settings:
         _apply_jobs_per_account(settings["jobs_per_account"])
+    if "ffmpeg_concurrency" in settings:
+        shopee_engine.set_ffmpeg_concurrency(settings["ffmpeg_concurrency"])
     if "skip_exhausted_accounts" in settings:
         store.set_skip_exhausted(settings["skip_exhausted_accounts"])
-    return {"success": True}
+    return {"success": True, "ffmpeg_concurrency": shopee_engine.FFMPEG_CONCURRENCY}
 
 
 def _update_env_file(env_path: str, updates: dict[str, str]):
@@ -4263,6 +4295,25 @@ def sync_thinaptm_proxies(req: dict | None = None):
     return proxy_manager.sync_all_accounts_with_homeproxy(rebalance=bool((req or {}).get("rebalance")))
 
 
+@app.post("/api/proxy/import-txt")
+def import_proxies_txt_api(req: dict):
+    """Nhập danh sách proxy từ file .txt và chia đều cho toàn bộ các tài khoản hiện có."""
+    import proxy_manager
+    content = str((req or {}).get("content") or (req or {}).get("manual_proxies") or "")
+    filename = str((req or {}).get("filename") or "proxy.txt").strip()
+    try:
+        res = proxy_manager.import_proxies_from_txt(content, filename=filename)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Lỗi khi nhập proxy từ file .txt: {exc}")
+    try:
+        engine.close_all_sessions()
+    except Exception as exc:
+        log.warning("Không làm mới được phiên trình duyệt sau khi nhập proxy từ TXT: %s", exc)
+    return res
+
+
 @app.post("/api/proxy/test/{acc_id}")
 def test_account_proxy(acc_id: str):
     import proxy_manager
@@ -5186,8 +5237,11 @@ async def _startup():
             200, anyio.to_thread.current_default_thread_limiter().total_tokens)
     except Exception as exc:
         log.warning("Không nới được threadpool anyio: %s", exc)
-    n_jobs = _apply_jobs_per_account(_get_shopee_settings().get("jobs_per_account", 2))
+    n_jobs = _apply_jobs_per_account(1)
     log.info("🎬 Số video cùng lúc / tài khoản: %d", n_jobs)
+    sp_init = _get_shopee_settings()
+    if sp_init.get("ffmpeg_concurrency"):
+        shopee_engine.set_ffmpeg_concurrency(sp_init["ffmpeg_concurrency"])
     skip_ex = store.set_skip_exhausted(_get_shopee_settings().get("skip_exhausted_accounts", False))
     log.info("🔋 Bỏ qua TK hết token khi giao việc: %s", "BẬT" if skip_ex else "tắt")
     # Luồng xử lý (ảnh lẫn video) đã chết khi tắt app: đóng các task còn treo để không bị đếm/kẹt mãi.

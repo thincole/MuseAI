@@ -846,12 +846,19 @@ class MuseAutoLogin:
                                             "label": email,
                                             "cookies": all_c,
                                             "cookie_header": cstr,
-                                            "expires": {k: int(v) for k, v in c_exp.items() if v > 0}
+                                            "expires": {k: int(v) for k, v in c_exp.items() if v > 0},
+                                            "enabled": False,
                                         }
                                         r = requests.post(url, json=payload, headers=headers, timeout=5)
                                         if r.status_code == 200:
                                             synced_live = True
-                                            log_success(f"[Luồng {wid}] [{email}] {Colors.BOLD}Đã nạp thành công vào MuseAI Studio qua Live API!{Colors.ENDC}")
+                                            try:
+                                                for item in (r.json().get("added") or []):
+                                                    if item.get("id"):
+                                                        requests.patch(f"{url}/{item['id']}", json={"enabled": False}, headers=headers, timeout=5)
+                                            except Exception:
+                                                pass
+                                            log_success(f"[Luồng {wid}] [{email}] {Colors.BOLD}Đã nạp thành công vào MuseAI Studio (trạng thái TẮT)!{Colors.ENDC}")
                                     except Exception:
                                         pass
 
@@ -950,12 +957,19 @@ class MuseAutoLogin:
                                         "label": email,
                                         "cookies": res["cookies"],
                                         "cookie_header": cookie_str,
-                                        "expires": {k: int(v) for k, v in res["cookies_exp"].items() if v > 0}
+                                        "expires": {k: int(v) for k, v in res["cookies_exp"].items() if v > 0},
+                                        "enabled": False,
                                     }
                                     r = requests.post(url, json=payload, headers=headers, timeout=5)
                                     if r.status_code == 200:
                                         synced_live = True
-                                        log_success(f"[{email}] Đã nạp thành công vào MuseAI Studio qua Live API!")
+                                        try:
+                                            for item in (r.json().get("added") or []):
+                                                if item.get("id"):
+                                                    requests.patch(f"{url}/{item['id']}", json={"enabled": False}, headers=headers, timeout=5)
+                                        except Exception:
+                                            pass
+                                        log_success(f"[{email}] Đã nạp thành công vào MuseAI Studio (trạng thái TẮT)!")
                                 except Exception:
                                     pass
 

@@ -38,6 +38,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Lấy mã OTP trên DongVanFB: số lần đọc hòm thư và số giây chờ giữa 2 lần (trang đôi khi phải đọc lại mới có thư)
 DEAD_STATUS = "ACC CHẾT (Muse is disconnected)"
+CAPTCHA_STATUS = "Bị Captcha tay (Bỏ qua)"
 CHECKPOINT_STATUS = "TK LỖI (Muse chuyển sang Instagram)"
 OTP_READ_ATTEMPTS = 10
 OTP_READ_INTERVAL = 5
@@ -133,47 +134,52 @@ def is_recent_dongvan_time(time_str: str, max_age_seconds: int = 3600) -> bool:
 
 
 # ============================================================================
-# PROXY CỐ ĐỊNH CHO TỪNG LUỒNG (HomeProxy): mỗi luồng đăng nhập 1 IP riêng, không dùng IP thật của máy
+# PROXY CỐ ĐỊNH CHO TỪNG LUỒNG: Import từ file TXT hoặc theo MuseAI Studio
 # ============================================================================
-PROXY_SRC_APP = "app"            # theo "Nguồn Proxy" trong cài đặt MuseAI Studio
-PROXY_SRC_HOMEPROXY = "homeproxy"
-PROXY_SRC_WEBSHARE = "webshare"
+PROXY_SRC_FILE = "file"          # Import danh sách từ file TXT
+PROXY_SRC_APP = "app"            # Theo "Nguồn Proxy" trong cài đặt MuseAI Studio
 
 
-def _proxy_pool_for(pm, source: str, webshare_key: str, log=None) -> list[str]:
-    """Danh sách proxy theo nguồn đã chọn trong công cụ. Nguồn trùng với nguồn đang chạy của MuseAI Studio thì dùng chung
-    danh sách (có cache); nguồn khác thì chỉ lấy để dùng, KHÔNG ghi đè cache/cài đặt của MuseAI Studio."""
-    app_src = pm.get_provider()
-    src = app_src if source in ("", PROXY_SRC_APP) else source
-    if src == app_src:
-        return pm.get_cached_proxy_pool() or pm.load_proxies_from_thinaptm()
-    if src == PROXY_SRC_WEBSHARE:
-        key = (webshare_key or pm.get_webshare_key()).strip()
-        if not key:
+def _proxy_pool_for(pm, source: str, proxy_file_path: str = "", log=None) -> list[str]:
+    """Danh sách proxy theo nguồn đã chọn trong công cụ (file TXT hoặc theo MuseAI Studio)."""
+    if source == PROXY_SRC_FILE:
+        path = (proxy_file_path or "").strip()
+        if not path:
+            path = os.path.join(BASE_DIR, "proxy.txt")
+        if not os.path.isfile(path):
             if log:
-                log("Chưa có API key Webshare -> không có proxy.")
+                log(f"[!] Không tìm thấy file proxy: {path}")
             return []
-        lst = pm.fetch_proxies_from_webshare(key)
+        proxies = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if s and not s.startswith("#"):
+                        proxies.append(s)
+        except Exception as exc:
+            if log:
+                log(f"[!] Lỗi đọc file proxy ({exc})")
+            return []
         if log:
-            log(f"Webshare: lấy được {len(lst)} proxy.")
-        return lst
-    lst = pm.fetch_proxies_from_homeproxy_api(pm.HOMEPROXY_TOKEN or pm.DEFAULT_HOMEPROXY_TOKEN)
-    if log:
-        log(f"HomeProxy: lấy được {len(lst)} proxy.")
-    return lst
+            log(f"Đã đọc {len(proxies)} proxy từ file: {os.path.basename(path)}")
+        return proxies
+
+    # Theo MuseAI Studio
+    return pm.get_cached_proxy_pool() or pm.load_proxies_from_thinaptm()
 
 
-def pick_worker_proxies(n: int, log=None, source: str = PROXY_SRC_APP, webshare_key: str = "") -> list[str | None]:
-    """Chọn n proxy KHÁC NHAU còn sống từ nguồn proxy đã chọn (HomeProxy / Webshare / theo cài đặt MuseAI; ưu tiên proxy ít TK nhất).
+def pick_worker_proxies(n: int, log=None, source: str = PROXY_SRC_FILE, proxy_file_path: str = "") -> list[str | None]:
+    """Chọn n proxy KHÁC NHAU còn sống từ nguồn proxy đã chọn (File TXT hoặc MuseAI Studio).
     Trả về list độ dài n; luồng nào không kiếm được proxy thì None (chạy IP thật)."""
     out: list[str | None] = [None] * n
     try:
         import proxy_manager as pm
-        if not pm.is_proxy_enabled():
+        if not pm.is_proxy_enabled() and source == PROXY_SRC_APP:
             if log:
                 log("Proxy đang TẮT trong cài đặt phần mềm (Không fake IP) -> các luồng chạy IP thật.")
             return out
-        pool = _proxy_pool_for(pm, source, webshare_key, log)
+        pool = _proxy_pool_for(pm, source, proxy_file_path, log)
         if not pool:
             if log:
                 log("Không có proxy nào trong danh sách proxy đã chọn -> các luồng chạy IP thật.")
@@ -192,6 +198,9 @@ def pick_worker_proxies(n: int, log=None, source: str = PROXY_SRC_APP, webshare_
                 if log:
                     log(f"[Luồng {k + 1}] dùng proxy cố định IP {ip}")
                 k += 1
+            else:
+                if log:
+                    log(f"[!] Proxy {cand} không phản hồi/lỗi, thử proxy khác...")
         if k < n and log:
             log(f"Chỉ có {k}/{n} proxy còn sống: các luồng còn lại chạy IP thật.")
     except Exception as exc:  # noqa: BLE001
@@ -337,6 +346,122 @@ def lay2fa_extract_otp(mail: dict) -> str | None:
 
 
 # ============================================================================
+# ============================================================================
+# NGUỒN ĐỌC OTP THỨ 4: hòm thư tạm https://tuan89.site/ (Tuan89 Temp Mail)
+# Hỗ trợ định dạng:
+#   email@tuan89.site | https://tuan89.site/?email=email%40tuan89.site
+#   email@tuan89.site
+#   https://tuan89.site/?email=email%40tuan89.site
+# ============================================================================
+TUAN89_API_BASE = "https://tuan89.site/api/temp-mail/inbox"
+TUAN89_ATTEMPTS = 18      # số lần hỏi API (18 x 3s ~ 54s)
+TUAN89_INTERVAL = 3       # giây giữa 2 lần hỏi
+
+
+def is_tuan89_account(acc_line: str, email: str) -> bool:
+    """Kiểm tra xem dòng tài khoản có sử dụng dịch vụ lấy OTP từ tuan89.site hay không."""
+    target = f"{acc_line} {email}".lower()
+    return "tuan89.site" in target or "@tuan89" in target
+
+
+def parse_tuan89_email(acc_line: str, email: str) -> str:
+    """Tách địa chỉ email tuan89 sạch từ dòng tài khoản hoặc query param URL."""
+    target = (email or "").strip().strip('"\'')
+    if "@" in target and not target.startswith("http"):
+        return target
+    m_url = re.search(r'email=([^&|\s]+)', acc_line)
+    if m_url:
+        import urllib.parse
+        decoded = urllib.parse.unquote(m_url.group(1)).strip().strip('"\'')
+        if "@" in decoded:
+            return decoded
+    m = re.search(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', acc_line)
+    if m:
+        return m.group(1).strip()
+    return target
+
+
+def extract_account_email(acc_line: str) -> str:
+    """Tách địa chỉ email từ dòng tài khoản (hỗ trợ email, email|link, link url, v.v.)."""
+    raw = acc_line.split("|")[0].strip().strip('"\'')
+    if "@" in raw and not raw.startswith("http"):
+        return raw
+    m_url = re.search(r'email=([^&|\s]+)', acc_line)
+    if m_url:
+        import urllib.parse
+        decoded = urllib.parse.unquote(m_url.group(1)).strip().strip('"\'')
+        if "@" in decoded:
+            return decoded
+    m = re.search(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', acc_line)
+    if m:
+        return m.group(1).strip()
+    return raw
+
+
+def tuan89_fetch(email: str, timeout: float = 10.0) -> list[dict] | None:
+    """Gọi API tuan89.site lấy danh sách thư trong hòm thư tạm."""
+    clean_email = email.strip().lower()
+    try:
+        import urllib.parse
+        url = f"{TUAN89_API_BASE}?email={urllib.parse.quote(clean_email)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if isinstance(data, dict) and data.get("success"):
+                msgs = data.get("messages")
+                if isinstance(msgs, list):
+                    return msgs
+                return []
+    except Exception:
+        pass
+    return None
+
+
+def tuan89_extract_otp(mail: dict) -> str | None:
+    """Bóc mã OTP 6 số từ thư của Tuan89."""
+    if not isinstance(mail, dict):
+        return None
+    # 1. Server bóc sẵn mã otp_code
+    otp = str(mail.get("otp_code") or "").strip()
+    if otp and re.fullmatch(r"\d{6}", otp):
+        return otp
+    # 2. Bóc từ subject, snippet, body
+    subject = str(mail.get("subject") or "")
+    snippet = str(mail.get("snippet") or "")
+    body = str(mail.get("body") or mail.get("html") or mail.get("text") or "")
+    text = f"{subject} {snippet} {body}"
+    m = re.search(r"(?:dùng\s+mã|mã\s+đăng\s+nhập|use\s+code|login\s+code|security\s+code|mã\s+xác\s+nhận|mã|code|verification)\D{0,30}?(\d{6})\b", text, re.IGNORECASE)
+    if not m:
+        m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+    return m.group(1) if m else None
+
+
+def safe_activate_tab(page, tab_or_idx=0):
+    """Kích hoạt tab an toàn, tương thích DrissionPage, không bao giờ gây lỗi 'list index out of range'."""
+    try:
+        if page is None:
+            return
+        tabs = getattr(page, "tab_ids", None)
+        if not tabs:
+            return
+        if isinstance(tab_or_idx, int):
+            # Nếu chỉ có 1 tab thì nó đã là tab hiện tại
+            if len(tabs) <= 1:
+                return
+            # DrissionPage 1-based index (0 bị chuyển thành 1). Do đó truyền trực tiếp tab_id:
+            idx = 0 if tab_or_idx == 0 else (tab_or_idx - 1)
+            if 0 <= idx < len(tabs):
+                page.activate_tab(tabs[idx])
+        else:
+            page.activate_tab(tab_or_idx)
+    except Exception:
+        pass
+
+
 # LỚP WORKER THREAD CHẠY TỪNG TÀI KHOẢN TRONG POOL
 # ============================================================================
 class LoginWorker(threading.Thread):
@@ -350,7 +475,7 @@ class LoginWorker(threading.Thread):
         delay_between: int,
         proxy_str: str | None = None,
         use_fingerprint: bool = True,
-        manual_captcha: bool = True,
+        manual_captcha: bool = False,
     ):
         super().__init__()
         self.use_fingerprint = use_fingerprint
@@ -370,7 +495,7 @@ class LoginWorker(threading.Thread):
         co = ChromiumOptions()
         co.set_browser_path(self.chrome_path)
         co.set_user_data_path(self.profile_dir)
-        co.set_local_port(self.port)
+        co.auto_port()
         co.set_argument("--no-first-run")
         co.set_argument("--no-default-browser-check")
         co.set_argument("--disable-blink-features=AutomationControlled")
@@ -380,7 +505,7 @@ class LoginWorker(threading.Thread):
                 fport = pm.start_local_forwarder(self.proxy_str)
                 co.set_argument(f"--proxy-server=http://127.0.0.1:{fport}")
                 # Trang đọc hòm thư (DongVanFB) đi thẳng, không qua proxy: nhanh và tránh proxy chặn làm không đọc được OTP
-                co.set_argument("--proxy-bypass-list=dongvanfb.net;*.dongvanfb.net;localhost;127.0.0.1")
+                co.set_argument("--proxy-bypass-list=dongvanfb.net;*.dongvanfb.net;tuan89.site;*.tuan89.site;lay2fa.xyz;*.lay2fa.xyz;nguyenmaucole.io.vn;*.nguyenmaucole.io.vn;localhost;127.0.0.1")
             except Exception as exc:  # noqa: BLE001
                 self.controller.log(f"[Luồng {self.worker_id}] Không bật được proxy ({exc}) -> chạy IP thật")
         if prof:
@@ -404,8 +529,8 @@ class LoginWorker(threading.Thread):
                 pass
             time.sleep(0.5)
 
-    def _launch_browser(self):
-        """Mở Chrome MỚI với hồ sơ trắng (cùng proxy cố định của luồng) + tab Muse + tab DongVanFB."""
+    def _launch_browser(self, acc_line: str = "", email: str = ""):
+        """Mở Chrome MỚI với hồ sơ trắng (cùng proxy cố định của luồng) + tab Muse (+ tab DongVanFB nếu là acc DongVan)."""
         self._wipe_profile()
         prof = None
         if self.use_fingerprint:
@@ -414,8 +539,20 @@ class LoginWorker(threading.Thread):
                 prof = fpm.make_profile()
             except Exception as exc:  # noqa: BLE001
                 self.controller.log(f"[Luồng {self.worker_id}] Không tạo được hồ sơ trình duyệt ({exc}) -> dùng mặc định")
-        co = self._build_options(prof)
-        page = ChromiumPage(co)
+
+        page = None
+        for attempt in range(1, 4):
+            try:
+                co = self._build_options(prof)
+                page = ChromiumPage(co)
+                break
+            except Exception as exc:
+                if attempt >= 3:
+                    raise
+                self.controller.log(f"[Luồng {self.worker_id}] Khởi động Chrome lần {attempt} chưa thành công ({exc}), thử lại...")
+                time.sleep(1.5)
+
+        dongvan_tab = None
         try:
             if prof:
                 import fingerprint as fpm
@@ -426,12 +563,15 @@ class LoginWorker(threading.Thread):
                     f"GPU {prof['gpu_renderer'][7:45]}, ngôn ngữ {prof['lang']}")
             page.get("https://muse.ai")
             time.sleep(2)
-            dongvan_tab = page.new_tab("https://dongvanfb.net/read_mail_box/")
-            time.sleep(2)
-            page.activate_tab(0)
+            # Chỉ mở thêm tab DongVanFB nếu tài khoản KHÔNG dùng Tuan89, Lay2FA, hoặc MailAPI
+            needs_dongvan = not (is_tuan89_account(acc_line, email) or is_lay2fa_account(acc_line, email) or is_mailapi_email(email))
+            if needs_dongvan:
+                dongvan_tab = page.new_tab("https://dongvanfb.net/read_mail_box/")
+                time.sleep(2)
+                safe_activate_tab(page, 0)
         except Exception:
             try:
-                page.quit()
+                page.quit(timeout=2, force=True)
             except Exception:  # noqa: BLE001
                 pass
             raise
@@ -440,7 +580,7 @@ class LoginWorker(threading.Thread):
     def _close_browser(self, page):
         """Tắt hẳn Chrome của luồng rồi xoá hồ sơ (xoá hết cookie)."""
         try:
-            page.quit()
+            page.quit(timeout=2, force=True)
         except Exception:  # noqa: BLE001
             pass
         time.sleep(1)
@@ -456,12 +596,23 @@ class LoginWorker(threading.Thread):
                     break
 
                 row_idx, acc_line = item
-                email = acc_line.split("|")[0].strip()
+                email = extract_account_email(acc_line)
+                if is_tuan89_account(acc_line, email):
+                    email = parse_tuan89_email(acc_line, email)
+
+                # BỎ QUA NGAY nếu tài khoản đã xác nhận là ACC CHẾT (Muse is disconnected) từ trước
+                if self.controller.is_dead(email):
+                    self.controller.log(f"[Luồng {self.worker_id}] [{email}] ☠ Đã xác định là ACC CHẾT (Muse is disconnected) từ trước -> BỎ QUA LUÔN.")
+                    self.controller.update_status(row_idx, DEAD_STATUS, "#ef4444")
+                    self.controller.record_result(False)
+                    self.task_queue.task_done()
+                    continue
+
                 page = None
                 try:
                     # MỖI TÀI KHOẢN = 1 TRÌNH DUYỆT MỚI: mở Chrome hồ sơ trắng -> làm xong -> tắt và xoá hết cookie
                     self.controller.log(f"[Luồng {self.worker_id}] [{email}] Mở Chrome mới (hồ sơ trắng, Port {self.port}){proxy_note}...")
-                    page, dongvan_tab = self._launch_browser()
+                    page, dongvan_tab = self._launch_browser(acc_line, email)
                     self.process_single_account(page, dongvan_tab, row_idx, acc_line, email)
                 except Exception as e:
                     self.controller.log(f"[Luồng {self.worker_id}] Lỗi xử lý {email}: {e}")
@@ -564,9 +715,10 @@ class LoginWorker(threading.Thread):
             return False
 
     def _fail_verify(self, row_idx: int, email: str):
-        """Meta bắt xác minh (Confirm you're human) khi tắt chế độ chờ tay: báo lỗi xác minh, tắt Chrome và sang TK kế."""
-        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Meta bắt xác minh (Confirm you're human) -> bỏ qua TK này (không lưu cookie).")
-        self.controller.update_status(row_idx, "Cần xác minh Captcha tay", "#ef4444")
+        """Meta/Muse bắt xác minh Captcha tay (Confirm you're human...): BỎ QUA NGAY LẬP TỨC, tắt Chrome và sang TK kế."""
+        self.controller.log(f"[Luồng {self.worker_id}] [{email}] 🖐 Yêu cầu Captcha tay / xác minh con người -> BỎ QUA LUÔN (không chờ).")
+        self.controller.update_status(row_idx, CAPTCHA_STATUS, "#ef4444")
+        self.controller.mark_captcha(email)
         self.controller.record_result(False)
 
     def _wait_manual_captcha(
@@ -579,7 +731,7 @@ class LoginWorker(threading.Thread):
     ) -> tuple[bool, dict, dict]:
         """Tạm dừng tối đa wait_sec giây (mặc định 10 phút = 600s) để người dùng nhập Captcha / xác minh bằng tay trên trình duyệt."""
         try:
-            page.activate_tab(0)
+            safe_activate_tab(page, 0)
             page.run_cdp("Page.bringToFront")
         except Exception:  # noqa: BLE001
             pass
@@ -662,6 +814,27 @@ class LoginWorker(threading.Thread):
             time.sleep(0.5)
         return False
 
+    def _otp_from_tuan89(self, row_idx: int, email: str, seen: set[str] | None) -> str | None:
+        """Hỏi API tuan89.site mỗi TUAN89_INTERVAL giây (tối đa TUAN89_ATTEMPTS lần), chỉ nhận thư MỚI có mã 6 số."""
+        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đọc OTP qua Tuan89 Temp Mail API...")
+        for attempt in range(1, TUAN89_ATTEMPTS + 1):
+            if not self.controller.is_running:
+                return None
+            self.controller.update_status(row_idx, f"Đang lấy OTP Tuan89 (lần {attempt}/{TUAN89_ATTEMPTS})...", "#fbbf24")
+            mails = tuan89_fetch(email)
+            if mails is None:
+                self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đang kết nối Tuan89 API (lần {attempt})...")
+            else:
+                for mail in mails:
+                    mail_id = str(mail.get("id") or "")
+                    if seen is not None and mail_id and mail_id in seen:
+                        continue
+                    code = tuan89_extract_otp(mail)
+                    if code:
+                        return code
+            time.sleep(TUAN89_INTERVAL)
+        return None
+
     def _otp_from_lay2fa(self, page, row_idx: int, acc_line: str, email: str, seen: set[str] | None) -> str | None:
         """Hỏi API lay2fa.xyz mỗi LAY2FA_INTERVAL giây (tối đa LAY2FA_ATTEMPTS lần), chỉ nhận thư MỚI có mã 6 số."""
         u, d = parse_lay2fa_user_domain(acc_line, email)
@@ -709,7 +882,7 @@ class LoginWorker(threading.Thread):
         self.controller.update_status(row_idx, "Đang lấy OTP DongVanFB...", "#fbbf24")
         self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chuyển tab DongVanFB đọc hòm thư...")
 
-        page.activate_tab(dongvan_tab)
+        safe_activate_tab(page, dongvan_tab)
         time.sleep(1)
 
         dongvan_tab.run_js("""
@@ -762,7 +935,7 @@ class LoginWorker(threading.Thread):
         self.controller.log(f"[Luồng {self.worker_id}] [{email}] Mở trang Muse.ai...")
 
         # 1. Reset Session trên Muse
-        page.activate_tab(0)
+        safe_activate_tab(page, 0)
         try:
             page.run_cdp("Network.clearBrowserCookies")
             page.run_cdp("Network.clearBrowserCache")
@@ -785,25 +958,32 @@ class LoginWorker(threading.Thread):
             self._fail_checkpoint(row_idx, email)
             return
 
-        email_inp = page.ele("@placeholder:Mobile number or email") or page.ele("tag:input[inputmode='email']")
-        if not email_inp:
+        email_inp = None
+        for _ in range(8):
+            email_inp = page.ele("@placeholder:Mobile number or email") or page.ele("tag:input[inputmode='email']")
+            if email_inp:
+                break
             use_another = page.ele("text:Use another account") or page.ele("tag:button@text():Use another account")
             if use_another:
                 try:
                     use_another.click()
-                    time.sleep(2)
+                    time.sleep(1)
                 except Exception:
                     pass
                 email_inp = page.ele("@placeholder:Mobile number or email") or page.ele("tag:input[inputmode='email']")
-        if not email_inp:
+                if email_inp:
+                    break
             login_link = page.ele("text:Log in") or page.ele("text:Sign in") or page.ele("tag:a@text():Log in")
             if login_link:
                 try:
                     login_link.click()
+                    time.sleep(1)
                 except Exception:
                     pass
-                time.sleep(2)
                 email_inp = page.ele("@placeholder:Mobile number or email")
+                if email_inp:
+                    break
+            time.sleep(1)
 
         if not email_inp:
             self.controller.update_status(row_idx, "Không thấy ô Email", "#ef4444")
@@ -821,6 +1001,12 @@ class LoginWorker(threading.Thread):
             return
 
         # Chụp danh sách thư ĐANG CÓ trước khi bấm Continue để chỉ nhận thư MỚI
+        tuan89_seen: set[str] | None = None
+        if is_tuan89_account(acc_line, email):
+            clean_em = parse_tuan89_email(acc_line, email)
+            before_t89 = tuan89_fetch(clean_em)
+            tuan89_seen = {str(m.get("id")) for m in before_t89 if m.get("id")} if before_t89 is not None else None
+
         mailapi_seen: set[str] | None = None
         if is_mailapi_email(email):
             before = mailapi_fetch(email)
@@ -874,8 +1060,10 @@ class LoginWorker(threading.Thread):
                 self.controller.record_result(False)
                 return
 
-            # 2. Lấy OTP: Lay2FA API / MailAPI / DongVanFB
-            if is_lay2fa_account(acc_line, email):
+            # 2. Lấy OTP: Tuan89 / Lay2FA / MailAPI / DongVanFB
+            if is_tuan89_account(acc_line, email):
+                otp_code = self._otp_from_tuan89(row_idx, email, tuan89_seen)
+            elif is_lay2fa_account(acc_line, email):
                 otp_code = self._otp_from_lay2fa(page, row_idx, acc_line, email, lay2fa_seen)
             elif is_mailapi_email(email):
                 otp_code = self._otp_from_mailapi(row_idx, email, mailapi_seen)
@@ -893,7 +1081,7 @@ class LoginWorker(threading.Thread):
             self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đã nhận mã OTP mới: {otp_code}. Điền vào Muse.ai...")
 
             # 3. Điền OTP vào Muse
-            page.activate_tab(0)
+            safe_activate_tab(page, 0)
             time.sleep(1)
 
             page.run_js("""
@@ -936,7 +1124,8 @@ class LoginWorker(threading.Thread):
                     cdp = page.run_cdp("Storage.getCookies")
                     clist = cdp.get("cookies", [])
                     m_cookies = {c["name"]: c["value"] for c in clist if "muse.ai" in c.get("domain", "")}
-                    if "hatch_sess" in m_cookies:
+                    has_auth_done = ("__Host-hatch_one_tap" in m_cookies or "hatch_vml" in m_cookies or "hatch_gw" in m_cookies)
+                    if "hatch_sess" in m_cookies and has_auth_done and "hatch_checkpoint_oidc_return" not in m_cookies:
                         login_ok = True
                         all_cookies = m_cookies
                         cookies_exp = {
@@ -972,7 +1161,17 @@ class LoginWorker(threading.Thread):
             page.get("https://muse.ai/thread/new")
             for _ in range(10):
                 time.sleep(1)
+                # PHÁT HIỆN SỚM: Muse báo disconnected thì dừng ngay lập tức trong 1s đầu!
+                if self._muse_disconnected(page, wait_sec=0.2):
+                    self.controller.log(f"[Luồng {self.worker_id}] [{email}] ☠ Muse báo 'Muse is disconnected' -> TK CHẾT, BỎ QUA LUÔN.")
+                    self.controller.update_status(row_idx, DEAD_STATUS, "#ef4444")
+                    self.controller.mark_dead(email)
+                    self.controller.record_result(False)
+                    return
                 if self._meta_manual_checkpoint(page):
+                    if not self.manual_captcha:
+                        self._fail_verify(row_idx, email)
+                        return
                     break
                 cdp = page.run_cdp("Storage.getCookies")
                 clist = cdp.get("cookies", [])
@@ -1031,13 +1230,27 @@ class LoginWorker(threading.Thread):
             from engine import MuseEngine
             if CFG:
                 eng = MuseEngine(CFG)
-                ren = eng.renew_session_http(all_cookies, cookies_exp, wake_vm=True)
-                if ren and ren.get("cookies"):
-                    all_cookies = ren["cookies"]
-                    cookies_exp = ren.get("cookies_exp", cookies_exp)
-                    self.controller.log(f"[Luồng {self.worker_id}] [{email}] Kích hoạt session cốt lõi hatch_vml thành công (VM: {ren.get('vm_state')}).")
+                for _attempt_vml in range(3):
+                    try:
+                        ren = eng.renew_session_http(all_cookies, cookies_exp, wake_vm=True)
+                        if ren and ren.get("cookies"):
+                            all_cookies = ren["cookies"]
+                            cookies_exp = ren.get("cookies_exp", cookies_exp)
+                            if "hatch_vml" in all_cookies:
+                                self.controller.log(f"[Luồng {self.worker_id}] [{email}] Kích hoạt session cốt lõi hatch_vml thành công (VM: {ren.get('vm_state')}).")
+                                break
+                    except Exception as e_inner:
+                        if _attempt_vml == 2:
+                            raise e_inner
+                        time.sleep(2)
         except Exception as e_ren:
             self.controller.log(f"[Luồng {self.worker_id}] [{email}] Ghi chú kích hoạt: {e_ren}")
+
+        if "hatch_vml" not in all_cookies:
+            self.controller.log(f"[Luồng {self.worker_id}] [{email}] ✗ Chưa lấy được cookie máy ảo (hatch_vml) -> đánh dấu lỗi để chạy lại (Retry Lỗi).")
+            self.controller.update_status(row_idx, "Thiếu hatch_vml (Retry)", "#ef4444")
+            self.controller.record_result(False)
+            return
 
         # 6. Lưu kết quả
         self.controller.save_account_success(row_idx, email, all_cookies, cookies_exp)
@@ -1064,13 +1277,13 @@ class WorkerController(QThread):
         tasks: list[tuple[int, str]] | None = None,
         use_proxy: bool = True,
         use_fingerprint: bool = True,
-        proxy_source: str = PROXY_SRC_APP,
-        webshare_key: str = "",
-        manual_captcha: bool = True,
+        proxy_source: str = PROXY_SRC_FILE,
+        proxy_file_path: str = "",
+        manual_captcha: bool = False,
     ):
         super().__init__()
         self.proxy_source = proxy_source
-        self.webshare_key = webshare_key
+        self.proxy_file_path = proxy_file_path
         self.use_proxy = use_proxy
         self.use_fingerprint = use_fingerprint
         self.manual_captcha = manual_captcha
@@ -1094,6 +1307,14 @@ class WorkerController(QThread):
         self.out_dir = os.path.join(BASE_DIR, "data")
         os.makedirs(self.out_dir, exist_ok=True)
         self.export_txt_path = os.path.join(self.out_dir, "auto_login_success_cookies.txt")
+        self._dead_emails: set[str] = set()
+        dead_path = os.path.join(self.out_dir, "auto_login_dead.txt")
+        if os.path.isfile(dead_path):
+            try:
+                with open(dead_path, "r", encoding="utf-8", errors="ignore") as f:
+                    self._dead_emails = {ln.split("|")[0].strip().lower() for ln in f if ln.strip()}
+            except Exception:
+                pass
 
     def run(self):
         self.log(f"Bắt đầu xử lý {self.total} tài khoản với {self.num_threads} luồng song song...")
@@ -1104,8 +1325,8 @@ class WorkerController(QThread):
         workers = []
         actual_threads = min(self.num_threads, self.total)
         if self.use_proxy:
-            self.log(f"Đang chọn {actual_threads} proxy cố định (mỗi luồng 1 IP riêng)...")
-            worker_proxies = pick_worker_proxies(actual_threads, self.log, self.proxy_source, self.webshare_key)
+            self.log(f"Đang kiểm tra và chọn {actual_threads} proxy cố định (mỗi luồng 1 IP riêng)...")
+            worker_proxies = pick_worker_proxies(actual_threads, self.log, self.proxy_source, self.proxy_file_path)
         else:
             self.log("Không dùng proxy: các luồng chạy bằng IP thật của máy.")
             worker_proxies = [None] * actual_threads
@@ -1174,8 +1395,27 @@ class WorkerController(QThread):
         with self.lock:
             self._used_otps.setdefault(email.strip().lower(), set()).add(code)
 
+    def is_dead(self, email: str) -> bool:
+        return email.strip().lower() in getattr(self, "_dead_emails", set())
+
+    def mark_captcha(self, email: str, reason: str = "Yeu cau Captcha tay"):
+        """Ghi email bị Captcha vào data/auto_login_captcha.txt."""
+        try:
+            path = os.path.join(self.out_dir, "auto_login_captcha.txt")
+            existing = set()
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    existing = {ln.split("|")[0].strip().lower() for ln in f if ln.strip()}
+            if email.strip().lower() not in existing:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(f"{email}|{reason}|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        except Exception:  # noqa: BLE001
+            pass
+
     def mark_dead(self, email: str, reason: str = "Muse is disconnected"):
         """Ghi TK chết vào data/auto_login_dead.txt và, nếu TK đã có trong Studio, khoá TK đó (không giao việc nữa)."""
+        if hasattr(self, "_dead_emails"):
+            self._dead_emails.add(email.strip().lower())
         try:
             path = os.path.join(self.out_dir, "auto_login_dead.txt")
             existing = set()
@@ -1184,7 +1424,7 @@ class WorkerController(QThread):
                     existing = {ln.split("|")[0].strip().lower() for ln in f if ln.strip()}
             if email.strip().lower() not in existing:
                 with open(path, "a", encoding="utf-8") as f:
-                    f.write(f"{email}|{reason}|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}" + chr(10))
+                    f.write(f"{email}|{reason}|{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -1239,20 +1479,27 @@ class WorkerController(QThread):
                     "label": email,
                     "cookies": cookies,
                     "cookie_header": cstr,
-                    "expires": {k: int(v) for k, v in cookies_exp.items() if v > 0}
+                    "expires": {k: int(v) for k, v in cookies_exp.items() if v > 0},
+                    "enabled": False,
                 }
                 r = requests.post(url, json=payload, headers=headers, timeout=5)
                 if r.status_code == 200:
                     synced_studio = True
-                    self.log(f"[✓] [{email}] Đã ghi đè / đồng bộ thành công vào MuseAI Studio Dashboard đang chạy!")
+                    try:
+                        for item in (r.json().get("added") or []):
+                            if item.get("id"):
+                                requests.patch(f"{url}/{item['id']}", json={"enabled": False}, headers=headers, timeout=5)
+                    except Exception:
+                        pass
+                    self.log(f"[✓] [{email}] Đã đồng bộ vào MuseAI Studio (trạng thái TẮT — không giao việc)!")
             except Exception:
                 pass
 
         with self.lock:
-            # 2. Luôn ghi đè cập nhật vào data/accounts.json
-            if self.save_to_store and self.store:
-                acc = self.store.add_account(cookies, label=email, cookies_exp=cookies_exp)
-                if not synced_studio:
+            # 2. Luôn ghi đè cập nhật vào data/accounts.json (trạng thái TẮT mặc định)
+            if self.save_to_store and not synced_studio and self.store:
+                acc = self.store.add_account(cookies, label=email, cookies_exp=cookies_exp, enabled=False)
+                if True:
                     self.log(f"[✓] [{email}] Đã ghi đè trực tiếp vào data/accounts.json (ID: {acc['id']}).")
 
             # 3. Ghi đè vào file text dự phòng
@@ -1468,10 +1715,39 @@ class MainWindow(QMainWindow):
         row1.addWidget(btn_browse)
         ctrl_layout.addLayout(row1)
 
-        # Hàng 2: Cài đặt luồng & tùy chọn
+        # Hàng 2: Cài đặt Proxy & Luồng chạy
         row2 = QHBoxLayout()
 
-        row2.addWidget(QLabel("Số luồng chạy song song:"))
+        self.chk_proxy = QCheckBox("Proxy cố định (mỗi luồng 1 IP):")
+        self.chk_proxy.setChecked(True)
+        self.chk_proxy.setToolTip("Mỗi luồng đăng nhập qua 1 proxy riêng thay vì IP thật của máy (giảm bị Muse chặn)")
+        self.chk_proxy.toggled.connect(self._on_proxy_toggled)
+        row2.addWidget(self.chk_proxy)
+
+        self.cmb_proxy_src = QComboBox()
+        self.cmb_proxy_src.addItem("Nguồn: Import từ file TXT", PROXY_SRC_FILE)
+        self.cmb_proxy_src.addItem("Nguồn: theo MuseAI Studio", PROXY_SRC_APP)
+        self.cmb_proxy_src.setToolTip("Chọn nguồn proxy cho các luồng lấy cookie. 'Import từ file TXT' sẽ dùng file proxy tùy chọn; 'theo MuseAI Studio' sẽ dùng proxy từ cài đặt hệ thống.")
+        self.cmb_proxy_src.currentIndexChanged.connect(self._on_proxy_src_changed)
+        row2.addWidget(self.cmb_proxy_src)
+
+        default_proxy_txt = os.path.join(BASE_DIR, "proxy.txt")
+        self.txt_proxy_path = QLineEdit()
+        self.txt_proxy_path.setPlaceholderText("Đường dẫn file proxy (.txt)...")
+        if os.path.isfile(default_proxy_txt):
+            self.txt_proxy_path.setText(default_proxy_txt)
+        self.txt_proxy_path.setMinimumWidth(200)
+        self.txt_proxy_path.setToolTip("File chứa danh sách Proxy (mỗi dòng 1 proxy: IP:PORT hoặc IP:PORT:USER:PASS)")
+        row2.addWidget(self.txt_proxy_path)
+
+        self.btn_browse_proxy = QPushButton("📂 Chọn File Proxy...")
+        self.btn_browse_proxy.setToolTip("Chọn file txt chứa danh sách proxy")
+        self.btn_browse_proxy.clicked.connect(self.browse_proxy_file)
+        row2.addWidget(self.btn_browse_proxy)
+        self._on_proxy_src_changed()
+
+        row2.addSpacing(20)
+        row2.addWidget(QLabel("Số luồng:"))
         self.spin_threads = QSpinBox()
         self.spin_threads.setRange(1, 10)
         self.spin_threads.setValue(3)
@@ -1479,59 +1755,44 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.spin_threads)
 
         row2.addSpacing(15)
-        row2.addWidget(QLabel("Nghỉ giữa tài khoản (giây):"))
+        row2.addWidget(QLabel("Nghỉ (s):"))
         self.spin_delay = QSpinBox()
         self.spin_delay.setRange(0, 30)
         self.spin_delay.setValue(2)
+        self.spin_delay.setToolTip("Thời gian nghỉ giữa các tài khoản (giây)")
         row2.addWidget(self.spin_delay)
 
-        row2.addSpacing(15)
-        self.chk_headless = QCheckBox("Chạy ngầm (Ẩn cửa sổ Chrome)")
+        row2.addStretch()
+        ctrl_layout.addLayout(row2)
+
+        # Hàng 3: Tùy chọn Chrome & Chống chặn
+        row3_opt = QHBoxLayout()
+
+        self.chk_headless = QCheckBox("Chạy ngầm (Ẩn Chrome)")
         self.chk_headless.setChecked(False)
         self.chk_headless.setToolTip("Tích vào để không làm phiền màn hình làm việc")
-        row2.addWidget(self.chk_headless)
-
-        self.chk_proxy = QCheckBox("Proxy cố định (mỗi luồng 1 IP)")
-        self.chk_proxy.setChecked(True)
-        self.chk_proxy.setToolTip("Mỗi luồng đăng nhập qua 1 proxy riêng thay vì IP thật của máy (giảm bị Muse chặn)")
-        row2.addWidget(self.chk_proxy)
-
-        self.cmb_proxy_src = QComboBox()
-        self.cmb_proxy_src.addItem("Nguồn: theo MuseAI Studio", PROXY_SRC_APP)
-        self.cmb_proxy_src.addItem("Nguồn: HomeProxy", PROXY_SRC_HOMEPROXY)
-        self.cmb_proxy_src.addItem("Nguồn: Webshare", PROXY_SRC_WEBSHARE)
-        self.cmb_proxy_src.setToolTip("Chọn nguồn proxy cho các luồng lấy cookie. Chọn nguồn khác MuseAI Studio thì chỉ dùng cho công cụ này, không đổi cài đặt của MuseAI Studio.")
-        self.cmb_proxy_src.currentIndexChanged.connect(self._on_proxy_src_changed)
-        row2.addWidget(self.cmb_proxy_src)
-
-        self.txt_ws_key = QLineEdit()
-        self.txt_ws_key.setPlaceholderText("Webshare API key")
-        self.txt_ws_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.txt_ws_key.setFixedWidth(200)
-        self.txt_ws_key.setToolTip("API key Webshare (webshare.io -> API). Để trống nếu MuseAI Studio đã lưu key. Nhập ở đây sẽ được lưu vào data/proxy_settings.json (không đưa lên git).")
-        self.txt_ws_key.setVisible(False)
-        row2.addWidget(self.txt_ws_key)
+        row3_opt.addWidget(self.chk_headless)
 
         self.chk_fp = QCheckBox("Mỗi trình duyệt 1 cấu hình khác nhau")
         self.chk_fp.setChecked(True)
         self.chk_fp.setToolTip("Mỗi lần mở Chrome dùng 1 hồ sơ riêng: màn hình, cửa sổ, số nhân CPU, RAM, card đồ hoạ, nhiễu Canvas/Audio, múi giờ, ngôn ngữ")
-        row2.addWidget(self.chk_fp)
+        row3_opt.addWidget(self.chk_fp)
 
         self.chk_save_store = QCheckBox("Tự động nạp vào MuseAI Studio")
         self.chk_save_store.setChecked(True)
         self.chk_save_store.setToolTip("Cập nhật trực tiếp vào data/accounts.json")
-        row2.addWidget(self.chk_save_store)
+        row3_opt.addWidget(self.chk_save_store)
 
-        self.chk_manual_captcha = QCheckBox("Chờ xác minh Captcha tay (10 phút)")
-        self.chk_manual_captcha.setChecked(True)
+        self.chk_manual_captcha = QCheckBox("Chờ xác minh Captcha tay (10p) - [Mặc định: TẮT]")
+        self.chk_manual_captcha.setChecked(False)
         self.chk_manual_captcha.setToolTip(
-            "Khi đăng nhập Muse và điền OTP xong nếu bị yêu cầu nhập Captcha / xác minh con người, "
-            "phần mềm sẽ tạm dừng tối đa 10 phút (600s) để bạn thao tác trên trình duyệt Chrome."
+            "Mặc định TẮT: Nếu tài khoản bị yêu cầu Captcha tay / xác minh con người thì BỎ QUA LUÔN lập tức, không chờ 10 phút.\n"
+            "Chỉ tích bật nếu bạn muốn tự tay giải Captcha cho từng tài khoản trên trình duyệt Chrome."
         )
-        row2.addWidget(self.chk_manual_captcha)
+        row3_opt.addWidget(self.chk_manual_captcha)
 
-        row2.addStretch()
-        ctrl_layout.addLayout(row2)
+        row3_opt.addStretch()
+        ctrl_layout.addLayout(row3_opt)
 
         # Hàng 3: Các nút hành động
         row3 = QHBoxLayout()
@@ -1648,7 +1909,9 @@ class MainWindow(QMainWindow):
 
         self.table.setRowCount(len(self.accounts))
         for row, acc in enumerate(self.accounts):
-            email = acc.split("|")[0].strip()
+            email = extract_account_email(acc)
+            if is_tuan89_account(acc, email):
+                email = parse_tuan89_email(acc, email)
             item_stt = QTableWidgetItem(str(row + 1))
             item_stt.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             item_email = QTableWidgetItem(email)
@@ -1780,20 +2043,34 @@ class MainWindow(QMainWindow):
         self.log(f"[*] Đã lưu {len(self.accounts)} tài khoản vào: {path}")
         QMessageBox.information(self, "Lưu danh sách", f"Đã lưu {len(self.accounts)} tài khoản vào:\n{path}")
 
+    def browse_proxy_file(self):
+        curr = self.txt_proxy_path.text().strip()
+        start_dir = os.path.dirname(curr) if (curr and os.path.isfile(curr)) else BASE_DIR
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file danh sách Proxy TXT",
+            start_dir,
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if path:
+            self.txt_proxy_path.setText(path)
+            self.log(f"[*] Đã chọn file Proxy TXT: {path}")
+
+    def _on_proxy_toggled(self, checked: bool):
+        self.cmb_proxy_src.setEnabled(checked)
+        self.txt_proxy_path.setEnabled(checked)
+        self.btn_browse_proxy.setEnabled(checked)
+
     def _on_proxy_src_changed(self, _idx: int = 0):
-        self.txt_ws_key.setVisible(self.cmb_proxy_src.currentData() == PROXY_SRC_WEBSHARE)
+        is_file = (self.cmb_proxy_src.currentData() == PROXY_SRC_FILE)
+        self.txt_proxy_path.setVisible(is_file)
+        self.btn_browse_proxy.setVisible(is_file)
 
     def _proxy_source_args(self) -> dict:
-        """(nguồn proxy, API key Webshare) cho WorkerController. Key nhập tay được lưu lại (file data/proxy_settings.json)."""
-        src = self.cmb_proxy_src.currentData() or PROXY_SRC_APP
-        key = self.txt_ws_key.text().strip() if src == PROXY_SRC_WEBSHARE else ""
-        if key:
-            try:
-                import proxy_manager as pm
-                pm._update_settings(webshare_key=key)
-            except Exception:  # noqa: BLE001
-                pass
-        return {"proxy_source": src, "webshare_key": key}
+        """(nguồn proxy, file proxy) cho WorkerController."""
+        src = self.cmb_proxy_src.currentData() or PROXY_SRC_FILE
+        proxy_path = self.txt_proxy_path.text().strip()
+        return {"proxy_source": src, "proxy_file_path": proxy_path}
 
     def log(self, msg: str):
         self.txt_log.append(msg)
@@ -1836,16 +2113,20 @@ class MainWindow(QMainWindow):
         self.controller.start()
 
     def get_failed_rows(self) -> list[int]:
-        """Tìm các dòng bị lỗi hoặc chưa thành công để chạy lại."""
+        """Tìm các dòng bị lỗi hoặc chưa thành công để chạy lại (BỎ QUA LUÔN TK CHẾT và TK bị Captcha tay)."""
         failed = []
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 2)
             st = item.text().strip() if item else ""
+            st_low = st.lower()
             # Dòng đã thành công thì bỏ qua
-            if "thành công" in st.lower() or st.startswith("✓"):
+            if "thành công" in st_low or st.startswith("✓"):
                 continue
-            # TK đã bị Muse khoá vĩnh viễn (Muse is disconnected): loại ra, không chạy lại
-            if st == DEAD_STATUS:
+            # TK đã bị Muse khoá vĩnh viễn (Muse is disconnected): BỎ QUA LUÔN, không chạy lại
+            if st == DEAD_STATUS or "disconnected" in st_low or "chết" in st_low:
+                continue
+            # TK bị yêu cầu Captcha tay / xác minh con người: BỎ QUA LUÔN, không chạy lại
+            if "captcha" in st_low or "xác minh" in st_low:
                 continue
             # Dòng chưa chạy bao giờ thì bỏ qua (nếu đang tìm lỗi cụ thể)
             if st == "Sẵn sàng":

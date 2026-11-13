@@ -1259,7 +1259,7 @@
             <div>
               <div style="font-size:13px;font-weight:700;color:#38bdf8;display:flex;align-items:center;gap:8px;">
                 <span>TRUNG TÂM PHÂN PHỐI TÀI KHOẢN TAILSCALE (MÁY CHỦ HUB)</span>
-                <span style="background:rgba(16,185,129,0.2);color:#34d399;border:1px solid rgba(16,185,129,0.4);padding:1px 8px;border-radius:999px;font-size:11px;">Đang phát 2 Luồng / TK</span>
+                <span style="background:rgba(16,185,129,0.2);color:#34d399;border:1px solid rgba(16,185,129,0.4);padding:1px 8px;border-radius:999px;font-size:11px;">Đang phát 1 Luồng / TK</span>
               </div>
               <div style="font-size:12px;color:#94a3b8;margin-top:3px;" id="hubServerBannerSub">
                 Server: <code style="color:#60a5fa;">http://100.79.170.67:18610</code> · Các máy trạm kết nối qua Tailscale sẽ tự động mượn tài khoản (ẩn danh sách TK trên máy trạm).
@@ -1294,7 +1294,7 @@
 
           <div id="workerRemoteBrowserWarning" style="display:none;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.4);border-radius:10px;padding:12px 16px;margin-bottom:16px;color:#fcd34d;font-size:12.5px;line-height:1.6;">
             ⚠️ <b>Lưu ý quan trọng:</b> Bạn đang mở trực tiếp địa chỉ web của Máy Chủ (<code id="workerRemoteUrlText" style="color:#fff;">http://100.79.170.67:18610</code>) trên trình duyệt. Danh sách tài khoản đã được <b>ẩn tự động</b> để bảo mật.<br>
-            💡 <b>Để Máy Trạm tự chạy bằng CPU/RAM của chính Máy Trạm:</b> Hãy mở phần mềm MuseAI Studio cài trên Máy Trạm (<code style="color:#38bdf8;">Chay_MESUAI.bat</code> → <code style="color:#38bdf8;">http://127.0.0.1:18610</code>). Phần mềm ở Máy Trạm sẽ tự động kết nối qua Tailscale về <code style="color:#38bdf8;">100.79.170.67:18610</code> để mượn tài khoản (2 luồng/TK) mà không cần nạp tài khoản vào máy trạm!
+            💡 <b>Để Máy Trạm tự chạy bằng CPU/RAM của chính Máy Trạm:</b> Hãy mở phần mềm MuseAI Studio cài trên Máy Trạm (<code style="color:#38bdf8;">Chay_MESUAI.bat</code> → <code style="color:#38bdf8;">http://127.0.0.1:18610</code>). Phần mềm ở Máy Trạm sẽ tự động kết nối qua Tailscale về <code style="color:#38bdf8;">100.79.170.67:18610</code> để mượn tài khoản (1 luồng/TK) mà không cần nạp tài khoản vào máy trạm!
           </div>
 
           <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:14px;margin-bottom:18px;">
@@ -1311,7 +1311,7 @@
             </div>
 
             <div style="background:rgba(0,0,0,0.35);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:14px 16px;">
-              <div style="font-size:11.5px;color:var(--text-dim);margin-bottom:6px;">⚡ CÔNG SUẤT ĐA LUỒNG (2 LUỒNG/TK)</div>
+              <div style="font-size:11.5px;color:var(--text-dim);margin-bottom:6px;">⚡ CÔNG SUẤT ĐA LUỒNG (1 LUỒNG/TK)</div>
               <div id="wkHubTotalSlots" style="font-size:20px;font-weight:800;color:#38bdf8;">-- Slots</div>
               <div style="font-size:11.5px;color:var(--text-muted);margin-top:4px;">Tổng số luồng video chạy song song</div>
             </div>
@@ -1324,41 +1324,12 @@
           </div>
 
           <div style="background:rgba(56,189,248,0.07);border:1px solid rgba(56,189,248,0.22);border-radius:10px;padding:14px 16px;font-size:12.5px;color:#cbd5e1;line-height:1.65;">
-            <div style="font-weight:700;color:#38bdf8;margin-bottom:4px;">🛡️ Cơ chế Bảo Mật & Điều Phối 2 Luồng Tự Động:</div>
+            <div style="font-weight:700;color:#38bdf8;margin-bottom:4px;">🛡️ Cơ chế Bảo Mật & Điều Phối 1 Luồng Tự Động:</div>
             <ul style="padding-left:18px;margin:0;">
               <li>Danh sách email, cookie và nút xóa tài khoản được <b>khóa và ẩn hoàn toàn trên các Máy Trạm</b> để tránh lộ cookie hoặc thao tác xóa nhầm.</li>
               <li>Khi bạn chạy <b>Tạo Video AI</b> hoặc <b>Shopee DB & Batch</b> trên Máy Trạm, hệ thống tự động mượn 1 Slot tài khoản từ Máy Chủ (<code style="color:#60a5fa;">100.79.170.67:18610</code>), tạo video xong tự động trả Slot về kho chung.</li>
-              <li>Mỗi tài khoản Muse chỉ nhận tối đa <b>2 luồng cùng lúc</b> trên toàn mạng Tailscale (ưu tiên cấp các tài khoản đang rảnh 0 luồng trước).</li>
+              <li>Mỗi tài khoản Muse chỉ nhận tối đa <b>1 luồng cùng lúc</b> trên toàn mạng Tailscale (ưu tiên cấp các tài khoản đang rảnh 0 luồng trước).</li>
             </ul>
-          </div>
-        </div>
-
-        <div class="card" id="cardAddAccount" style="margin-bottom:20px;">
-          <div class="card-header">
-            <div class="card-title">
-              <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
-              Thêm Tài Khoản Muse.ai Mới Vào Pool
-            </div>
-          </div>
-
-          <div style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">
-            Muse.ai cung cấp lượt tạo video & ảnh miễn phí cho tài khoản. Bạn có thể nhập nhiều tài khoản để phần mềm tự động luân phiên xoay vòng và duy trì kết nối 48 giờ.
-          </div>
-
-          <div style="display:grid;grid-template-columns:1fr 2.5fr auto;gap:12px;align-items:flex-end;">
-            <div>
-              <div class="form-label">Tên / Ghi chú</div>
-              <input type="text" id="accLabelInput" placeholder="Ví dụ: Tài khoản Muse 1" style="width:100%;padding:10px;border-radius:8px;background:rgba(0,0,0,0.4);border:1px solid var(--border);color:#fff;">
-            </div>
-
-            <div>
-              <div class="form-label">Cookie Header (Dán chuỗi Cookie từ F12 hoặc Extension)</div>
-              <input type="text" id="accCookieInput" placeholder="hatch_sess=...; hatch_vml=...; hatch_gw=..." style="width:100%;padding:10px;border-radius:8px;background:rgba(0,0,0,0.4);border:1px solid var(--border);color:#fff;font-family:monospace;font-size:12px;">
-            </div>
-
-            <button class="btn-action primary" onclick="submitAddAccount()" style="padding:10px 18px;height:42px;">
-              ➕ Thêm Tài Khoản
-            </button>
           </div>
         </div>
 
@@ -1373,6 +1344,16 @@
               </button>
               <button class="btn-header" onclick="syncThinAptmProxy()" style="background:rgba(59,130,246,0.15);border:1px solid #3b82f6;color:#60a5fa;" title="Tự động nạp danh sách HomeProxy từ E:\ThinAptm0707 và gán cố định cho từng tài khoản">
                 🌐 Nạp Proxy ThinAptm
+              </button>
+              <button class="btn-header" id="btnImportProxyTxtAcc" onclick="triggerImportProxyTxt(this)" style="background:rgba(14,165,233,0.18);border:1px solid #0ea5e9;color:#38bdf8;" title="Chọn file .txt chứa danh sách proxy (mỗi dòng 1 proxy) để nạp và chia đều cho toàn bộ tài khoản đang có">
+                📂 Nhập Proxy TXT
+              </button>
+              <input type="file" id="proxyTxtFileInput" accept=".txt,text/plain" style="display:none;" onchange="onProxyTxtFileSelected(event)">
+              <button class="btn-header" id="btnEnableAllAccs" onclick="toggleAllAccountsEnabled(true)" style="background:rgba(16,185,129,0.18);border:1px solid #10b981;color:#34d399;" title="Bật giao việc cho TOÀN BỘ tài khoản trong hệ thống">
+                🟢 Bật Tất Cả TK
+              </button>
+              <button class="btn-header" id="btnDisableAllAccs" onclick="toggleAllAccountsEnabled(false)" style="background:rgba(148,163,184,0.15);border:1px solid #64748b;color:#cbd5e1;" title="Tắt giao việc cho TOÀN BỘ tài khoản trong hệ thống">
+                ⚪ Tắt Tất Cả TK
               </button>
               <button class="btn-header" onclick="resetAllAccounts()" style="background:rgba(16,185,129,0.18);border:1px solid #10b981;color:#34d399;" title="Mở khoá toàn bộ tài khoản bị khoá/lỗi, xóa thời gian nghỉ (cooldown) để chạy lại từ đầu">
                 🔄 Reset Toàn Bộ TK
@@ -1513,6 +1494,9 @@
               </button>
               <button type="button" class="shopee-btn" onclick="event.stopPropagation(); syncThinAptmProxy();" style="background:#0f766e; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;">
                 🌐 Nạp Proxy ThinAptm
+              </button>
+              <button type="button" class="shopee-btn" id="btnImportProxyTxtShopee" onclick="event.stopPropagation(); triggerImportProxyTxt(this);" style="background:#0284c7; color:#fff; font-size:11px; padding:4px 10px; font-weight:600;" title="Chọn file .txt chứa danh sách proxy và tự động chia đều cho các tài khoản">
+                📂 Nhập Proxy TXT
               </button>
               <button type="button" class="shopee-btn" onclick="event.stopPropagation(); recycleBrowserSessions();" style="background:#475569; color:#f8fafc; font-size:11px; padding:4px 10px; font-weight:600;" title="Giải phóng RAM và tái sinh phiên trình duyệt sạch">
                 ♻️ Làm Mới / Dọn RAM Trình Duyệt
@@ -1813,13 +1797,11 @@
                 <span id="sp_threads_machine_hint" style="font-size:11px;font-weight:600;margin-left:4px;"></span>
               </div>
 
-              <div style="display:flex;align-items:center;gap:6px;background:rgba(56,189,248,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(56,189,248,0.35);" title="Mỗi tài khoản Muse chỉ có 1 máy ảo Cloud VM -> chỉ cho phép chạy tối đa 1 hoặc 2 video cùng lúc / tài khoản. Khi chạy 2 video/TK, hệ thống tự động tạo độ trễ lệch pha (15-18s) giữa 2 luồng cùng 1 tài khoản để tránh nghẽn máy ảo.">
-                <span style="font-size:12px;font-weight:700;color:#38bdf8;">🎬 Số video cùng lúc / tài khoản:</span>
-                <select class="shopee-select" id="sp_jobs_per_account" onchange="updateShopeeThreadsHint(); saveShopeeSettings()" style="font-weight:bold;color:#38bdf8;padding:4px 8px;background:#0d1117;">
-                  <option value="1">1</option>
-                  <option value="2" selected>2 (Khuyên dùng)</option>
-                </select>
+              <div style="display:flex;align-items:center;gap:6px;background:rgba(16,185,129,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(16,185,129,0.35);" title="Số luồng FFmpeg ghép video chạy đồng thời (khi lưu/ghép Outro 12s hoặc nối 16s). Máy nhiều nhân CPU (như Xeon) có thể đặt 16 - 32 để không bị dồn hàng chờ 'đang lưu/ghép'.">
+                <span style="font-size:12px;font-weight:700;color:#34d399;">🎞️ Luồng ghép FFmpeg:</span>
+                <input type="number" id="sp_ffmpeg_threads" min="1" max="64" value="24" style="width:58px;padding:4px 6px;background:#0d1117;border:1px solid #10b981;border-radius:6px;color:#34d399;font-weight:bold;text-align:center;font-size:12px;" onchange="onFfmpegConcurrencyChange()" title="Nhập số luồng ghép video FFmpeg chạy cùng lúc (1 - 64)">
               </div>
+              <input type="hidden" id="sp_jobs_per_account" value="1">
 
               <label style="display:flex;align-items:center;gap:5px;font-size:12px;font-weight:700;color:#a78bfa;cursor:pointer;" title="Khi hàng đợi sắp hết, tự nhận thêm lô SP mới từ Database (cùng bộ lọc) để batch chạy liên tục không phải bấm Nhận SP">
                 <input type="checkbox" id="sp_auto_claim" checked onchange="saveShopeeSettings()">
@@ -1969,7 +1951,7 @@
 
     <div style="padding:20px;display:flex;flex-direction:column;gap:14px;">
       <div style="font-size:12.5px;color:var(--text-muted);line-height:1.5;background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.25);padding:10px 14px;border-radius:8px;">
-        Cấu hình vai trò của máy tính này: <b>Máy Chủ</b> (quản lý & lưu trữ toàn bộ tài khoản Muse) hoặc <b>Máy Trạm</b> (không lưu tài khoản, tự động mượn tài khoản 2 luồng/TK từ Máy Chủ qua Tailscale).
+        Cấu hình vai trò của máy tính này: <b>Máy Chủ</b> (quản lý & lưu trữ toàn bộ tài khoản Muse) hoặc <b>Máy Trạm</b> (không lưu tài khoản, tự động mượn tài khoản 1 luồng/TK từ Máy Chủ qua Tailscale).
       </div>
 
       <div>
@@ -2933,7 +2915,7 @@
 
         const totalAccs = hubInfo.total_accounts ?? resData.stats?.total ?? 0;
         const aliveAccs = hubInfo.alive_accounts ?? resData.alive_count ?? 0;
-        const totalSlots = hubInfo.total_slots ?? (aliveAccs * 2);
+        const totalSlots = hubInfo.total_slots ?? (aliveAccs * 1);
         const usedSlots = hubInfo.used_slots ?? 0;
         const freeSlots = hubInfo.available_slots ?? Math.max(0, totalSlots - usedSlots);
 
@@ -3012,9 +2994,15 @@
       }
 
       tbody.innerHTML = shownAccs.map(a => {
+        const isEnabled = a.enabled !== false;
         let statusBadge = `<span class="status-pill unknown">Chưa kiểm tra</span>`;
-        if (a.ok === true) statusBadge = `<span class="status-pill good">🟢 Hoạt động</span>`;
-        else if (a.ok === false) statusBadge = `<span class="status-pill bad" title="${translateLegacyNote(a.note || '')}">🔴 Lỗi / Hết hạn</span>`;
+        if (!isEnabled) {
+          statusBadge = `<span class="status-pill unknown" style="background:rgba(148,163,184,0.15);color:#cbd5e1;border:1px solid rgba(148,163,184,0.4);" title="Tài khoản đang ở trạng thái TẮT — phần mềm không giao việc cho TK này. Bấm nút Bật ở cột Thao Tác để cho phép nhận việc.">⚪ Đang tắt</span>`;
+        } else if (a.ok === true) {
+          statusBadge = `<span class="status-pill good">🟢 Hoạt động</span>`;
+        } else if (a.ok === false) {
+          statusBadge = `<span class="status-pill bad" title="${translateLegacyNote(a.note || '')}">🔴 Lỗi / Hết hạn</span>`;
+        }
 
         let expStr = "Không rõ";
         if (a.expires_at) {
@@ -3074,7 +3062,11 @@
             <td>${successCellHtml(a)}</td>
             <td>${lastSuccessCellHtml(a)}</td>
             <td>
-              <div style="display:flex;gap:6px;">
+              <div style="display:flex;gap:6px;align-items:center;">
+                ${isEnabled
+                  ? `<button class="btn-tiny" id="tb_${a.id}" onclick="toggleAccountEnabled('${a.id}', false)" title="Đang BẬT giao việc cho TK này — Bấm để TẮT (ngưng giao việc)" style="background:rgba(16,185,129,0.18);border-color:#10b981;color:#34d399;font-weight:600;min-width:52px;">🟢 Bật</button>`
+                  : `<button class="btn-tiny" id="tb_${a.id}" onclick="toggleAccountEnabled('${a.id}', true)" title="Đang TẮT (không giao việc cho TK này) — Bấm để BẬT giao việc" style="background:rgba(239,68,68,0.14);border-color:#f87171;color:#fca5a5;font-weight:600;min-width:52px;">⚪ Tắt</button>`
+                }
                 <button class="btn-tiny" id="ob_${a.id}" onclick="openAccountBrowser('${a.id}')" title="Mở TK này trên 1 cửa sổ Chrome thật (đăng nhập sẵn bằng cookie, đi qua đúng proxy của TK) để thao tác trực tiếp" style="border-color:#3b82f6;color:#60a5fa;">Mở</button>
                 <button class="btn-tiny" onclick="testAccount('${a.id}')">Kiểm Tra</button>
                 <button class="btn-tiny" id="qb_${a.id}" onclick="checkAccountQuota('${a.id}')" title="Đọc hạn mức token của tài khoản này (qua proxy riêng của nó)">Hạn mức</button>
@@ -3223,10 +3215,12 @@
   function renderQuotaSummary() {
     const el = document.getElementById("accQuotaSummary");
     if (!el) return;
-    const accs = (cachedAccounts || []).filter(a => a.enabled !== false);
-    if (!accs.length) { el.innerHTML = ""; return; }
+    const allAccs = cachedAccounts || [];
+    if (!allAccs.length) { el.innerHTML = ""; return; }
+    const enabledCount = allAccs.filter(a => a.enabled !== false).length;
+    const disabledCount = allAccs.length - enabledCount;
     let ok = 0, low = 0, ex = 0, unk = 0, totalTokens = 0, oldest = Infinity;
-    accs.forEach(a => {
+    allAccs.forEach(a => {
       const st = quotaState(a.quota);
       if (st.state === "unknown") unk++;
       else {
@@ -3236,7 +3230,8 @@
       }
     });
     const parts = [
-      `<b>Hạn mức token (${accs.length} TK):</b>`,
+      `<b>Trạng thái (${allAccs.length} TK):</b> <span style="color:#34d399;">🟢 Bật ${enabledCount}</span> · <span style="color:#cbd5e1;">⚪ Tắt ${disabledCount}</span> &nbsp;|&nbsp;`,
+      `<b>Hạn mức token:</b>`,
       `<span style="color:#34d399;">🟢 còn ${ok}</span>`,
       `<span style="color:#fbbf24;">🟠 sắp hết ${low}</span>`,
       `<span style="color:#f87171;">🔴 hết token ${ex}</span>`,
@@ -3285,7 +3280,7 @@
   async function checkAllQuota() {
     const btn = document.getElementById("btnQuotaAll");
     if (quotaAllRunning) { quotaAllStop = true; if (btn) btn.innerText = "⏹ Đang dừng..."; return; }
-    const ids = (cachedAccounts || []).filter(a => a.enabled !== false && a.cookie_count !== 0).map(a => a.id);
+    const ids = (cachedAccounts || []).filter(a => !a.muse_locked && a.cookie_count !== 0).map(a => a.id);
     if (!ids.length) { showToast("Chưa có tài khoản nào", "warning"); return; }
     if (!confirm(`Đọc hạn mức token của ${ids.length} tài khoản?\nMỗi TK mở 1 tab tạm qua proxy riêng, 3 TK cùng lúc, khoảng ${Math.ceil(ids.length * 25 / 3 / 60)} phút. Có thể bấm lại nút để dừng giữa chừng.`)) return;
     quotaAllRunning = true; quotaAllStop = false;
@@ -3330,7 +3325,8 @@
         headers: getHeaders(),
         body: JSON.stringify({
           label: label || `Tài khoản ${Date.now().toString().slice(-4)}`,
-          cookie_header: cookie
+          cookie_header: cookie,
+          enabled: false
         })
       });
 
@@ -3347,10 +3343,24 @@
       }
 
       const data = await res.json();
+      // Đảm bảo tài khoản mới thêm luôn ở trạng thái TẮT (enabled=false) kể cả khi server chưa khởi động lại
+      if (Array.isArray(data.added)) {
+        for (const item of data.added) {
+          if (item && item.id) {
+            try {
+              await fetch(`/admin/accounts/${item.id}`, {
+                method: "PATCH",
+                headers: getHeaders(),
+                body: JSON.stringify({ enabled: false })
+              });
+            } catch (_) {}
+          }
+        }
+      }
       if (data.warning) {
-        showToast(`Đã thêm tài khoản! Lưu ý: ${data.warning}`, "warning");
+        showToast(`Đã thêm tài khoản (ở trạng thái TẮT)! Lưu ý: ${data.warning}`, "warning");
       } else {
-        showToast(`Đã thêm thành công ${data.count || 1} tài khoản!`, "success");
+        showToast(`Đã thêm ${data.count || 1} tài khoản (mặc định ở trạng thái TẮT — bấm Bật để giao việc)!`, "success");
       }
       document.getElementById("accLabelInput").value = "";
       document.getElementById("accCookieInput").value = "";
@@ -3510,6 +3520,101 @@
       showToast(`Lỗi mở trình duyệt: ${e.message}`, "danger");
     } finally {
       if (btn) { btn.disabled = false; btn.innerText = "Mở"; }
+    }
+  }
+
+  async function toggleAccountEnabled(aid, targetEnabled) {
+    const btn = document.getElementById(`tb_${aid}`);
+    if (btn) {
+      btn.disabled = true;
+      btn.innerText = "⏳...";
+    }
+    try {
+      const res = await fetch(`/admin/accounts/${aid}`, {
+        method: "PATCH",
+        headers: getHeaders(),
+        body: JSON.stringify({ enabled: !!targetEnabled })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+      }
+      const acc = (cachedAccounts || []).find(a => a.id === aid);
+      const label = (acc && acc.label) || data.label || aid;
+      showToast(
+        targetEnabled
+          ? `🟢 Đã BẬT giao việc cho tài khoản: ${label}`
+          : `⚪ Đã TẮT giao việc cho tài khoản: ${label}`,
+        targetEnabled ? "success" : "info"
+      );
+      await loadAccounts();
+      await checkServerStatus();
+    } catch (e) {
+      showToast(`Lỗi bật/tắt tài khoản: ${e.message}`, "danger");
+      if (btn) btn.disabled = false;
+      await loadAccounts();
+    }
+  }
+
+  async function toggleAllAccountsEnabled(targetEnabled) {
+    const accs = cachedAccounts || [];
+    if (!accs.length) {
+      showToast("Chưa có tài khoản nào trong hệ thống!", "warning");
+      return;
+    }
+    const actionLabel = targetEnabled ? "BẬT giao việc cho TẤT CẢ" : "TẮT giao việc cho TẤT CẢ";
+    if (!confirm(`Bạn có chắc muốn ${actionLabel} ${accs.length} tài khoản trong hệ thống?`)) return;
+
+    const btn = document.getElementById(targetEnabled ? "btnEnableAllAccs" : "btnDisableAllAccs");
+    const oldText = btn ? btn.innerText : "";
+    if (btn) {
+      btn.disabled = true;
+      btn.innerText = "⏳ Đang xử lý...";
+    }
+    try {
+      let handled = false;
+      const res = await fetch("/admin/accounts/toggle-all", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ enabled: !!targetEnabled })
+      });
+      if (res.ok) {
+        handled = true;
+      } else if (res.status === 404 || res.status === 405) {
+        // Fallback tương thích nóng khi server chưa khởi động lại
+        for (let i = 0; i < accs.length; i++) {
+          const a = accs[i];
+          if ((a.enabled !== false) !== !!targetEnabled) {
+            await fetch(`/admin/accounts/${a.id}`, {
+              method: "PATCH",
+              headers: getHeaders(),
+              body: JSON.stringify({ enabled: !!targetEnabled })
+            });
+          }
+          if (btn && i % 5 === 0) btn.innerText = `⏳ (${i + 1}/${accs.length})...`;
+        }
+        handled = true;
+      } else {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.detail || d.message || `HTTP ${res.status}`);
+      }
+      if (handled) {
+        showToast(
+          targetEnabled
+            ? `🟢 Đã BẬT giao việc cho toàn bộ ${accs.length} tài khoản!`
+            : `⚪ Đã TẮT giao việc cho toàn bộ ${accs.length} tài khoản!`,
+          targetEnabled ? "success" : "info"
+        );
+        await loadAccounts();
+        await checkServerStatus();
+      }
+    } catch (e) {
+      showToast(`Lỗi thao tác hàng loạt: ${e.message}`, "danger");
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerText = oldText;
+      }
     }
   }
 
@@ -3678,8 +3783,12 @@
       if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
       if (data.auto_claim !== undefined) document.getElementById("sp_auto_claim").checked = !!data.auto_claim;
       if (data.jobs_per_account) {
-        const clampedJobs = Math.max(1, Math.min(2, parseInt(data.jobs_per_account) || 2));
-        document.getElementById("sp_jobs_per_account").value = String(clampedJobs);
+        const elJobs = document.getElementById("sp_jobs_per_account");
+        if (elJobs) elJobs.value = "1";
+      }
+      if (data.ffmpeg_concurrency !== undefined) {
+        const elFf = document.getElementById("sp_ffmpeg_threads");
+        if (elFf) elFf.value = String(Math.max(1, Math.min(64, parseInt(data.ffmpeg_concurrency) || 24)));
       }
       if (data.skip_exhausted_accounts !== undefined) document.getElementById("skipExhausted").checked = !!data.skip_exhausted_accounts;
       updateShopeeThreadsHint();
@@ -3757,8 +3866,7 @@
   }
 
   function getShopeeJobsPerAccount() {
-    const v = parseInt(document.getElementById("sp_jobs_per_account")?.value) || 2;
-    return Math.max(1, Math.min(2, v));
+    return 1;
   }
 
   function onShopeeThreadsChange() {
@@ -3781,6 +3889,14 @@
     saveShopeeSettings();
   }
 
+  async function onFfmpegConcurrencyChange() {
+    const el = document.getElementById("sp_ffmpeg_threads");
+    const v = Math.max(1, Math.min(64, parseInt(el?.value) || 24));
+    if (el) el.value = String(v);
+    await saveShopeeSettings();
+    showToast(`🎞️ Đã lưu số luồng ghép FFmpeg đồng thời: ${v} luồng`, "success");
+  }
+
   function getShopeeFormData() {
     return {
       threads: parseInt(document.getElementById("sp_threads")?.value) || 2,
@@ -3794,6 +3910,7 @@
       ghep_anh: document.getElementById("sp_ghep_anh").checked,
       auto_claim: !!document.getElementById("sp_auto_claim")?.checked,
       jobs_per_account: getShopeeJobsPerAccount(),
+      ffmpeg_concurrency: Math.max(1, Math.min(64, parseInt(document.getElementById("sp_ffmpeg_threads")?.value) || 24)),
       skip_exhausted_accounts: !!document.getElementById("skipExhausted")?.checked,
       naming: document.getElementById("sp_naming").value,
       out_dir: document.getElementById("sp_out_dir").value.trim(),
@@ -5499,7 +5616,86 @@
     showToast("Đã xóa sạch danh sách sản phẩm!", "info");
   }
 
-  // ==================== HOMEPROXY MANAGEMENT ====================
+  // ==================== HOMEPROXY & TXT PROXY MANAGEMENT ====================
+  let _lastProxyTxtBtn = null;
+
+  function triggerImportProxyTxt(btnEl) {
+    _lastProxyTxtBtn = btnEl || null;
+    const inp = document.getElementById("proxyTxtFileInput");
+    if (inp) {
+      inp.value = "";
+      inp.click();
+    }
+  }
+
+  async function onProxyTxtFileSelected(ev) {
+    const file = ev?.target?.files?.[0];
+    if (!file) return;
+    const btn = _lastProxyTxtBtn || document.getElementById("btnImportProxyTxtAcc");
+    const origText = btn ? btn.innerText : "📂 Nhập Proxy TXT";
+    if (btn) {
+      btn.disabled = true;
+      btn.innerText = "⏳ Đang chia đều proxy...";
+    }
+    try {
+      const content = await file.text();
+      const lines = content.split(/[\r\n,;]+/).map(s => s.trim()).filter(s => s && !s.startsWith("#"));
+      if (!lines.length) {
+        showToast("⚠️ File .txt trống hoặc không có dòng proxy nào!", "warning");
+        return;
+      }
+      showToast(`⏳ Đang kiểm tra ${lines.length} dòng proxy từ "${file.name}" và chia đều cho các tài khoản...`, "info");
+      let res = await fetch("/api/proxy/import-txt", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ content, filename: file.name })
+      });
+      let data = {};
+      if (res.status === 404) {
+        const rProv = await fetch("/api/proxy/provider", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({ provider: "manual", manual_proxies: lines.join("\n") })
+        });
+        const dProv = await rProv.json().catch(() => ({}));
+        if (!rProv.ok) throw new Error(dProv.detail || `HTTP ${rProv.status}`);
+        const rSync = await fetch("/api/proxy/sync-thinaptm", {
+          method: "POST",
+          headers: getHeaders(),
+          body: JSON.stringify({ rebalance: true })
+        });
+        const dSync = await rSync.json().catch(() => ({}));
+        data = { ...dProv, ...dSync };
+      } else {
+        data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || `HTTP ${res.status}`);
+        }
+      }
+      const total = data.total_proxies || 0;
+      const alive = data.alive_proxies || 0;
+      const totalAccs = data.total_accounts || 0;
+      const maxPerProxy = data.max_accounts_per_proxy || 0;
+      showToast(
+        `✓ Đã nhập ${total} proxy từ "${file.name}" (${alive} sống) và chia đều cho ${totalAccs} tài khoản (~${maxPerProxy} TK/proxy)!`,
+        "success"
+      );
+      if ((data.invalid_lines || []).length) {
+        showToast(`⚠️ Đã bỏ qua ${data.invalid_lines.length} dòng sai định dạng: ${data.invalid_lines.slice(0, 3).join(" | ")}`, "warning");
+      }
+      await fetchProxyStatus();
+      await loadAccounts();
+      await fetchBrowserTtlStatus();
+    } catch (e) {
+      showToast(`Lỗi nhập proxy từ TXT: ${e.message}`, "danger");
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerText = origText;
+      }
+    }
+  }
+
   async function syncThinAptmProxy() {
     const btn = event?.target;
     if (btn) {
