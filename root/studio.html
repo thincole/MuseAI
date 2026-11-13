@@ -4381,6 +4381,102 @@
     throw new Error("Hết thời gian chờ render clip video (đã chờ quá 10 phút)");
   }
 
+  // --- Giải phóng giới hạn 6 kết nối HTTP/1.1 mỗi Origin của Chromium/WebView2 ---
+  // Chromium giới hạn tối đa 6 socket đồng thời trên cùng 1 origin (http://127.0.0.1:18610).
+  // Khi chạy 40-60 luồng, hàng chục request save-rendered-video / download-image sẽ bị kẹt cứng (Stalled)
+  // trong trình duyệt trước cả khi tới được FFmpeg trên server.
+  // Giải pháp kép:
+  // 1) Chia tải qua dải IP Loopback 127.0.0.2 -> 127.0.0.17 (16 origin x 6 = 96 luồng kết nối độc lập).
+  // 2) Chế độ Bất đồng bộ (async_mode: true) trả job_id trong < 2ms và gom nhóm hỏi trạng thái (Batch Poll).
+  let _shopeeShardSeq = 0;
+  let _loopbackShardReady = false;
+  (function probeLoopbackShards() {
+    const h = window.location.hostname;
+    if ((h === "127.0.0.1" || h === "localhost") && window.location.protocol === "http:") {
+      const port = window.location.port || "18610";
+      fetch(`http://127.0.0.2:${port}/api/version`, { method: "GET" })
+        .then(r => { if (r && r.ok) _loopbackShardReady = true; })
+        .catch(() => {});
+    }
+  })();
+
+  function shopeeBgUrl(path) {
+    if (_loopbackShardReady) {
+      const idx = (_shopeeShardSeq++ % 16) + 2; // 127.0.0.2 .. 127.0.0.17
+      const port = window.location.port || "18610";
+      return `http://127.0.0.${idx}:${port}${path}`;
+    }
+    return path;
+  }
+
+  const _pendingSaveVideoJobs = new Map();
+  let _saveJobsPollTimer = null;
+  let _saveJobsPolling = false;
+
+  function _ensureSaveJobsPoller() {
+    if (_saveJobsPollTimer) return;
+    _saveJobsPollTimer = setInterval(async () => {
+      if (_saveJobsPolling) return;
+      if (_pendingSaveVideoJobs.size === 0) {
+        clearInterval(_saveJobsPollTimer);
+        _saveJobsPollTimer = null;
+        return;
+      }
+      _saveJobsPolling = true;
+      try {
+        const allIds = Array.from(_pendingSaveVideoJobs.keys());
+        for (let i = 0; i < allIds.length; i += 40) {
+          const chunk = allIds.slice(i, i + 40);
+          const res = await fetch(shopeeBgUrl(`/api/shopee/save-jobs-status?ids=${encodeURIComponent(chunk.join(","))}`), {
+            headers: getHeaders()
+          });
+          if (!res.ok) continue;
+          const data = await res.json();
+          const jobs = (data && data.jobs) || {};
+          for (const jid of chunk) {
+            const info = jobs[jid];
+            if (!info || info.status === "running") continue;
+            const entry = _pendingSaveVideoJobs.get(jid);
+            if (!entry) continue;
+            _pendingSaveVideoJobs.delete(jid);
+            if (info.status === "done") {
+              entry.resolve({ ok: true, status: 200, data: info.result || {} });
+            } else {
+              entry.resolve({
+                ok: false,
+                status: info.status_code || 500,
+                errorText: info.error || "Lỗi lưu/ghép video"
+              });
+            }
+          }
+        }
+      } catch (_) {
+      } finally {
+        _saveJobsPolling = false;
+      }
+    }, 450);
+  }
+
+  async function saveRenderedVideoAsync(payload) {
+    const res = await fetch(shopeeBgUrl("/api/shopee/save-rendered-video"), {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify({ ...payload, async_mode: true })
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      return { ok: false, status: res.status, errorText: errText };
+    }
+    const data = await res.json();
+    if (data && data.async_job_id) {
+      return await new Promise((resolve) => {
+        _pendingSaveVideoJobs.set(data.async_job_id, { resolve });
+        _ensureSaveJobsPoller();
+      });
+    }
+    return { ok: true, status: 200, data };
+  }
+
   // Số sản phẩm kế tiếp trong hàng đợi được chuẩn bị sẵn (cào link TXT, tải ảnh, tạo prompt) trong lúc các luồng đang render
   const SHOPEE_PREFETCH_AHEAD = 3;
 
@@ -4393,7 +4489,7 @@
     if (!(prod._need_fetch || (!prod.image && prod.url))) return;
     appendShopeeLog(`> [${who}] Đang cào thông tin & ảnh từ Shopee URL: ${prod.url}...`);
     try {
-      const fetchRes = await fetch("/api/shopee/fetch-single-link", {
+      const fetchRes = await fetch(shopeeBgUrl("/api/shopee/fetch-single-link"), {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({ url: prod.url })
@@ -4416,7 +4512,7 @@
   }
 
   async function fetchShopeePrompt(prod, form) {
-    const promptRes = await fetch("/api/shopee/test-prompt", {
+    const promptRes = await fetch(shopeeBgUrl("/api/shopee/test-prompt"), {
       method: "POST",
       headers: getHeaders(),
       body: JSON.stringify({
@@ -4437,7 +4533,7 @@
   async function checkShopeeJobOwnership(prod) {
     if (prod._is_imported) return { skip: false };
     try {
-      const res = await fetch("/api/shopee/job-status", {
+      const res = await fetch(shopeeBgUrl("/api/shopee/job-status"), {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({ item_id: prod.item_id })
@@ -4455,7 +4551,7 @@
     const prep = { name: prod.name, imgUrl: shopeeProductImageUrl(prod), dataUrl: null, promptData: null };
     if (prep.imgUrl) {
       try {
-        const imgRes = await fetch("/api/shopee/download-image", {
+        const imgRes = await fetch(shopeeBgUrl("/api/shopee/download-image"), {
           method: "POST",
           headers: getHeaders(),
           body: JSON.stringify({ image_url: prep.imgUrl })
@@ -4527,7 +4623,7 @@
 
     if (!prod._clipsChecked) {
       try {
-        const checkRes = await fetch(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}&duration=${checkDuration}`, { headers: getHeaders() });
+        const checkRes = await fetch(shopeeBgUrl(`/api/shopee/check-temp-clips?out_dir=${encodeURIComponent(outDir)}&item_id=${encodeURIComponent(prod.item_id)}&duration=${checkDuration}`), { headers: getHeaders() });
         if (checkRes.ok) {
           const chk = await checkRes.json();
           prod._clipsChecked = true;
@@ -4548,7 +4644,7 @@
       renderShopeeProductsConsole();
       if (!prod._is_imported) {
         try {
-          await fetch("/api/shopee/complete", {
+          await fetch(shopeeBgUrl("/api/shopee/complete"), {
             method: "POST",
             headers: getHeaders(),
             body: JSON.stringify({ item_id: prod.item_id, status: "completed", video_path: finalVideoFile })
@@ -4571,7 +4667,7 @@
       appendShopeeLog(`   + Clip B: ${clipBFile}`);
       appendShopeeLog(`> [Luồng ${workerId}] Bỏ qua gọi Muse.ai, ghép Clip A + Clip B thành video 16s qua FFmpeg ngay...`);
 
-      const concatRes = await fetch("/api/shopee/concat-videos", {
+      const concatRes = await fetch(shopeeBgUrl("/api/shopee/concat-videos"), {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({
@@ -4586,31 +4682,26 @@
       finishedVideoFilename = concatData.filename;
       appendShopeeLog(`✓ [Luồng ${workerId}] Ghép video 16s từ 2 clip có sẵn thành công!`);
 
-      const saveRes = await fetch("/api/shopee/save-rendered-video", {
-        method: "POST",
-        headers: getHeaders(),
-        body: JSON.stringify({
-          filename: finishedVideoFilename,
-          item_id: prod.item_id,
-          out_dir: outDir,
-          target_name: targetFileName,
-          ghep_anh: false,
-          del_img: form.del_img,
-          image_url: prod.image_url || prod.image || (prod.images && prod.images[0]) || "",
-          image_data_url: null,
-          duration: form.duration
-        })
+      const saveOut16 = await saveRenderedVideoAsync({
+        filename: finishedVideoFilename,
+        item_id: prod.item_id,
+        out_dir: outDir,
+        target_name: targetFileName,
+        ghep_anh: false,
+        del_img: form.del_img,
+        image_url: prod.image_url || prod.image || (prod.images && prod.images[0]) || "",
+        image_data_url: null,
+        duration: form.duration
       });
-      if (!saveRes.ok) {
-        const errText = await saveRes.text();
-        throw new Error(`Lỗi lưu video 16s (${saveRes.status}): ${errText}`);
+      if (!saveOut16.ok) {
+        throw new Error(`Lỗi lưu video 16s (${saveOut16.status}): ${saveOut16.errorText}`);
       }
-      const saveData = await saveRes.json();
+      const saveData = saveOut16.data || {};
       const finalSavedPath = saveData.saved_path || `${outDir}/${targetFileName}`;
       appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video 16s hoàn chỉnh vào: ${finalSavedPath}`);
 
       if (!prod._is_imported) {
-        await fetch("/api/shopee/complete", {
+        await fetch(shopeeBgUrl("/api/shopee/complete"), {
           method: "POST",
           headers: getHeaders(),
           body: JSON.stringify({ item_id: prod.item_id, status: "completed", video_path: finalSavedPath })
@@ -4633,7 +4724,7 @@
       for (let attempt = 1; attempt <= 2 && !refImageDataUrl; attempt++) {
         if (attempt > 1) await new Promise(r => setTimeout(r, 2000));
         try {
-          const imgRes = await fetch("/api/shopee/download-image", {
+          const imgRes = await fetch(shopeeBgUrl("/api/shopee/download-image"), {
             method: "POST",
             headers: getHeaders(),
             body: JSON.stringify({ image_url: imgUrl })
@@ -4677,7 +4768,7 @@
         const rawA = await renderSingleVideoClip(promptData.prompts[0], refImageDataUrl, ar, 8, workerId, "Clip A (0-8s)");
         prod._clipA = rawA;
         try {
-          const saveResA = await fetch("/api/shopee/save-temp-clip", {
+          const saveResA = await fetch(shopeeBgUrl("/api/shopee/save-temp-clip"), {
             method: "POST",
             headers: getHeaders(),
             body: JSON.stringify({ filename: rawA, out_dir: outDir, item_id: String(prod.item_id), part: "a" })
@@ -4706,7 +4797,7 @@
         const rawB = await renderSingleVideoClip(promptData.prompts[1], refImageDataUrl, ar, 8, workerId, "Clip B (8-16s)");
         prod._clipB = rawB;
         try {
-          const saveResB = await fetch("/api/shopee/save-temp-clip", {
+          const saveResB = await fetch(shopeeBgUrl("/api/shopee/save-temp-clip"), {
             method: "POST",
             headers: getHeaders(),
             body: JSON.stringify({ filename: rawB, out_dir: outDir, item_id: String(prod.item_id), part: "b" })
@@ -4741,7 +4832,7 @@
     let rawSavedToTemp = false;
     if (effectiveIs16s) {
       appendShopeeLog(`> [Luồng ${workerId}] Đang ghép Clip A + Clip B thành video 16s qua FFmpeg...`);
-      const concatRes = await fetch("/api/shopee/concat-videos", {
+      const concatRes = await fetch(shopeeBgUrl("/api/shopee/concat-videos"), {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({
@@ -4758,7 +4849,7 @@
       appendShopeeLog(`✓ [Luồng ${workerId}] Ghép video 16s thành công!`);
     } else {
       try {
-        const sRes = await fetch("/api/shopee/save-temp-clip", {
+        const sRes = await fetch(shopeeBgUrl("/api/shopee/save-temp-clip"), {
           method: "POST",
           headers: getHeaders(),
           body: JSON.stringify({ filename: finishedVideoFilename, out_dir: outDir, item_id: prod.item_id, part: "raw", image_url: imgUrl })
@@ -4777,30 +4868,26 @@
       appendShopeeLog(`> [Luồng ${workerId}] Đang ghép ảnh Outro sản phẩm để tạo video 12s bằng FFmpeg...`);
     }
 
-    const saveRes = await fetch("/api/shopee/save-rendered-video", {
-      method: "POST",
-      headers: getHeaders(),
-      body: JSON.stringify({
-        filename: finishedVideoFilename,
-        item_id: prod.item_id,
-        out_dir: outDir,
-        target_name: targetFileName,
-        ghep_anh: shouldGhepAnh,
-        del_img: form.del_img,
-        image_url: imgUrl,
-        image_data_url: refImageDataUrl,
-        duration: form.duration
-      })
+    const saveOut = await saveRenderedVideoAsync({
+      filename: finishedVideoFilename,
+      item_id: prod.item_id,
+      out_dir: outDir,
+      target_name: targetFileName,
+      ghep_anh: shouldGhepAnh,
+      del_img: form.del_img,
+      image_url: imgUrl,
+      image_data_url: refImageDataUrl,
+      duration: form.duration
     });
-    if (!saveRes.ok) {
-      const errText = await saveRes.text();
-      if (shouldGhepAnh && rawSavedToTemp && saveRes.status === 502) {
+    if (!saveOut.ok) {
+      const errText = saveOut.errorText || "";
+      if (shouldGhepAnh && rawSavedToTemp && saveOut.status === 502) {
         // Video AI đã render xong và nằm an toàn trong temp ({item_id}-raw.mp4): vẫn báo hoàn tất về Database
         // để SP không bị nhận lại; phần ghép Outro 12s làm sau bằng nút "Ghép Clip Temp".
-        appendShopeeLog(`⚠️ [Luồng ${workerId}] SP ${prod.item_id}: chưa ghép được Outro 12s (${saveRes.status}) -> giữ video AI trong temp/${prod.item_id}-raw.mp4, bấm "Ghép Clip Temp" để ghép sau.`);
+        appendShopeeLog(`⚠️ [Luồng ${workerId}] SP ${prod.item_id}: chưa ghép được Outro 12s (${saveOut.status}) -> giữ video AI trong temp/${prod.item_id}-raw.mp4, bấm "Ghép Clip Temp" để ghép sau.`);
         const pendingPath = `${outDir}/${targetFileName}`;
         if (!prod._is_imported) {
-          await fetch("/api/shopee/complete", {
+          await fetch(shopeeBgUrl("/api/shopee/complete"), {
             method: "POST",
             headers: getHeaders(),
             body: JSON.stringify({ item_id: prod.item_id, status: "completed", video_path: pendingPath })
@@ -4810,9 +4897,9 @@
         updateTempStitchButtonStatus();
         return;
       }
-      throw new Error(`Lỗi lưu/ghép video (${saveRes.status}): ${errText}`);
+      throw new Error(`Lỗi lưu/ghép video (${saveOut.status}): ${errText}`);
     }
-    const saveData = await saveRes.json();
+    const saveData = saveOut.data || {};
     const finalSavedPath = saveData.saved_path || `${outDir}/${targetFileName}`;
     if (saveData.stitched) {
       appendShopeeLog(`✓ [Luồng ${workerId}] Đã ghép ảnh Outro thành công (12s) vào: ${finalSavedPath}`);
@@ -4823,7 +4910,7 @@
     }
 
     if (!prod._is_imported) {
-      await fetch("/api/shopee/complete", {
+      await fetch(shopeeBgUrl("/api/shopee/complete"), {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({

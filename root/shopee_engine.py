@@ -141,7 +141,7 @@ def has_nvenc() -> bool:
 def _video_encode_args(use_nvenc: bool) -> list[str]:
     if use_nvenc:
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23", "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "superfast", "-crf", "22", "-threads", "2", "-pix_fmt", "yuv420p"]
 
 # ==================== CẤU HÌNH DATABASE NOVAGATE (đọc từ .env, không ghi cứng secret) ====================
 # Server URL / API key / Client ID để trong .env (file này đã được .gitignore) để không lộ khi commit.
@@ -1533,12 +1533,12 @@ def ghep_anh_12s(
         # zoom là 1:1 -> concat không nối được 2 đoạn khác SAR, FFmpeg báo -22 (Invalid argument) -> ép về 1:1.
         v_part = f"[0:v]scale={width}:{height},fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setsar=1,setpts=PTS-STARTPTS[v_part]"
 
-        # Outro ảnh chuyển động phóng to (zoom-in)
+        # Outro ảnh chuyển động phóng to (zoom-in) — chỉ đọc 1 khung ảnh rồi zoompan sinh ra đúng total_image_frames
         i_v = (
             f"[1:v]scale={w_scale}:{h_scale}:force_original_aspect_ratio=increase,"
             f"crop={w_scale}:{h_scale},"
-            f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height},"
-            f"fps={fps_int},trim=0:{image_dur},setsar=1,setpts=PTS-STARTPTS[i_v]"
+            f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height}:fps={fps_int},"
+            f"trim=0:{image_dur},setsar=1,setpts=PTS-STARTPTS[i_v]"
         )
 
         filter_parts = [v_part, i_v]
@@ -1568,7 +1568,7 @@ def ghep_anh_12s(
         base_cmd = [
             "ffmpeg", "-y",
             "-reinit_filter", "0", "-i", video_path,
-            "-loop", "1", "-t", str(image_dur), "-i", image_path,
+            "-i", image_path,
             "-filter_complex", filter_complex_str,
             *map_args,
         ]

@@ -4453,10 +4453,15 @@ def download_shopee_image(req: dict):
     return {"data_url": data_url}
 
 
-@app.post("/api/shopee/save-rendered-video")
-def save_rendered_video(req: dict):
-    """Lưu video đã render sang thư mục đầu ra chỉ định.
-    Nếu ghep_anh=True, thực hiện ghép ảnh sản phẩm làm Outro tạo video chuẩn 12s."""
+import concurrent.futures
+
+_SAVE_VIDEO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=64, thread_name_prefix="shopee_save")
+_SAVE_JOBS: dict[str, dict[str, Any]] = {}
+_SAVE_JOBS_LOCK = threading.Lock()
+
+
+def _save_rendered_video_sync(req: dict) -> dict:
+    """Thực thi đồng bộ việc lưu / ghép ảnh Outro 12s cho video đã render."""
     filename = str(req.get("filename") or "").strip()
     out_dir = req.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
     target_name = req.get("target_name") or filename
@@ -4664,6 +4669,75 @@ def save_rendered_video(req: dict):
         raise
     except Exception as e:
         raise HTTPException(500, f"Lỗi lưu file video: {e}")
+
+
+def _run_async_save_job(job_id: str, payload: dict) -> None:
+    try:
+        res = _save_rendered_video_sync(payload)
+        with _SAVE_JOBS_LOCK:
+            _SAVE_JOBS[job_id] = {
+                "status": "done",
+                "ts": time.time(),
+                "result": res,
+                "status_code": 200,
+            }
+    except HTTPException as he:
+        with _SAVE_JOBS_LOCK:
+            _SAVE_JOBS[job_id] = {
+                "status": "error",
+                "ts": time.time(),
+                "error": str(he.detail),
+                "status_code": he.status_code,
+            }
+    except Exception as exc:
+        with _SAVE_JOBS_LOCK:
+            _SAVE_JOBS[job_id] = {
+                "status": "error",
+                "ts": time.time(),
+                "error": f"Lỗi lưu file video: {exc}",
+                "status_code": 500,
+            }
+
+
+@app.post("/api/shopee/save-rendered-video")
+def save_rendered_video(req: dict):
+    """Lưu video đã render sang thư mục đầu ra chỉ định.
+    Nếu async_mode=True, đẩy ngay vào hàng đợi xử lý nền (trả về trong < 2ms để giải phóng giới hạn 6 kết nối HTTP/1.1 của trình duyệt)."""
+    if req.get("async_mode"):
+        job_id = "sv_" + uuid.uuid4().hex[:12]
+        now = time.time()
+        with _SAVE_JOBS_LOCK:
+            if len(_SAVE_JOBS) > 200:
+                stale = [k for k, v in _SAVE_JOBS.items() if now - v.get("ts", 0) > 600]
+                for k in stale:
+                    _SAVE_JOBS.pop(k, None)
+            _SAVE_JOBS[job_id] = {
+                "status": "running",
+                "ts": now,
+                "item_id": str(req.get("item_id") or ""),
+            }
+        _SAVE_VIDEO_EXECUTOR.submit(_run_async_save_job, job_id, dict(req))
+        return {"success": True, "async_job_id": job_id, "queued": True}
+    return _save_rendered_video_sync(req)
+
+
+@app.get("/api/shopee/save-jobs-status")
+def get_save_jobs_status(ids: str = ""):
+    """Kiểm tra trạng thái hàng loạt các tác vụ lưu/ghép video đang chạy nền."""
+    req_ids = [x.strip() for x in (ids or "").split(",") if x.strip()]
+    out: dict[str, dict[str, Any]] = {}
+    with _SAVE_JOBS_LOCK:
+        for jid in req_ids:
+            info = _SAVE_JOBS.get(jid)
+            if not info:
+                out[jid] = {"status": "not_found"}
+            elif info.get("status") in ("done", "error"):
+                out[jid] = dict(info)
+                _SAVE_JOBS.pop(jid, None)
+            else:
+                out[jid] = {"status": "running"}
+        running_count = sum(1 for v in _SAVE_JOBS.values() if v.get("status") == "running")
+    return {"success": True, "jobs": out, "running_count": running_count}
 
 
 @app.post("/api/shopee/clean-media-cache")
