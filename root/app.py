@@ -3610,14 +3610,15 @@ def save_temp_clip(req: dict):
         except Exception:
             pass
 
-    shopee_engine.set_cached_clip(item_id, f"clip_{part}", target_path)
+    cache_updates = {f"clip_{part}": target_path}
     image_url = str(req.get("image_url", "")).strip()
     if image_url:
         if image_url.startswith("//"):
             image_url = "https:" + image_url
         elif not image_url.startswith(("http://", "https://", "data:")) and not os.path.isfile(image_url):
             image_url = f"https://cf.shopee.ph/file/{image_url}"
-        shopee_engine.set_cached_clip(item_id, "image_url", image_url)
+        cache_updates["image_url"] = image_url
+    shopee_engine.set_cached_clips(item_id, cache_updates)
     log.info("💾 [Temp Clip] Đã lưu clip thành phần: temp/%s (%s)", target_filename, target_path)
     # Clip đã đổi tên sang temp/{item}-raw.mp4: chuyển nhãn "TK nào sinh ra" sang tên mới, để bước ghép/lưu sau còn biết
     # cộng "Video thành công" cho đúng TK.
@@ -3932,14 +3933,15 @@ def auto_stitch_temp_clips(req: dict):
     log.info("⚡ [Auto Stitch] Bắt đầu ghép tự động: %d cặp clip 16s và %d clip raw trong %s...", len(waiting_ids), len(waiting_raw_ids), temp_dir)
     stitched_items = []
     failed_items = []
+    stitch_res_lock = threading.Lock()
 
     delete_temp = bool(req.get("delete_temp", True))
     product_images = req.get("product_images") or {}
     ghep_anh = bool(req.get("ghep_anh", True))
     market = (str(req.get("market") or saved_cfg.get("market") or "PH").strip().upper() or "PH")
+    worker_count = max(1, min(shopee_engine.FFMPEG_CONCURRENCY, len(waiting_ids) + len(waiting_raw_ids)))
 
-    # 1. Ghép các cặp clip A + B thành video 16s
-    for iid in waiting_ids:
+    def _stitch_pair_16s(iid: str) -> None:
         f_a = None
         f_b = None
         # Quy tắc dự án: KHÔNG BAO GIỜ tự động xóa clip -a / -b. File lỗi (< 200KB) chỉ bị bỏ qua,
@@ -3966,11 +3968,12 @@ def auto_stitch_temp_clips(req: dict):
         # Chỉ ghép khi có ĐỦ cả Clip A và Clip B; thiếu một bên thì giữ nguyên file, chờ render bổ sung.
         if not f_a or not f_b:
             missing = "Clip A" if not f_a else "Clip B"
-            failed_items.append({
-                "item_id": iid,
-                "reason": f"Chưa đủ cặp để ghép (thiếu {missing} hợp lệ >= 200KB) — đã giữ nguyên file trong temp"
-            })
-            continue
+            with stitch_res_lock:
+                failed_items.append({
+                    "item_id": iid,
+                    "reason": f"Chưa đủ cặp để ghép (thiếu {missing} hợp lệ >= 200KB) — đã giữ nguyên file trong temp"
+                })
+            return
 
         target_name = f"{iid}.mp4"
         out_final = os.path.join(out_dir, target_name)
@@ -3978,25 +3981,29 @@ def auto_stitch_temp_clips(req: dict):
         try:
             ok = shopee_engine.concat_videos([f_a, f_b], out_final)
             if ok and os.path.isfile(out_final) and os.path.getsize(out_final) >= 200000:
-                stitched_items.append({
-                    "item_id": iid,
-                    "filename": target_name,
-                    "path": out_final,
-                    "size": os.path.getsize(out_final)
-                })
+                sz = os.path.getsize(out_final)
+                with stitch_res_lock:
+                    stitched_items.append({
+                        "item_id": iid,
+                        "filename": target_name,
+                        "path": out_final,
+                        "size": sz
+                    })
                 log.info("✓ [Auto Stitch] Ghép thành công 16s: %s (%.1f MB) — giữ nguyên Clip A/B trong temp",
-                         target_name, os.path.getsize(out_final) / (1024 * 1024))
+                         target_name, sz / (1024 * 1024))
             else:
-                failed_items.append({"item_id": iid, "reason": "FFmpeg concat_videos trả về thất bại"})
+                with stitch_res_lock:
+                    failed_items.append({"item_id": iid, "reason": "FFmpeg concat_videos trả về thất bại"})
         except Exception as err:
             log.warning("✗ [Auto Stitch] Lỗi ghép SP %s: %s", iid, err)
-            failed_items.append({"item_id": iid, "reason": str(err)})
+            with stitch_res_lock:
+                failed_items.append({"item_id": iid, "reason": str(err)})
 
-    # 2. Xử lý các clip raw (8s/10s) chưa ghép: ghép ảnh 12s hoặc chuyển vào output folder
+    db_images = {}
+    cached_meta_map = {}
     if waiting_raw_ids:
-        # Truy vấn Database PostgreSQL lấy ảnh cho các item_id còn thiếu
+        cached_meta_map = shopee_engine.get_cached_clips_many(waiting_raw_ids)
         missing_img_ids = [iid for iid in waiting_raw_ids if not (product_images.get(iid) or product_images.get(str(iid)))]
-        db_images = {}
         if missing_img_ids:
             try:
                 db_images = query_shopee_db_images(missing_img_ids, market)
@@ -4004,117 +4011,129 @@ def auto_stitch_temp_clips(req: dict):
             except Exception as e_q:
                 log.warning("Không thể truy vấn PostgreSQL cho clip temp: %s", e_q)
 
-        for iid in waiting_raw_ids:
-            f_raw = None
-            for ext in (".mp4", ".mov", ".webm"):
-                for cand_raw in (os.path.join(temp_dir, f"{iid}-raw{ext}"), os.path.join(temp_dir, f"{iid}_raw{ext}")):
-                    if os.path.isfile(cand_raw):
-                        sz = os.path.getsize(cand_raw)
-                        if sz < 200000:
-                            # Tự động xóa luôn file < 200KB
-                            try:
-                                os.remove(cand_raw)
-                                log.info("🗑️ Đã xóa file raw lỗi < 200KB: %s (%d bytes)", cand_raw, sz)
-                            except Exception:
-                                pass
-                        else:
-                            f_raw = cand_raw
-                            break
-                if f_raw:
-                    break
+    def _stitch_raw_12s(iid: str) -> None:
+        f_raw = None
+        for ext in (".mp4", ".mov", ".webm"):
+            for cand_raw in (os.path.join(temp_dir, f"{iid}-raw{ext}"), os.path.join(temp_dir, f"{iid}_raw{ext}")):
+                if os.path.isfile(cand_raw):
+                    sz = os.path.getsize(cand_raw)
+                    if sz < 200000:
+                        # Tự động xóa luôn file < 200KB
+                        try:
+                            os.remove(cand_raw)
+                            log.info("🗑️ Đã xóa file raw lỗi < 200KB: %s (%d bytes)", cand_raw, sz)
+                        except Exception:
+                            pass
+                    else:
+                        f_raw = cand_raw
+                        break
+            if f_raw:
+                break
 
-            if not f_raw:
+        if not f_raw:
+            with stitch_res_lock:
                 failed_items.append({"item_id": iid, "reason": "Clip raw không hợp lệ hoặc dung lượng < 200KB (đã tự động xóa)"})
-                continue
+            return
 
-            target_name = f"{iid}.mp4"
-            out_final = os.path.join(out_dir, target_name)
+        target_name = f"{iid}.mp4"
+        out_final = os.path.join(out_dir, target_name)
 
-            # Thứ tự tìm ảnh sản phẩm theo ItemID:
-            #   1) danh sách SP đang mở trên giao diện -> 2) PostgreSQL -> 3) ảnh đã tải về máy
-            #   -> 4) image_url lưu trong clip cache lúc render -> 5) cào trực tiếp từ Shopee theo ItemID
-            local_img = os.path.join(SHOPEE_IMG_CACHE_DIR, f"{iid}.jpg")
-            img_url = str(product_images.get(iid) or product_images.get(str(iid)) or db_images.get(iid) or "").strip()
-            if not img_url and os.path.isfile(local_img) and os.path.getsize(local_img) > 1000:
-                img_url = local_img
-            if not img_url:
-                img_url = str(shopee_engine.get_cached_clips(iid).get("image_url") or "").strip()
-            if not img_url:
-                try:
-                    import shopee_scraper
-                    img_url = shopee_scraper.fetch_image_url_by_item_id(iid, market=market) or ""
-                    if img_url:
-                        log.info("🔎 [Auto Stitch] Đã cào được ảnh SP %s từ Shopee %s", iid, market)
-                except Exception as e_sc:
-                    log.warning("Cào ảnh Shopee theo ItemID %s thất bại: %s", iid, e_sc)
+        # Thứ tự tìm ảnh sản phẩm theo ItemID:
+        #   1) danh sách SP đang mở trên giao diện -> 2) PostgreSQL -> 3) ảnh đã tải về máy
+        #   -> 4) image_url lưu trong clip cache lúc render -> 5) cào trực tiếp từ Shopee theo ItemID
+        local_img = os.path.join(SHOPEE_IMG_CACHE_DIR, f"{iid}.jpg")
+        img_url = str(product_images.get(iid) or product_images.get(str(iid)) or db_images.get(iid) or "").strip()
+        if not img_url and os.path.isfile(local_img) and os.path.getsize(local_img) > 1000:
+            img_url = local_img
+        if not img_url:
+            img_url = str((cached_meta_map.get(iid) or {}).get("image_url") or "").strip()
+        if not img_url:
+            try:
+                import shopee_scraper
+                img_url = shopee_scraper.fetch_image_url_by_item_id(iid, market=market) or ""
+                if img_url:
+                    log.info("🔎 [Auto Stitch] Đã cào được ảnh SP %s từ Shopee %s", iid, market)
+            except Exception as e_sc:
+                log.warning("Cào ảnh Shopee theo ItemID %s thất bại: %s", iid, e_sc)
 
-            if img_url and not os.path.isfile(img_url):
-                if img_url.startswith("//"):
-                    img_url = "https:" + img_url
-                elif not img_url.startswith(("http://", "https://", "data:")):
-                    img_url = f"https://cf.shopee.{market.lower()}/file/{img_url}"
-                # Ghi nhớ lại để lần ghép sau khỏi phải truy vấn/cào lại
-                try:
-                    shopee_engine.set_cached_clip(iid, "image_url", img_url)
-                except Exception:
-                    pass
+        if img_url and not os.path.isfile(img_url):
+            if img_url.startswith("//"):
+                img_url = "https:" + img_url
+            elif not img_url.startswith(("http://", "https://", "data:")):
+                img_url = f"https://cf.shopee.{market.lower()}/file/{img_url}"
+            # Ghi nhớ lại để lần ghép sau khỏi phải truy vấn/cào lại
+            try:
+                shopee_engine.set_cached_clip(iid, "image_url", img_url)
+            except Exception:
+                pass
 
-            stitched_raw = False
-            if ghep_anh and img_url:
-                try:
-                    img_path = None
-                    if os.path.isfile(img_url):
-                        img_path = img_url
-                    else:
-                        os.makedirs(SHOPEE_IMG_CACHE_DIR, exist_ok=True)
-                        if img_url.startswith("data:image") and ";base64," in img_url:
-                            with open(local_img, "wb") as f:
-                                f.write(base64.b64decode(img_url.split(";base64,", 1)[1]))
-                            img_path = local_img
-                        elif img_url.startswith("http") and shopee_engine.download_image_to_file(img_url, local_img):
-                            img_path = local_img
+        stitched_raw = False
+        if ghep_anh and (img_url or (os.path.isfile(local_img) and os.path.getsize(local_img) > 100)):
+            try:
+                img_path = None
+                if os.path.isfile(local_img) and os.path.getsize(local_img) > 100:
+                    img_path = local_img
+                elif img_url and os.path.isfile(img_url):
+                    img_path = img_url
+                else:
+                    os.makedirs(SHOPEE_IMG_CACHE_DIR, exist_ok=True)
+                    if img_url.startswith("data:image") and ";base64," in img_url:
+                        with open(local_img, "wb") as f:
+                            f.write(base64.b64decode(img_url.split(";base64,", 1)[1]))
+                        img_path = local_img
+                    elif img_url.startswith("http") and shopee_engine.download_image_to_file(img_url, local_img):
+                        img_path = local_img
 
-                    if img_path and os.path.isfile(img_path) and os.path.getsize(img_path) > 100:
-                        raw_dur = shopee_engine.probe_media_duration(f_raw)
-                        ok = shopee_engine.ghep_anh_12s(f_raw, img_path, out_final, ai_duration=raw_dur)
-                        if ok:
-                            valid, out_dur = shopee_engine.is_valid_12s_output(out_final)
-                            if valid:
-                                stitched_raw = True
-                                log.info("✓ [Auto Stitch] SP %s: đã ghép Outro ảnh -> video %.2fs", iid, out_dur)
-                            else:
-                                log.warning("⚠️ [Auto Stitch] SP %s: video sau ghép dài %s, không phải 12s -> hủy, giữ clip raw",
-                                            iid, f"{out_dur:.2f}s" if out_dur else "?")
-                                shopee_engine._safe_remove(out_final)
-                    else:
-                        log.warning("⚠️ [Auto Stitch] SP %s: tải ảnh thất bại, chưa ghép được 12s", iid)
-                except Exception as ge:
-                    log.warning("Ghép ảnh 12s cho SP %s thất bại: %s", iid, ge)
+                if img_path and os.path.isfile(img_path) and os.path.getsize(img_path) > 100:
+                    ok = shopee_engine.ghep_anh_12s(f_raw, img_path, out_final)
+                    if ok:
+                        valid, out_dur = shopee_engine.is_valid_12s_output(out_final)
+                        if valid:
+                            stitched_raw = True
+                            log.info("✓ [Auto Stitch] SP %s: đã ghép Outro ảnh -> video %.2fs", iid, out_dur)
+                        else:
+                            log.warning("⚠️ [Auto Stitch] SP %s: video sau ghép dài %s, không phải 12s -> hủy, giữ clip raw",
+                                        iid, f"{out_dur:.2f}s" if out_dur else "?")
+                            shopee_engine._safe_remove(out_final)
+                else:
+                    log.warning("⚠️ [Auto Stitch] SP %s: tải ảnh thất bại, chưa ghép được 12s", iid)
+            except Exception as ge:
+                log.warning("Ghép ảnh 12s cho SP %s thất bại: %s", iid, ge)
 
-            if not stitched_raw and not ghep_anh:
-                # Nếu không chọn ghép ảnh, copy thô clip raw sang output
-                try:
-                    shutil.copy2(f_raw, out_final)
-                    stitched_raw = os.path.isfile(out_final) and os.path.getsize(out_final) >= 10000
-                except Exception as ce:
-                    log.warning("Copy clip raw SP %s sang output thất bại: %s", iid, ce)
+        if not stitched_raw and not ghep_anh:
+            # Nếu không chọn ghép ảnh, copy thô clip raw sang output
+            try:
+                shutil.copy2(f_raw, out_final)
+                stitched_raw = os.path.isfile(out_final) and os.path.getsize(out_final) >= 10000
+            except Exception as ce:
+                log.warning("Copy clip raw SP %s sang output thất bại: %s", iid, ce)
 
-            if stitched_raw:
+        if stitched_raw:
+            sz_out = os.path.getsize(out_final)
+            with stitch_res_lock:
                 stitched_items.append({
                     "item_id": iid,
                     "filename": target_name,
                     "path": out_final,
-                    "size": os.path.getsize(out_final)
+                    "size": sz_out
                 })
-                log.info("✓ [Auto Stitch] Đã xuất video hoàn chỉnh cho SP %s: %s (%.1f MB)", iid, target_name, os.path.getsize(out_final)/(1024*1024))
-                if delete_temp and os.path.isfile(f_raw):
-                    try:
-                        os.remove(f_raw)
-                    except Exception:
-                        pass
-            else:
-                reason = "Thiếu ảnh sản phẩm để ghép Outro 12s" if (ghep_anh and not img_url) else "Lỗi ghép ảnh 12s FFmpeg"
+            log.info("✓ [Auto Stitch] Đã xuất video hoàn chỉnh cho SP %s: %s (%.1f MB)", iid, target_name, sz_out / (1024 * 1024))
+            if delete_temp and os.path.isfile(f_raw):
+                try:
+                    os.remove(f_raw)
+                except Exception:
+                    pass
+            shopee_engine.clear_cached_clip_keys(iid, ("clip_raw",))
+        else:
+            reason = "Thiếu ảnh sản phẩm để ghép Outro 12s" if (ghep_anh and not img_url) else "Lỗi ghép ảnh 12s FFmpeg"
+            with stitch_res_lock:
                 failed_items.append({"item_id": iid, "reason": reason})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="auto_stitch") as ex:
+        futs = [ex.submit(_stitch_pair_16s, iid) for iid in waiting_ids]
+        futs.extend(ex.submit(_stitch_raw_12s, iid) for iid in waiting_raw_ids)
+        for fut in futs:
+            fut.result()
 
     total_stitched = len(stitched_items)
     total_needed = len(waiting_ids) + len(waiting_raw_ids)
@@ -4444,8 +4463,12 @@ def recycle_browser(req: dict = Body(default={})):
 @app.post("/api/shopee/download-image")
 def download_shopee_image(req: dict):
     image_url = req.get("image_url", "")
+    item_id = str(req.get("item_id") or "").strip()
+    cache_path = None
+    if item_id and _SAFE_ID_RE.match(item_id):
+        cache_path = os.path.join(SHOPEE_IMG_CACHE_DIR, f"{item_id}.jpg")
     try:
-        data_url = shopee_engine.download_image_as_data_url(image_url)
+        data_url = shopee_engine.download_image_as_data_url(image_url, cache_path=cache_path)
     except ValueError as e:
         raise HTTPException(400, f"URL ảnh không hợp lệ: {e}")
     if not data_url:
@@ -4455,7 +4478,7 @@ def download_shopee_image(req: dict):
 
 import concurrent.futures
 
-_SAVE_VIDEO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=64, thread_name_prefix="shopee_save")
+_SAVE_VIDEO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=128, thread_name_prefix="shopee_save")
 _SAVE_JOBS: dict[str, dict[str, Any]] = {}
 _SAVE_JOBS_LOCK = threading.Lock()
 
@@ -4565,32 +4588,44 @@ def _save_rendered_video_sync(req: dict) -> dict:
             elif not image_url.startswith(("http://", "https://", "data:")) and not os.path.isfile(image_url):
                 image_url = f"https://cf.shopee.ph/file/{image_url}"
 
+        safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(item_id or ""))[:24]
+        cached_local_img = os.path.join(SHOPEE_IMG_CACHE_DIR, f"{safe_id}.jpg") if safe_id else ""
+        has_cached_local_img = bool(cached_local_img and os.path.isfile(cached_local_img) and os.path.getsize(cached_local_img) > 100)
+
         stitched = False
         ghep_fail_reason = ""
         temp_img_path = None
-        if ghep_anh and (image_url or image_data_url):
-            # Dùng độ dài THẬT của clip (Muse có thể trả ngắn hơn số giây đã chọn) để chọn 8s+4s hay 10s+2s;
-            # chỉ khi ffprobe không đo được mới dựa vào số giây người dùng chọn.
-            real_dur = shopee_engine.probe_media_duration(src)
-            ghep_dur = real_dur or ai_dur
+        if ghep_anh and (has_cached_local_img or image_url or image_data_url):
             try:
-                # Tên file riêng cho từng lần ghép: 2 SP ghép cùng 1 mili-giây từng dùng chung 1 file ảnh,
-                # SP xong trước xóa mất ảnh của SP kia -> "[WinError 2] cannot find the file".
-                safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(item_id or ""))[:24]
-                temp_img_path = os.path.join(CFG.data_dir, f"temp_outro_{safe_id}_{uuid.uuid4().hex[:10]}.jpg")
-                if image_data_url and ";base64," in image_data_url:
+                img_path_to_use = None
+                if has_cached_local_img:
+                    img_path_to_use = cached_local_img
+                elif image_data_url and ";base64," in image_data_url:
                     b64_content = image_data_url.split(";base64,", 1)[1]
-                    with open(temp_img_path, "wb") as f:
-                        f.write(base64.b64decode(b64_content))
+                    raw_img_bytes = base64.b64decode(b64_content)
+                    if cached_local_img:
+                        os.makedirs(SHOPEE_IMG_CACHE_DIR, exist_ok=True)
+                        with open(cached_local_img, "wb") as f:
+                            f.write(raw_img_bytes)
+                        img_path_to_use = cached_local_img
+                    else:
+                        temp_img_path = os.path.join(CFG.data_dir, f"temp_outro_{uuid.uuid4().hex[:10]}.jpg")
+                        with open(temp_img_path, "wb") as f:
+                            f.write(raw_img_bytes)
+                        img_path_to_use = temp_img_path
                 elif image_url and (image_url.startswith("http://") or image_url.startswith("https://")):
-                    shopee_engine.download_image_to_file(image_url, temp_img_path)
+                    dst_img = cached_local_img or os.path.join(CFG.data_dir, f"temp_outro_{uuid.uuid4().hex[:10]}.jpg")
+                    if not cached_local_img:
+                        temp_img_path = dst_img
+                    if shopee_engine.download_image_to_file(image_url, dst_img):
+                        img_path_to_use = dst_img
                 elif image_url and os.path.isfile(image_url):
-                    shutil.copy2(image_url, temp_img_path)
+                    img_path_to_use = image_url
 
-                if os.path.isfile(temp_img_path) and os.path.getsize(temp_img_path) > 100:
-                    log.info("[Ghep 12s] Đang ghép ảnh Outro vào %s (clip thật: %ss, đã chọn: %ss)...",
-                             target_name, f"{real_dur:.2f}" if real_dur else "?", ai_dur or "?")
-                    ok = shopee_engine.ghep_anh_12s(src, temp_img_path, dst, ai_duration=ghep_dur)
+                if img_path_to_use and os.path.isfile(img_path_to_use) and os.path.getsize(img_path_to_use) > 100:
+                    log.info("[Ghep 12s] Đang ghép ảnh Outro vào %s (đã chọn: %ss)...",
+                             target_name, ai_dur or "?")
+                    ok = shopee_engine.ghep_anh_12s(src, img_path_to_use, dst, fallback_duration=ai_dur)
                     if ok:
                         valid, out_dur = shopee_engine.is_valid_12s_output(dst)
                         if valid:
@@ -4616,11 +4651,47 @@ def _save_rendered_video_sync(req: dict) -> dict:
             ghep_fail_reason = "thiếu link ảnh sản phẩm"
 
         if ghep_anh and not stitched:
+            # Nếu video gốc vẫn đang ở media_dir (bỏ qua bước save-temp-clip để tránh copy/xóa thừa khi thành công),
+            # tự cứu sang out_dir/temp/{id}-raw.mp4 khi ghép lỗi để nút 'Ghép Clip Temp' vẫn ghép lại được.
+            tid_rescue = safe_id or item_id
+            if not tid_rescue:
+                m_rid = re.search(r"(\d{8,})", target_name)
+                if m_rid:
+                    tid_rescue = m_rid.group(1)
+            tdir = os.path.join(out_dir, "temp")
+            tdir_norm = os.path.normcase(os.path.abspath(tdir))
+            src_norm = os.path.normcase(os.path.abspath(src))
+            media_dir_norm = os.path.normcase(os.path.abspath(CFG.media_dir))
+            has_temp_copy = src_norm.startswith(tdir_norm + os.sep) and os.path.isfile(src)
+            if not has_temp_copy and tid_rescue and src_norm.startswith(media_dir_norm + os.sep) and os.path.isfile(src):
+                try:
+                    os.makedirs(tdir, exist_ok=True)
+                    ext = os.path.splitext(src)[1] or ".mp4"
+                    raw_target_name = f"{tid_rescue}-raw{ext}"
+                    raw_target_path = os.path.join(tdir, raw_target_name)
+                    if not os.path.isfile(raw_target_path):
+                        try:
+                            shutil.move(src, raw_target_path)
+                        except Exception:
+                            shutil.copy2(src, raw_target_path)
+                            shopee_engine._safe_remove(src)
+                    if os.path.isfile(raw_target_path) and os.path.getsize(raw_target_path) > 1000:
+                        has_temp_copy = True
+                        _remember_file_account(raw_target_name, _FILE_ACCOUNT.pop(os.path.basename(filename), None))
+                        rescue_cache = {"clip_raw": raw_target_path}
+                        if image_url and not image_url.startswith("data:"):
+                            rescue_cache["image_url"] = image_url
+                        shopee_engine.set_cached_clips(tid_rescue, rescue_cache)
+                except Exception as re_err:
+                    log.warning("Không lưu được clip raw sang temp cho SP %s: %s", tid_rescue, re_err)
             # Đã yêu cầu ghép 12s mà không ghép được: KHÔNG lưu bản 8s/10s ra thư mục xuất và KHÔNG xóa
             # clip -raw trong temp, để nút "Ghép Clip Temp" có thể ghép lại sau.
-            log.warning("[Ghep 12s] SP %s: chưa ghép được Outro 12s (%s) — giữ nguyên clip trong temp", item_id, ghep_fail_reason)
-            raise HTTPException(502, f"Chưa ghép được Outro 12s ({ghep_fail_reason}). Clip gốc vẫn giữ trong temp, "
-                                     f"bấm 'Ghép Clip Temp' để ghép lại.")
+            if has_temp_copy:
+                log.warning("[Ghep 12s] SP %s: chưa ghép được Outro 12s (%s) — giữ nguyên clip trong temp", item_id, ghep_fail_reason)
+                raise HTTPException(502, f"Chưa ghép được Outro 12s ({ghep_fail_reason}). Clip gốc vẫn giữ trong temp, "
+                                         f"bấm 'Ghép Clip Temp' để ghép lại.")
+            log.warning("[Ghep 12s] SP %s: chưa ghép được Outro 12s (%s) — không lưu được bản tạm", item_id, ghep_fail_reason)
+            raise HTTPException(502, f"Chưa ghép được Outro 12s ({ghep_fail_reason}). Không lưu được clip gốc vào thư mục tạm.")
 
         if not stitched:
             if os.path.abspath(src) != os.path.abspath(dst):
@@ -4643,6 +4714,7 @@ def _save_rendered_video_sync(req: dict) -> dict:
                 if m_target_id:
                     tid = m_target_id.group(1)
             if tid:
+                shopee_engine.clear_cached_clip_keys(tid, ("clip_raw",))
                 temp_dir = os.path.join(out_dir, "temp")
                 if os.path.isdir(temp_dir):
                     for ext in (".mp4", ".mov", ".webm"):
@@ -5378,6 +5450,14 @@ async def _maintenance_loop():
 @app.on_event("shutdown")
 def _shutdown():
     engine.stop()
+    try:
+        store.flush()
+    except Exception:
+        pass
+    try:
+        shopee_engine.flush_clip_cache(force=True)
+    except Exception:
+        pass
     try:
         shopee_cache = os.path.join(BASE_DIR, "data", "shopee_images_cache")
         if os.path.isdir(shopee_cache):

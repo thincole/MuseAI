@@ -927,7 +927,14 @@ class Store:
                     break
             else:
                 return
-            self._save_accounts()
+            self._save_accounts(force=False)
+
+    def flush(self):
+        """Ghi ép toàn bộ dữ liệu tài khoản xuống đĩa ngay (dùng khi tắt app)."""
+        if self.is_hub_client():
+            return
+        with _LOCK:
+            self._save_accounts(force=True)
 
     def release_account(self, aid: str):
         """Trả tài khoản lại cho Pool sau khi worker hoàn thành tác vụ."""

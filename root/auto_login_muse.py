@@ -230,6 +230,106 @@ def is_recent_dongvan_time(time_str: str, max_age_seconds: int = 3600) -> bool:
         return True
 
 
+DONGVAN_API_MESSAGES = "https://tools.dongvanfb.net/api/get_messages_oauth2"
+DONGVAN_API_CODE = "https://tools.dongvanfb.net/api/get_code_oauth2"
+DONGVAN_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def parse_dongvan_oauth2(acc_line: str, fallback_email: str = "") -> tuple[str, str, str] | None:
+    """Tách (email, refresh_token, client_id) từ dòng tài khoản."""
+    parts = [p.strip() for p in (acc_line or "").split("|") if p.strip()]
+    if len(parts) < 3:
+        return None
+    email = (fallback_email or parts[0]).strip()
+    client_id = ""
+    refresh_token = ""
+    for p in parts[1:]:
+        if not client_id and DONGVAN_UUID_RE.match(p):
+            client_id = p
+        elif not refresh_token and (p.startswith("M.") or len(p) >= 40) and not DONGVAN_UUID_RE.match(p):
+            refresh_token = p
+    if not refresh_token and len(parts) >= 4:
+        refresh_token = parts[2]
+    if not client_id and len(parts) >= 4:
+        client_id = parts[3]
+    elif not client_id and len(parts) == 3:
+        client_id = parts[2]
+        if not refresh_token:
+            refresh_token = parts[1]
+    if email and refresh_token and client_id:
+        return email, refresh_token, client_id
+    return None
+
+
+def dongvan_api_fetch_messages(email: str, refresh_token: str, client_id: str, timeout: float = 15.0) -> list[dict] | None:
+    """Gọi POST https://tools.dongvanfb.net/api/get_messages_oauth2 lấy danh sách thư."""
+    import urllib.request
+    payload = {
+        "email": email.strip(),
+        "refresh_token": refresh_token.strip(),
+        "client_id": client_id.strip(),
+    }
+    try:
+        req = urllib.request.Request(
+            DONGVAN_API_MESSAGES,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if isinstance(data, dict):
+            msgs = data.get("messages")
+            if isinstance(msgs, list):
+                return msgs
+            if "status" in data:
+                return []
+    except Exception:
+        pass
+    return None
+
+
+def dongvan_msg_sig(mail: dict) -> str:
+    if not isinstance(mail, dict):
+        return ""
+    uid = str(mail.get("uid") or mail.get("id") or "").strip()
+    if uid:
+        return uid
+    dt = str(mail.get("date") or "").strip()
+    subj = str(mail.get("subject") or "").strip()
+    body = str(mail.get("message") or mail.get("body") or mail.get("content") or "")
+    return f"{dt}|{subj}|{len(body)}"
+
+
+def dongvan_extract_otp(mail: dict) -> str | None:
+    if not isinstance(mail, dict):
+        return None
+    from_addr = str(mail.get("from") or "").lower()
+    subject = str(mail.get("subject") or "")
+    if "microsoft.com" in from_addr and "meta" not in subject.lower() and "muse" not in subject.lower():
+        return None
+    code_field = str(mail.get("code") or "").strip()
+    if code_field and re.fullmatch(r"\d{6}", code_field):
+        return code_field
+    body = str(mail.get("message") or mail.get("body") or mail.get("content") or "")
+    body = re.sub(r"(?is)<(style|script)\b.*?</\1>", " ", body)
+    body = re.sub(r"(?s)<[^>]+>", " ", body)
+    body = re.sub(r"&nbsp;|&#160;", " ", body)
+    text = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", f"{subject} {body}")
+    m = re.search(
+        r"(?:confirmation\s+code|use\s+code|login\s+code|security\s+code|verification\s+code|dùng\s+mã|mã\s+đăng\s+nhập|mã\s+xác\s+nhận|mã|code)\D{0,45}?(\d{6})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+    return m.group(1) if m else None
+
+
 def _update_export_txt(file_path: str, email: str, cstr: str):
     """Cập nhật cookie vào file txt, nếu đã có email thì ghi đè chứ không thêm dòng mới."""
     lines = []
@@ -266,8 +366,13 @@ class MuseAutoLogin:
         co = ChromiumOptions()
         co.set_browser_path(self.chrome_path)
         co.set_user_data_path(self.profile_dir)
+        co.remove_extensions()
         co.set_argument("--no-first-run")
         co.set_argument("--no-default-browser-check")
+        co.set_argument("--disable-extensions")
+        co.set_argument("--disable-component-extensions-with-background-pages")
+        co.set_argument("--disable-default-apps")
+        co.set_argument("--disable-sync")
         co.set_argument("--disable-blink-features=AutomationControlled")
         if self.headless:
             co.headless(True)
@@ -275,15 +380,10 @@ class MuseAutoLogin:
             co.set_argument("--window-size=1366,850")
 
         self.page = ChromiumPage(co)
-        # Mở tab 1 cho Muse.ai
+        # Mở tab cho Muse.ai (OTP DongVanFB đọc thẳng qua API OAuth2)
         self.page.get("https://muse.ai")
         time.sleep(2)
-        # Mở tab 2 cho DongVanFB
-        self.dongvan_tab = self.page.new_tab("https://dongvanfb.net/read_mail_box/")
-        time.sleep(2)
-        # Quay về tab Muse
-        self.page.activate_tab(0)
-        log_success("Trình duyệt đã sẵn sàng với 2 tab: Muse.ai và DongVanFB.net")
+        log_success("Trình duyệt đã sẵn sàng với Muse.ai (OTP đọc trực tiếp qua API DongVanFB OAuth2)")
 
     def stop_browser(self):
         """Đóng trình duyệt an toàn."""
@@ -323,73 +423,33 @@ class MuseAutoLogin:
         log_warn(f"[{email}] Quá thời gian {max_wait_sec}s không nhận được mã OTP trên Lay2FA.")
         return None
 
-    def fetch_otp_from_dongvan(self, acc_line: str, email: str, max_wait_sec: int = 50) -> str | None:
-        """Thực hiện đọc hòm thư trên DongVanFB và trích xuất mã OTP."""
-        log_info(f"[{email}] Chuyển sang DongVanFB, dán thông tin và bấm 'Đọc hòm thư'...")
-        self.page.activate_tab(self.dongvan_tab)
-        time.sleep(1)
-
-        # 1. Chọn OAuth2 và điền vào textarea
-        self.dongvan_tab.run_js("""
-            let r = document.querySelector('input[value="oauth2"]');
-            if (r) {
-                r.checked = true;
-                r.click();
-                r.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            let ta = document.getElementById('list_email') || document.querySelector('textarea');
-            if (ta) {
-                ta.value = arguments[0];
-                ta.dispatchEvent(new Event('input', { bubbles: true }));
-                ta.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
-            if (btn) btn.click();
-        """, acc_line)
-
-        log_info(f"[{email}] Đang đợi thư mã đăng nhập gửi về hòm thư DongVanFB (tối đa {max_wait_sec}s)...")
+    def fetch_otp_from_dongvan(self, acc_line: str, email: str, max_wait_sec: int = 50, seen: set[str] | None = None) -> str | None:
+        """Thực hiện đọc hòm thư qua DongVanFB OAuth2 API (tools.dongvanfb.net/api/get_messages_oauth2) và trích xuất mã OTP."""
+        creds = parse_dongvan_oauth2(acc_line, email)
+        if not creds:
+            log_error(f"[{email}] Dòng tài khoản thiếu refresh_token hoặc client_id để gọi API DongVanFB!")
+            return None
+        dv_email, dv_rt, dv_cid = creds
+        log_info(f"[{email}] Đang đợi mã OTP qua API DongVanFB (tools.dongvanfb.net/api/get_messages_oauth2, tối đa {max_wait_sec}s)...")
         start_time = time.time()
-        last_click = time.time()
 
         while time.time() - start_time < max_wait_sec:
-            time.sleep(2)
-            # Lấy toàn bộ hàng trong bảng
-            rows = self.dongvan_tab.run_js("""
-                let trs = Array.from(document.querySelectorAll('table tr'));
-                return trs.map(r => Array.from(r.querySelectorAll('th, td')).map(c => c.innerText.trim()));
-            """)
-
-            if rows and len(rows) > 1:
-                # Quét các hàng thư (bỏ qua hàng tiêu đề)
-                for row in rows[1:]:
-                    time_col = row[3] if len(row) > 3 else ""
-                    if not is_recent_dongvan_time(time_col):
+            msgs = dongvan_api_fetch_messages(dv_email, dv_rt, dv_cid)
+            if msgs:
+                for mail in msgs:
+                    sig = dongvan_msg_sig(mail)
+                    if seen is not None and sig and sig in seen:
                         continue
-
-                    row_text = " ".join(row)
-                    # Tìm mã 6 số dạng: "Use code 123456 to log in" hoặc "Login code 123456" hoặc cột Code
-                    m = re.search(r'(?:use\s+code|login\s+code|mã\s+xác\s+nhận|code)\s*[:\-]?\s*(\d{6})', row_text, re.IGNORECASE)
-                    if not m:
-                        # Kiểm tra xem có cột riêng chứa 6 số không
-                        if len(row) >= 6 and re.search(r'^\d{6}', row[5]):
-                            m = re.search(r'(\d{6})', row[5])
-                        elif re.search(r'\b\d{6}\b', row_text):
-                            m = re.search(r'\b\d{6}\b', row_text)
-
-                    if m:
-                        code = m.group(1)
-                        log_success(f"[{email}] Đã tìm thấy mã OTP: {Colors.BOLD}{code}{Colors.ENDC}")
+                    time_col = str(mail.get("date") or "").strip()
+                    if time_col and not is_recent_dongvan_time(time_col):
+                        continue
+                    code = dongvan_extract_otp(mail)
+                    if code:
+                        log_success(f"[{email}] Đã tìm thấy mã OTP qua API DongVanFB: {Colors.BOLD}{code}{Colors.ENDC}")
                         return code
+            time.sleep(4)
 
-            # Nếu sau 7s chưa thấy thư mới, bấm lại nút Đọc hòm thư để làm mới
-            if time.time() - last_click > 7:
-                last_click = time.time()
-                self.dongvan_tab.run_js("""
-                    let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
-                    if (btn) btn.click();
-                """)
-
-        log_warn(f"[{email}] Quá thời gian {max_wait_sec}s không nhận được mã OTP trên DongVanFB.")
+        log_warn(f"[{email}] Quá thời gian {max_wait_sec}s không nhận được mã OTP trên API DongVanFB.")
         return None
 
     def login_account(self, acc_line: str) -> dict | None:
@@ -404,23 +464,35 @@ class MuseAutoLogin:
         time.sleep(3)
 
         # Kiểm tra ô nhập email
-        email_inp = self.page.ele("@placeholder:Mobile number or email") or self.page.ele("tag:input[inputmode='email']")
+        email_inp = (
+            self.page.ele("@placeholder:Mobile number or email", timeout=0.5)
+            or self.page.ele("@placeholder:Số di động hoặc email", timeout=0.2)
+            or self.page.ele("css:input[inputmode='email']", timeout=0.2)
+            or self.page.ele("css:input[autocomplete*='username']", timeout=0.2)
+            or self.page.ele("css:input[data-slot='input']", timeout=0.2)
+        )
         if not email_inp:
-            use_another = self.page.ele("text:Use another account") or self.page.ele("tag:button@text():Use another account")
+            use_another = self.page.ele("text:Use another account", timeout=0.5) or self.page.ele("tag:button@text():Use another account", timeout=0.3)
             if use_another:
                 try:
                     use_another.click()
                     time.sleep(2)
                 except Exception:
                     pass
-                email_inp = self.page.ele("@placeholder:Mobile number or email") or self.page.ele("tag:input[inputmode='email']")
+                email_inp = (
+                    self.page.ele("@placeholder:Mobile number or email", timeout=0.5)
+                    or self.page.ele("css:input[inputmode='email']", timeout=0.3)
+                )
         if not email_inp:
             # Thử tìm nút Log in nếu đang ở trang giới thiệu
-            login_link = self.page.ele("text:Log in")
+            login_link = self.page.ele("text:Log in", timeout=0.5)
             if login_link:
                 login_link.click()
                 time.sleep(2)
-                email_inp = self.page.ele("@placeholder:Mobile number or email")
+                email_inp = (
+                    self.page.ele("@placeholder:Mobile number or email", timeout=0.5)
+                    or self.page.ele("css:input[inputmode='email']", timeout=0.3)
+                )
 
         if not email_inp:
             log_error(f"[{email}] Không tìm thấy ô nhập email trên trang Muse.ai!")
@@ -432,17 +504,29 @@ class MuseAutoLogin:
         time.sleep(1)
 
         # Bấm Continue
-        btn_continue = self.page.ele("text:Continue") or self.page.ele("tag:button@text():Continue")
+        btn_continue = (
+            self.page.ele("text:Continue", timeout=1)
+            or self.page.ele("tag:button@text():Continue", timeout=0.5)
+            or self.page.ele("text:Tiếp tục", timeout=0.5)
+            or self.page.ele("css:button[type='submit']", timeout=0.5)
+        )
         if not btn_continue:
             log_error(f"[{email}] Không tìm thấy nút Continue!")
             return None
 
         # Chụp danh sách thư ĐANG CÓ trước khi bấm Continue để chỉ nhận thư MỚI
         lay2fa_seen: set[str] | None = None
+        dongvan_seen: set[str] | None = None
         if is_lay2fa_account(acc_line, email):
             u, d = parse_lay2fa_user_domain(acc_line, email)
             before_l2f = lay2fa_fetch(d, u)
             lay2fa_seen = {str(m.get("id")) for m in before_l2f} if before_l2f is not None else None
+        else:
+            dv_creds = parse_dongvan_oauth2(acc_line, email)
+            if dv_creds:
+                before_dv = dongvan_api_fetch_messages(*dv_creds, timeout=10.0)
+                if before_dv is not None:
+                    dongvan_seen = {dongvan_msg_sig(m) for m in before_dv if dongvan_msg_sig(m)}
 
         btn_continue.click()
         log_info(f"[{email}] Đã bấm Continue, chờ màn hình yêu cầu OTP...")
@@ -451,7 +535,8 @@ class MuseAutoLogin:
         # Kiểm tra xem có sang màn hình OTP không
         is_otp_screen = self.page.run_js("""
             return !!(document.querySelector('input[autocomplete="one-time-code"]') || 
-                      document.querySelector('input[aria-label="6-digit security code"]') ||
+                      document.querySelector('input[aria-label*="6" i]') ||
+                      document.querySelector('input[aria-label*="code" i]') ||
                       document.querySelector('input.sr-only'));
         """)
         if not is_otp_screen:
@@ -460,11 +545,11 @@ class MuseAutoLogin:
             log_error(f"[{email}] Không xuất hiện ô nhập mã OTP! Phản hồi từ trang: {body_txt[:150]}...")
             return None
 
-        # Bước 2: Lấy mã OTP từ Lay2FA hoặc DongVanFB
+        # Bước 2: Lấy mã OTP từ Lay2FA hoặc DongVanFB API
         if is_lay2fa_account(acc_line, email):
             otp_code = self.fetch_otp_from_lay2fa(acc_line, email, seen=lay2fa_seen)
         else:
-            otp_code = self.fetch_otp_from_dongvan(acc_line, email)
+            otp_code = self.fetch_otp_from_dongvan(acc_line, email, seen=dongvan_seen)
         if not otp_code:
             return None
 
@@ -587,8 +672,13 @@ class MuseAutoLogin:
                 co.set_browser_path(self.chrome_path)
                 co.set_user_data_path(pdir)
                 co.set_local_port(port)
+                co.remove_extensions()
                 co.set_argument("--no-first-run")
                 co.set_argument("--no-default-browser-check")
+                co.set_argument("--disable-extensions")
+                co.set_argument("--disable-component-extensions-with-background-pages")
+                co.set_argument("--disable-default-apps")
+                co.set_argument("--disable-sync")
                 co.set_argument("--disable-blink-features=AutomationControlled")
                 if self.headless:
                     co.headless(True)
@@ -599,9 +689,6 @@ class MuseAutoLogin:
                     wpage = ChromiumPage(co)
                     wpage.get("https://muse.ai")
                     time.sleep(2)
-                    wdongvan = wpage.new_tab("https://dongvanfb.net/read_mail_box/")
-                    time.sleep(2)
-                    wpage.activate_tab(0)
                 except Exception as e:
                     log_error(f"[Luồng {wid}] Không thể khởi động Chrome: {e}")
                     return
@@ -629,13 +716,18 @@ class MuseAutoLogin:
                             wpage.get("https://muse.ai")
                             time.sleep(3)
 
-                            e_inp = wpage.ele("@placeholder:Mobile number or email") or wpage.ele("tag:input[inputmode='email']")
+                            e_inp = (
+                                wpage.ele("@placeholder:Mobile number or email", timeout=0.5)
+                                or wpage.ele("@placeholder:Số di động hoặc email", timeout=0.2)
+                                or wpage.ele("css:input[inputmode='email']", timeout=0.2)
+                                or wpage.ele("css:input[autocomplete*='username']", timeout=0.2)
+                            )
                             if not e_inp:
-                                l_link = wpage.ele("text:Log in")
+                                l_link = wpage.ele("text:Log in", timeout=0.5)
                                 if l_link:
                                     l_link.click()
                                     time.sleep(2)
-                                    e_inp = wpage.ele("@placeholder:Mobile number or email")
+                                    e_inp = wpage.ele("@placeholder:Mobile number or email", timeout=0.5) or wpage.ele("css:input[inputmode='email']", timeout=0.3)
 
                             if not e_inp:
                                 log_error(f"[Luồng {wid}] [{email}] Không thấy ô nhập email!")
@@ -648,7 +740,7 @@ class MuseAutoLogin:
                             e_inp.input(email)
                             time.sleep(1)
 
-                            b_cont = wpage.ele("text:Continue") or wpage.ele("tag:button@text():Continue")
+                            b_cont = wpage.ele("text:Continue", timeout=1) or wpage.ele("tag:button@text():Continue", timeout=0.5) or wpage.ele("text:Tiếp tục", timeout=0.5)
                             if not b_cont:
                                 log_error(f"[Luồng {wid}] [{email}] Không thấy nút Continue!")
                                 with lock:
@@ -657,10 +749,17 @@ class MuseAutoLogin:
                                 continue
 
                             lay2fa_seen = None
+                            dongvan_seen = None
                             if is_lay2fa_account(acc_line, email):
                                 u, d = parse_lay2fa_user_domain(acc_line, email)
                                 before_l2f = lay2fa_fetch(d, u)
                                 lay2fa_seen = {str(m.get("id")) for m in before_l2f} if before_l2f is not None else None
+                            else:
+                                dv_creds = parse_dongvan_oauth2(acc_line, email)
+                                if dv_creds:
+                                    before_dv = dongvan_api_fetch_messages(*dv_creds, timeout=10.0)
+                                    if before_dv is not None:
+                                        dongvan_seen = {dongvan_msg_sig(m) for m in before_dv if dongvan_msg_sig(m)}
 
                             b_cont.click()
                             time.sleep(4)
@@ -684,62 +783,8 @@ class MuseAutoLogin:
                                         break
                                     time.sleep(3)
                             else:
-                                # 2. Đọc OTP DongVanFB
-                                wpage.activate_tab(wdongvan)
-                                time.sleep(1)
-                                wdongvan.run_js("""
-                                    let r = document.querySelector('input[value="oauth2"]');
-                                    if (r) {
-                                        r.checked = true;
-                                        r.click();
-                                        r.dispatchEvent(new Event('change', { bubbles: true }));
-                                    }
-                                    let ta = document.getElementById('list_email') || document.querySelector('textarea');
-                                    if (ta) {
-                                        ta.value = arguments[0];
-                                        ta.dispatchEvent(new Event('input', { bubbles: true }));
-                                        ta.dispatchEvent(new Event('change', { bubbles: true }));
-                                    }
-                                    let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
-                                    if (btn) btn.click();
-                                """, acc_line)
-
-                                st_time = time.time()
-                                lr_time = time.time()
-                                while time.time() - st_time < 50:
-                                    time.sleep(1)
-                                    rows = wdongvan.run_js("""
-                                        let trs = Array.from(document.querySelectorAll('table tr'));
-                                        return trs.map(r => Array.from(r.querySelectorAll('th, td')).map(c => c.innerText.trim()));
-                                    """)
-                                    if rows and len(rows) > 1:
-                                        for r in rows[1:]:
-                                            if len(r) > 2 and r[2] == '...':
-                                                continue
-                                            if len(r) > 0 and email.lower() not in r[0].lower():
-                                                continue
-                                            r_txt = " ".join(r)
-                                            time_col = r[3] if len(r) > 3 else ""
-                                            if not is_recent_dongvan_time(time_col):
-                                                continue
-
-                                            m = re.search(r'(?:use\s+code|login\s+code|mã\s+xác\s+nhận|code)\s*[:\-]?\s*(\d{6})', r_txt, re.IGNORECASE)
-                                            if not m:
-                                                if len(r) >= 6 and re.search(r'^\d{6}', r[5]):
-                                                    m = re.search(r'(\d{6})', r[5])
-                                                elif re.search(r'\b\d{6}\b', r_txt):
-                                                    m = re.search(r'\b\d{6}\b', r_txt)
-                                            if m:
-                                                otp_code = m.group(1)
-                                                break
-                                    if otp_code:
-                                        break
-                                    if time.time() - lr_time > 10:
-                                        lr_time = time.time()
-                                        wdongvan.run_js("""
-                                            let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
-                                            if (btn) btn.click();
-                                        """)
+                                # 2. Đọc OTP qua API DongVanFB OAuth2
+                                otp_code = self.fetch_otp_from_dongvan(acc_line, email, seen=dongvan_seen)
 
                             if not otp_code:
                                 log_warn(f"[Luồng {wid}] [{email}] Hết giờ chờ OTP!")

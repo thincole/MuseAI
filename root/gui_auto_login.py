@@ -440,6 +440,145 @@ def tuan89_extract_otp(mail: dict) -> str | None:
     return m.group(1) if m else None
 
 
+# ============================================================================
+# NGUỒN ĐỌC OTP CHÍNH (DONGVANFB OAUTH2 API - https://docs.dongvanfb.net/)
+# Không cần mở trình duyệt vào dongvanfb.net/read_mail_box: gọi thẳng API JSON:
+#   1) POST https://tools.dongvanfb.net/api/get_messages_oauth2  {email, refresh_token, client_id}
+#   2) POST https://tools.dongvanfb.net/api/get_code_oauth2      {email, refresh_token, client_id, type: "all"}
+# ============================================================================
+DONGVAN_API_MESSAGES = "https://tools.dongvanfb.net/api/get_messages_oauth2"
+DONGVAN_API_CODE = "https://tools.dongvanfb.net/api/get_code_oauth2"
+DONGVAN_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def parse_dongvan_oauth2(acc_line: str, fallback_email: str = "") -> tuple[str, str, str] | None:
+    """Tách (email, refresh_token, client_id) từ dòng tài khoản định dạng:
+      - email|pass|refresh_token|client_id
+      - email|refresh_token|client_id
+    """
+    parts = [p.strip() for p in (acc_line or "").split("|") if p.strip()]
+    if len(parts) < 3:
+        return None
+    email = (fallback_email or parts[0]).strip()
+    client_id = ""
+    refresh_token = ""
+    for p in parts[1:]:
+        if not client_id and DONGVAN_UUID_RE.match(p):
+            client_id = p
+        elif not refresh_token and (p.startswith("M.") or len(p) >= 40) and not DONGVAN_UUID_RE.match(p):
+            refresh_token = p
+    if not refresh_token and len(parts) >= 4:
+        refresh_token = parts[2]
+    if not client_id and len(parts) >= 4:
+        client_id = parts[3]
+    elif not client_id and len(parts) == 3:
+        client_id = parts[2]
+        if not refresh_token:
+            refresh_token = parts[1]
+    if email and refresh_token and client_id:
+        return email, refresh_token, client_id
+    return None
+
+
+def dongvan_api_fetch_messages(email: str, refresh_token: str, client_id: str, timeout: float = 15.0) -> list[dict] | None:
+    """Gọi POST https://tools.dongvanfb.net/api/get_messages_oauth2 lấy danh sách thư trong hòm thư."""
+    import urllib.request
+    payload = {
+        "email": email.strip(),
+        "refresh_token": refresh_token.strip(),
+        "client_id": client_id.strip(),
+    }
+    try:
+        req = urllib.request.Request(
+            DONGVAN_API_MESSAGES,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if isinstance(data, dict):
+            msgs = data.get("messages")
+            if isinstance(msgs, list):
+                return msgs
+            if "status" in data:
+                return []
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def dongvan_api_fetch_code(email: str, refresh_token: str, client_id: str, timeout: float = 12.0) -> dict | None:
+    """Gọi POST https://tools.dongvanfb.net/api/get_code_oauth2 (dự phòng)."""
+    import urllib.request
+    payload = {
+        "email": email.strip(),
+        "refresh_token": refresh_token.strip(),
+        "client_id": client_id.strip(),
+        "type": "all",
+    }
+    try:
+        req = urllib.request.Request(
+            DONGVAN_API_CODE,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def dongvan_msg_sig(mail: dict) -> str:
+    """Chữ ký nhận diện 1 bức thư trên DongVanFB để phân biệt thư cũ (trước khi bấm Continue) và thư mới."""
+    if not isinstance(mail, dict):
+        return ""
+    uid = str(mail.get("uid") or mail.get("id") or "").strip()
+    if uid:
+        return uid
+    dt = str(mail.get("date") or "").strip()
+    subj = str(mail.get("subject") or "").strip()
+    body = str(mail.get("message") or mail.get("body") or mail.get("content") or "")
+    return f"{dt}|{subj}|{len(body)}"
+
+
+def dongvan_extract_otp(mail: dict) -> str | None:
+    """Bóc mã OTP 6 số từ 1 thư trả về bởi get_messages_oauth2 của DongVanFB."""
+    if not isinstance(mail, dict):
+        return None
+    from_addr = str(mail.get("from") or "").lower()
+    subject = str(mail.get("subject") or "")
+    # Bỏ qua thư cảnh báo bảo mật của chính Microsoft để không lấy nhầm số trong nội dung
+    if "microsoft.com" in from_addr and "meta" not in subject.lower() and "muse" not in subject.lower():
+        return None
+    code_field = str(mail.get("code") or "").strip()
+    if code_field and re.fullmatch(r"\d{6}", code_field):
+        return code_field
+    body = str(mail.get("message") or mail.get("body") or mail.get("content") or "")
+    body = re.sub(r"(?is)<(style|script)\b.*?</\1>", " ", body)
+    body = re.sub(r"(?s)<[^>]+>", " ", body)
+    body = re.sub(r"&nbsp;|&#160;", " ", body)
+    text = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", f"{subject} {body}")
+    m = re.search(
+        r"(?:confirmation\s+code|use\s+code|login\s+code|security\s+code|verification\s+code|dùng\s+mã|mã\s+đăng\s+nhập|mã\s+xác\s+nhận|mã|code)\D{0,45}?(\d{6})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+    return m.group(1) if m else None
+
+
 def safe_activate_tab(page, tab_or_idx=0):
     """Kích hoạt tab an toàn, tương thích DrissionPage, không bao giờ gây lỗi 'list index out of range'."""
     try:
@@ -496,8 +635,14 @@ class LoginWorker(threading.Thread):
         co.set_browser_path(self.chrome_path)
         co.set_user_data_path(self.profile_dir)
         co.auto_port()
+        co.remove_extensions()
         co.set_argument("--no-first-run")
         co.set_argument("--no-default-browser-check")
+        # Chặn tuyệt đối mọi extension (kể cả extension cài ép qua Chrome Policy như ProtonVPN)
+        co.set_argument("--disable-extensions")
+        co.set_argument("--disable-component-extensions-with-background-pages")
+        co.set_argument("--disable-default-apps")
+        co.set_argument("--disable-sync")
         co.set_argument("--disable-blink-features=AutomationControlled")
         if self.proxy_str:
             try:
@@ -563,12 +708,6 @@ class LoginWorker(threading.Thread):
                     f"GPU {prof['gpu_renderer'][7:45]}, ngôn ngữ {prof['lang']}")
             page.get("https://muse.ai")
             time.sleep(2)
-            # Chỉ mở thêm tab DongVanFB nếu tài khoản KHÔNG dùng Tuan89, Lay2FA, hoặc MailAPI
-            needs_dongvan = not (is_tuan89_account(acc_line, email) or is_lay2fa_account(acc_line, email) or is_mailapi_email(email))
-            if needs_dongvan:
-                dongvan_tab = page.new_tab("https://dongvanfb.net/read_mail_box/")
-                time.sleep(2)
-                safe_activate_tab(page, 0)
         except Exception:
             try:
                 page.quit(timeout=2, force=True)
@@ -877,110 +1016,124 @@ class LoginWorker(threading.Thread):
             time.sleep(MAILAPI_INTERVAL)
         return None
 
-    def _otp_from_dongvan(self, page, dongvan_tab, row_idx: int, acc_line: str, email: str) -> str | None:
-        # Đọc OTP trên DongVanFB (chỉ chấp nhận thư mới gửi)
-        self.controller.update_status(row_idx, "Đang lấy OTP DongVanFB...", "#fbbf24")
-        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chuyển tab DongVanFB đọc hòm thư...")
+    def _otp_from_dongvan(self, page, dongvan_tab, row_idx: int, acc_line: str, email: str, seen: set[str] | None = None) -> str | None:
+        """Đọc OTP qua DongVanFB OAuth2 API (https://tools.dongvanfb.net/api/get_messages_oauth2) — không cần mở trình duyệt."""
+        creds = parse_dongvan_oauth2(acc_line, email)
+        if not creds:
+            self.controller.log(
+                f"[Luồng {self.worker_id}] [{email}] ❌ Dòng tài khoản thiếu refresh_token hoặc client_id để gọi API DongVanFB!"
+            )
+            return None
 
-        safe_activate_tab(page, dongvan_tab)
-        time.sleep(1)
+        dv_email, dv_rt, dv_cid = creds
+        self.controller.update_status(row_idx, "Đang lấy OTP qua API DongVanFB...", "#fbbf24")
+        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đọc OTP qua API DongVanFB (tools.dongvanfb.net/api/get_messages_oauth2)...")
 
-        dongvan_tab.run_js("""
-            let r = document.querySelector('input[value="oauth2"]');
-            if (r) {
-                r.checked = true;
-                r.click();
-                r.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            let ta = document.getElementById('list_email') || document.querySelector('textarea');
-            if (ta) {
-                ta.value = arguments[0];
-                ta.dispatchEvent(new Event('input', { bubbles: true }));
-                ta.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
-            if (btn) btn.click();
-        """, acc_line)
+        not_before = getattr(self, "_otp_not_before", None)
+        used = self.controller.used_otps(email)
 
-        # DongVanFB đôi khi phải đọc lại vài lần mới thấy thư OTP -> thử tối đa OTP_READ_ATTEMPTS lần,
-        # mỗi lần bấm "Đọc hòm thư" rồi chờ OTP_READ_INTERVAL giây (vẫn dò bảng mỗi giây, thấy mã là dừng ngay).
-        otp_code = None
         for attempt in range(1, OTP_READ_ATTEMPTS + 1):
             if not self.controller.is_running:
-                break
-            if attempt > 1:
-                dongvan_tab.run_js("""
-                    let btn = document.querySelector('.btn-buy-home') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.includes('Đọc hòm thư'));
-                    if (btn) btn.click();
-                """)
-            self.controller.update_status(row_idx, f"Đang lấy OTP DongVanFB (lần {attempt}/{OTP_READ_ATTEMPTS})...", "#fbbf24")
-            deadline = time.time() + OTP_READ_INTERVAL
-            while time.time() < deadline and self.controller.is_running:
-                time.sleep(1)
-                otp_code = self._find_dongvan_otp(dongvan_tab, email, getattr(self, '_otp_not_before', None),
-                                                  self.controller.used_otps(email))
-                if otp_code:
-                    break
-            if otp_code:
-                break
-            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chưa thấy mã OTP (lần {attempt}/{OTP_READ_ATTEMPTS}), đọc lại hòm thư...")
+                return None
+            self.controller.update_status(row_idx, f"Đang lấy OTP DongVanFB API (lần {attempt}/{OTP_READ_ATTEMPTS})...", "#fbbf24")
 
-        return otp_code
+            msgs = dongvan_api_fetch_messages(dv_email, dv_rt, dv_cid)
+            if msgs is None:
+                self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đang kết nối API DongVanFB (lần {attempt}/{OTP_READ_ATTEMPTS})...")
+            else:
+                for mail in msgs:
+                    sig = dongvan_msg_sig(mail)
+                    if seen is not None and sig and sig in seen:
+                        continue
+                    date_str = str(mail.get("date") or "").strip()
+                    if date_str:
+                        if not is_recent_dongvan_time(date_str):
+                            continue
+                        mail_dt = parse_dongvan_time(date_str)
+                        if not_before is not None and mail_dt is not None and mail_dt < not_before:
+                            continue
+                    code = dongvan_extract_otp(mail)
+                    if code and code not in used:
+                        return code
+
+            # Dự phòng gọi get_code_oauth2 nếu get_messages_oauth2 chưa trả mã
+            code_resp = dongvan_api_fetch_code(dv_email, dv_rt, dv_cid)
+            if isinstance(code_resp, dict):
+                direct_code = str(code_resp.get("code") or "").strip()
+                if direct_code and re.fullmatch(r"\d{6}", direct_code) and direct_code not in used:
+                    return direct_code
+
+            if attempt < OTP_READ_ATTEMPTS and self.controller.is_running:
+                self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chưa thấy thư OTP mới trên API DongVanFB (lần {attempt}/{OTP_READ_ATTEMPTS}), chờ 4s...")
+                time.sleep(4)
+
+        return None
 
     def process_single_account(self, page: ChromiumPage, dongvan_tab, row_idx: int, acc_line: str, email: str):
         if not self.controller.is_running:
             return
 
         self.controller.update_status(row_idx, "Đang vào Muse.ai...", "#38bdf8")
-        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Mở trang Muse.ai...")
-
-        # 1. Reset Session trên Muse
         safe_activate_tab(page, 0)
-        try:
-            page.run_cdp("Network.clearBrowserCookies")
-            page.run_cdp("Network.clearBrowserCache")
-            page.run_cdp("Storage.clearDataForOrigin", origin="https://muse.ai", storageTypes="all")
-        except Exception:
-            pass
-        try:
-            page.run_js("""
-                try {
-                    localStorage.clear();
-                    sessionStorage.clear();
-                } catch(e) {}
-            """)
-        except Exception:
-            pass
 
-        page.get("https://muse.ai")
-        time.sleep(3)
+        cur_url = ""
+        try:
+            cur_url = str(page.url or "").lower()
+        except Exception:
+            cur_url = ""
+        if "muse.ai" not in cur_url and "meta.com" not in cur_url:
+            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Mở trang Muse.ai...")
+            page.get("https://muse.ai")
+            time.sleep(2)
+        else:
+            time.sleep(1)
+
         if self._meta_checkpoint(page):
             self._fail_checkpoint(row_idx, email)
             return
 
+        def _locate_email_input():
+            return (
+                page.ele("@placeholder:Mobile number or email", timeout=0.4)
+                or page.ele("@placeholder:Số di động hoặc email", timeout=0.2)
+                or page.ele("css:input[inputmode='email']", timeout=0.2)
+                or page.ele("css:input[autocomplete*='username']", timeout=0.2)
+                or page.ele("css:input[type='email']", timeout=0.2)
+                or page.ele("css:input[data-slot='input']", timeout=0.2)
+            )
+
         email_inp = None
-        for _ in range(8):
-            email_inp = page.ele("@placeholder:Mobile number or email") or page.ele("tag:input[inputmode='email']")
+        for _ in range(10):
+            email_inp = _locate_email_input()
             if email_inp:
                 break
-            use_another = page.ele("text:Use another account") or page.ele("tag:button@text():Use another account")
+            use_another = (
+                page.ele("text:Use another account", timeout=0.3)
+                or page.ele("tag:button@text():Use another account", timeout=0.2)
+                or page.ele("text:Dùng tài khoản khác", timeout=0.2)
+            )
             if use_another:
                 try:
                     use_another.click()
                     time.sleep(1)
                 except Exception:
                     pass
-                email_inp = page.ele("@placeholder:Mobile number or email") or page.ele("tag:input[inputmode='email']")
+                email_inp = _locate_email_input()
                 if email_inp:
                     break
-            login_link = page.ele("text:Log in") or page.ele("text:Sign in") or page.ele("tag:a@text():Log in")
+            login_link = (
+                page.ele("text:Log in", timeout=0.3)
+                or page.ele("text:Sign in", timeout=0.2)
+                or page.ele("tag:a@text():Log in", timeout=0.2)
+                or page.ele("text:Đăng nhập", timeout=0.2)
+            )
             if login_link:
                 try:
                     login_link.click()
                     time.sleep(1)
                 except Exception:
                     pass
-                email_inp = page.ele("@placeholder:Mobile number or email")
+                email_inp = _locate_email_input()
                 if email_inp:
                     break
             time.sleep(1)
@@ -990,11 +1143,40 @@ class LoginWorker(threading.Thread):
             self.controller.record_result(False)
             return
 
-        email_inp.clear()
-        email_inp.input(email)
-        time.sleep(1)
+        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đang điền email vào Muse.ai...")
+        try:
+            email_inp.clear()
+            email_inp.input(email)
+        except Exception:
+            pass
+        # Đảm bảo React state nhận đủ giá trị email
+        try:
+            page.run_js("""
+                let inp = document.querySelector('input[inputmode="email"]')
+                       || document.querySelector('input[autocomplete*="username"]')
+                       || document.querySelector('input[placeholder*="email" i]')
+                       || document.querySelector('input[data-slot="input"]');
+                if (inp && (!inp.value || inp.value.trim().toLowerCase() !== arguments[0].trim().toLowerCase())) {
+                    inp.focus();
+                    let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                    let tracker = inp._valueTracker;
+                    if (tracker) tracker.setValue('');
+                    setter.call(inp, arguments[0]);
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            """, email)
+        except Exception:
+            pass
+        time.sleep(0.8)
 
-        btn_continue = page.ele("text:Continue") or page.ele("tag:button@text():Continue")
+        btn_continue = (
+            page.ele("text:Continue", timeout=1)
+            or page.ele("tag:button@text():Continue", timeout=0.5)
+            or page.ele("text:Tiếp tục", timeout=0.5)
+            or page.ele("tag:button@text():Tiếp tục", timeout=0.5)
+            or page.ele("css:button[type='submit']", timeout=0.5)
+        )
         if not btn_continue:
             self.controller.update_status(row_idx, "Không thấy nút Continue", "#ef4444")
             self.controller.record_result(False)
@@ -1018,15 +1200,54 @@ class LoginWorker(threading.Thread):
             before_l2f = lay2fa_fetch(d, u)
             lay2fa_seen = {str(m.get("id")) for m in before_l2f} if before_l2f is not None else None
 
+        dongvan_seen: set[str] | None = None
+        if not (is_tuan89_account(acc_line, email) or is_lay2fa_account(acc_line, email) or is_mailapi_email(email)):
+            dv_creds = parse_dongvan_oauth2(acc_line, email)
+            if dv_creds:
+                dv_em, dv_rt, dv_cid = dv_creds
+                before_dv = dongvan_api_fetch_messages(dv_em, dv_rt, dv_cid, timeout=10.0)
+                if before_dv is not None:
+                    dongvan_seen = set()
+                    for m in before_dv:
+                        sig = dongvan_msg_sig(m)
+                        if sig:
+                            dongvan_seen.add(sig)
+                        old_c = dongvan_extract_otp(m)
+                        if old_c:
+                            self.controller.remember_otp(email, old_c)
+
         # Mốc thời gian yêu cầu mã (dung sai 2 phút): chỉ nhận thư gửi SAU mốc này
         self._otp_not_before = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=2)
-        btn_continue.click()
+        try:
+            btn_continue.click()
+        except Exception:
+            try:
+                btn_continue.click(by_js=True)
+            except Exception:
+                pass
         self.controller.update_status(row_idx, "Đã gửi yêu cầu OTP...", "#f59e0b")
-        # Đợi 4 giây cho Muse gửi email
-        time.sleep(4)
-        if self._meta_checkpoint(page):
-            self._fail_checkpoint(row_idx, email)
-            return
+
+        # Chờ tối đa 12 giây cho trang chuyển sang ô nhập OTP (hoặc checkpoint/captcha)
+        is_otp = False
+        for _ in range(12):
+            time.sleep(1)
+            if self._meta_checkpoint(page):
+                self._fail_checkpoint(row_idx, email)
+                return
+            if self._meta_manual_checkpoint(page):
+                break
+            try:
+                is_otp = bool(page.run_js("""
+                    return !!(document.querySelector('input[autocomplete="one-time-code"]') || 
+                              document.querySelector('input[aria-label*="6" i]') ||
+                              document.querySelector('input[aria-label*="code" i]') ||
+                              document.querySelector('input[aria-label*="mã" i]') ||
+                              document.querySelector('input.sr-only'));
+                """))
+            except Exception:
+                is_otp = False
+            if is_otp:
+                break
 
         login_ok = False
         all_cookies = {}
@@ -1045,22 +1266,29 @@ class LoginWorker(threading.Thread):
                     cookies_exp = c_exp
                 else:
                     self._otp_not_before = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=2)
+                    is_otp = True
             else:
                 self._fail_verify(row_idx, email)
                 return
 
         if not login_ok:
-            is_otp = page.run_js("""
-                return !!(document.querySelector('input[autocomplete="one-time-code"]') || 
-                          document.querySelector('input[aria-label="6-digit security code"]') ||
-                          document.querySelector('input.sr-only'));
-            """)
+            if not is_otp:
+                try:
+                    is_otp = bool(page.run_js("""
+                        return !!(document.querySelector('input[autocomplete="one-time-code"]') || 
+                                  document.querySelector('input[aria-label*="6" i]') ||
+                                  document.querySelector('input[aria-label*="code" i]') ||
+                                  document.querySelector('input[aria-label*="mã" i]') ||
+                                  document.querySelector('input.sr-only'));
+                    """))
+                except Exception:
+                    is_otp = False
             if not is_otp:
                 self.controller.update_status(row_idx, "Không hiện ô OTP", "#ef4444")
                 self.controller.record_result(False)
                 return
 
-            # 2. Lấy OTP: Tuan89 / Lay2FA / MailAPI / DongVanFB
+            # 2. Lấy OTP: Tuan89 / Lay2FA / MailAPI / DongVanFB API
             if is_tuan89_account(acc_line, email):
                 otp_code = self._otp_from_tuan89(row_idx, email, tuan89_seen)
             elif is_lay2fa_account(acc_line, email):
@@ -1068,7 +1296,7 @@ class LoginWorker(threading.Thread):
             elif is_mailapi_email(email):
                 otp_code = self._otp_from_mailapi(row_idx, email, mailapi_seen)
             else:
-                otp_code = self._otp_from_dongvan(page, dongvan_tab, row_idx, acc_line, email)
+                otp_code = self._otp_from_dongvan(page, dongvan_tab, row_idx, acc_line, email, dongvan_seen)
 
             if not otp_code:
                 self.controller.update_status(row_idx, f"Không lấy được OTP sau {OTP_READ_ATTEMPTS} lần", "#ef4444")
@@ -1082,15 +1310,19 @@ class LoginWorker(threading.Thread):
 
             # 3. Điền OTP vào Muse
             safe_activate_tab(page, 0)
-            time.sleep(1)
+            time.sleep(0.5)
 
             page.run_js("""
                 let input = document.querySelector('input[autocomplete="one-time-code"]') || 
-                            document.querySelector('input[aria-label="6-digit security code"]') ||
+                            document.querySelector('input[aria-label*="6" i]') ||
+                            document.querySelector('input[aria-label*="code" i]') ||
+                            document.querySelector('input[aria-label*="mã" i]') ||
                             document.querySelector('input.sr-only');
                 if (input) {
                     input.focus();
                     let setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                    let tracker = input._valueTracker;
+                    if (tracker) tracker.setValue('');
                     setter.call(input, arguments[0]);
                     input.dispatchEvent(new Event('input', { bubbles: true }));
                     input.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1098,7 +1330,7 @@ class LoginWorker(threading.Thread):
             """, otp_code)
 
             time.sleep(2)
-            next_btn = page.ele("text:Next") or page.ele("tag:button@text():Tiếp tục")
+            next_btn = page.ele("text:Next", timeout=0.5) or page.ele("tag:button@text():Tiếp tục", timeout=0.5) or page.ele("tag:button@text():Continue", timeout=0.5)
             if next_btn and "disabled" not in str(next_btn.attr("class")).lower() and next_btn.attr("disabled") is None:
                 try:
                     next_btn.click(by_js=True)

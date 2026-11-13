@@ -29,6 +29,11 @@ def fix_accounts():
 
     co = ChromiumOptions()
     co.headless(True)
+    co.remove_extensions()
+    co.set_argument("--disable-extensions")
+    co.set_argument("--disable-component-extensions-with-background-pages")
+    co.set_argument("--disable-default-apps")
+    co.set_argument("--disable-sync")
     chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
     if os.path.isfile(chrome_path):
         co.set_browser_path(chrome_path)

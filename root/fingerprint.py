@@ -35,7 +35,7 @@ GPUS = [
 LANGS = [
     ("en-US", ["en-US", "en"]),
     ("en-US", ["en-US", "en", "vi"]),
-    ("vi-VN", ["vi-VN", "vi", "en-US", "en"]),
+    ("en-US", ["en-US", "en", "vi-VN", "vi"]),
     ("en-GB", ["en-GB", "en-US", "en"]),
 ]
 TIMEZONE = "Asia/Ho_Chi_Minh"     # khớp IP proxy Việt Nam (lệch múi giờ so với IP là dấu hiệu dễ bị phát hiện)

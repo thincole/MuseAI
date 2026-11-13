@@ -3,6 +3,7 @@ và sinh prompt chuẩn TVC / Video quảng cáo từ Novagate sang MuseAI.
 """
 from __future__ import annotations
 
+import atexit
 import base64
 import collections
 import copy
@@ -35,9 +36,10 @@ def _ffmpeg_concurrency() -> int:
             return max(1, min(int(env_val), 64))
         except (TypeError, ValueError):
             pass
-    # Tự động mở rộng số luồng ghép FFmpeg theo số luồng CPU của máy (VD: 56 luồng CPU -> 24 luồng ghép đồng thời)
+    # Tự động cân đối số luồng ghép FFmpeg theo số luồng CPU (mỗi FFmpeg dùng -threads 2 + -filter_threads 2
+    # nên ~cpu_threads // 3 tiến trình song song tận dụng tối đa CPU mà không nghẽn chuyển ngữ cảnh).
     cpu_threads = os.cpu_count() or 8
-    return max(8, min(32, cpu_threads // 2))
+    return max(6, min(20, cpu_threads // 3))
 
 
 # Concurrency Limiter: giới hạn số tiến trình FFmpeg encode/ghép video chạy đồng thời
@@ -109,6 +111,10 @@ def _run_ffmpeg_cmd(cmd: list[str], timeout: int = 180, check: bool = False, tex
 
 _NVENC_AVAILABLE: bool | None = None
 _NVENC_LOCK = threading.Lock()
+# Giới hạn số phiên NVENC chạy đồng thời trên GPU phổ thông (driver NVIDIA thường chặn 3-8 phiên; vượt ngưỡng
+# thì chuyển thẳng sang CPU libx264 thay vì 30+ tiến trình cùng đâm vào CUDA rồi chờ/lỗi).
+_NVENC_MAX_SLOTS = max(1, min(8, int(os.environ.get("MUSE2API_NVENC_SLOTS", "4") or 4)))
+_NVENC_SEMAPHORE = threading.BoundedSemaphore(_NVENC_MAX_SLOTS)
 
 
 def has_nvenc() -> bool:
@@ -132,10 +138,16 @@ def has_nvenc() -> bool:
             )
             _NVENC_AVAILABLE = (res.returncode == 0)
             if _NVENC_AVAILABLE:
-                log.info("🚀 [FFmpeg GPU] Đã kích hoạt tăng tốc phần cứng NVIDIA NVENC (h264_nvenc) để ghép video siêu tốc!")
+                log.info("🚀 [FFmpeg GPU] Đã kích hoạt tăng tốc phần cứng NVIDIA NVENC (h264_nvenc, tối đa %d luồng GPU đồng thời)!", _NVENC_MAX_SLOTS)
         except Exception:
             _NVENC_AVAILABLE = False
         return _NVENC_AVAILABLE
+
+
+def _ffmpeg_global_thread_args() -> list[str]:
+    """Giới hạn số luồng nội bộ cho decoder + filter_complex của mỗi tiến trình FFmpeg để tránh hàng chục
+    tiến trình chạy song song mỗi tiến trình tự đẻ hàng chục OS thread gây tranh chấp CPU."""
+    return ["-threads", "2", "-filter_threads", "2", "-filter_complex_threads", "2"]
 
 
 def _video_encode_args(use_nvenc: bool) -> list[str]:
@@ -491,6 +503,17 @@ CLIP_CACHE_FILE = os.path.join(CFG.data_dir, "shopee_clip_cache.json")
 _CLIP_CACHE_LOCK = threading.RLock()
 _BLACKLIST_LOCK = threading.RLock()
 
+# Bộ đệm RAM cho shopee_clip_cache.json: tránh đọc/parse/fsync file 30MB+ dưới khóa toàn cục trên mỗi video.
+_CLIP_CACHE_DATA: dict[str, dict] | None = None
+_CLIP_CACHE_PATH_LOADED: str | None = None
+_CLIP_CACHE_MTIME: float = 0.0
+_CLIP_CACHE_DIRTY: bool = False
+_CLIP_CACHE_FLUSH_TIMER: threading.Timer | None = None
+_CLIP_CACHE_FLUSH_LOCK = threading.Lock()
+_CLIP_CACHE_CAN_WRITE: bool = True
+CLIP_CACHE_FLUSH_INTERVAL = max(1.0, float(os.environ.get("MUSE2API_CLIP_CACHE_FLUSH_SEC", "4.0") or 4.0))
+CLIP_CACHE_MAX_ENTRIES = max(2000, int(os.environ.get("MUSE2API_CLIP_CACHE_MAX", "25000") or 25000))
+
 # Trạng thái trả về của _load_json_file
 _JSON_MISSING = "missing"
 _JSON_OK = "ok"
@@ -499,15 +522,16 @@ _JSON_CORRUPT_UNPRESERVED = "corrupt_unpreserved"  # file hỏng nhưng KHÔNG �
 _JSON_READ_ERROR = "read_error"                    # lỗi I/O khi đọc (khóa file, quyền...) -> không ghi đè
 
 
-def _atomic_write_json(path: str, data) -> None:
+def _atomic_write_json(path: str, data, compact: bool = False) -> None:
     """Ghi JSON nguyên tử: ghi ra `path + '.tmp'` (cùng thư mục) -> flush + fsync -> os.replace (thử lại vài lần
     vì trên Windows file đích có thể đang bị process khác/antivirus mở tạm thời). Ném lỗi nếu thất bại."""
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
+    dump_kw = {"separators": (",", ":")} if compact else {"indent": 2}
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, **dump_kw)
             f.flush()
             os.fsync(f.fileno())
         last_err: Exception | None = None
@@ -562,6 +586,114 @@ def _load_json_file(path: str, label: str) -> tuple[dict | None, str]:
     return data, _JSON_OK
 
 
+def _trim_clip_cache_locked(data: dict) -> bool:
+    """Giữ kích thước shopee_clip_cache gọn (mặc định tối đa CLIP_CACHE_MAX_ENTRIES bản ghi),
+    ưu tiên giữ các mục còn clip_a / clip_b (cho video 16s) và các mục mới cập nhật gần nhất."""
+    if len(data) <= CLIP_CACHE_MAX_ENTRIES:
+        return False
+    ab_items = []
+    other_items = []
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        ts = v.get("updated_at") or 0
+        if v.get("clip_a") or v.get("clip_b"):
+            ab_items.append((ts, k, v))
+        else:
+            other_items.append((ts, k, v))
+    ab_items.sort(key=lambda x: x[0], reverse=True)
+    keep: dict[str, dict] = {}
+    for _, k, v in ab_items[:CLIP_CACHE_MAX_ENTRIES]:
+        keep[k] = v
+    rem = CLIP_CACHE_MAX_ENTRIES - len(keep)
+    if rem > 0:
+        other_items.sort(key=lambda x: x[0], reverse=True)
+        for _, k, v in other_items[:rem]:
+            keep[k] = v
+    dropped = len(data) - len(keep)
+    if dropped > 0:
+        data.clear()
+        data.update(keep)
+        log.info("🧹 [Clip Cache] Đã tỉa bớt %d mục cũ khỏi cache (còn %d mục) để không nghẽn I/O.", dropped, len(data))
+        return True
+    return False
+
+
+def _ensure_clip_cache_loaded_locked() -> dict[str, dict]:
+    """Đảm bảo _CLIP_CACHE_DATA được nạp trong RAM; chỉ đọc đĩa lần đầu hoặc khi file ngoài thay đổi."""
+    global _CLIP_CACHE_DATA, _CLIP_CACHE_PATH_LOADED, _CLIP_CACHE_MTIME, _CLIP_CACHE_DIRTY, _CLIP_CACHE_CAN_WRITE
+    path = CLIP_CACHE_FILE
+    if _CLIP_CACHE_DATA is not None and _CLIP_CACHE_PATH_LOADED == path:
+        if not _CLIP_CACHE_DIRTY:
+            try:
+                cur_mtime = os.path.getmtime(path) if os.path.isfile(path) else 0.0
+            except OSError:
+                cur_mtime = _CLIP_CACHE_MTIME
+            if abs(cur_mtime - _CLIP_CACHE_MTIME) > 1e-6:
+                _CLIP_CACHE_DATA = None
+        if _CLIP_CACHE_DATA is not None:
+            return _CLIP_CACHE_DATA
+
+    data, status = _load_json_file(path, "clip cache")
+    _CLIP_CACHE_CAN_WRITE = status not in (_JSON_CORRUPT_UNPRESERVED, _JSON_READ_ERROR)
+    loaded = data if isinstance(data, dict) else {}
+    trimmed = _trim_clip_cache_locked(loaded)
+    _CLIP_CACHE_DATA = loaded
+    _CLIP_CACHE_PATH_LOADED = path
+    try:
+        _CLIP_CACHE_MTIME = os.path.getmtime(path) if os.path.isfile(path) else 0.0
+    except OSError:
+        _CLIP_CACHE_MTIME = 0.0
+    _CLIP_CACHE_DIRTY = trimmed and _CLIP_CACHE_CAN_WRITE
+    if _CLIP_CACHE_DIRTY:
+        _schedule_clip_cache_flush_locked()
+    return _CLIP_CACHE_DATA
+
+
+def flush_clip_cache(force: bool = True) -> bool:
+    """Ghi gộp shopee_clip_cache từ RAM xuống đĩa theo định dạng JSON compact; không giữ _CLIP_CACHE_LOCK lúc ghi."""
+    global _CLIP_CACHE_DIRTY, _CLIP_CACHE_MTIME, _CLIP_CACHE_FLUSH_TIMER
+    with _CLIP_CACHE_LOCK:
+        if _CLIP_CACHE_FLUSH_TIMER is not None and not force:
+            _CLIP_CACHE_FLUSH_TIMER = None
+        if _CLIP_CACHE_DATA is None or (not _CLIP_CACHE_DIRTY and len(_CLIP_CACHE_DATA) <= CLIP_CACHE_MAX_ENTRIES) or not _CLIP_CACHE_CAN_WRITE:
+            return True
+        _trim_clip_cache_locked(_CLIP_CACHE_DATA)
+        target_path = _CLIP_CACHE_PATH_LOADED or CLIP_CACHE_FILE
+        snapshot = {k: (dict(v) if isinstance(v, dict) else v) for k, v in _CLIP_CACHE_DATA.items()}
+        _CLIP_CACHE_DIRTY = False
+    with _CLIP_CACHE_FLUSH_LOCK:
+        try:
+            _atomic_write_json(target_path, snapshot, compact=True)
+            try:
+                mtime = os.path.getmtime(target_path)
+            except OSError:
+                mtime = 0.0
+            with _CLIP_CACHE_LOCK:
+                if (_CLIP_CACHE_PATH_LOADED or CLIP_CACHE_FILE) == target_path:
+                    _CLIP_CACHE_MTIME = mtime
+            return True
+        except Exception as e:
+            log.warning("Lỗi ghi clip cache xuống đĩa: %s", e)
+            with _CLIP_CACHE_LOCK:
+                if (_CLIP_CACHE_PATH_LOADED or CLIP_CACHE_FILE) == target_path:
+                    _CLIP_CACHE_DIRTY = True
+            return False
+
+
+def _schedule_clip_cache_flush_locked() -> None:
+    global _CLIP_CACHE_FLUSH_TIMER
+    if _CLIP_CACHE_FLUSH_TIMER is not None and _CLIP_CACHE_FLUSH_TIMER.is_alive():
+        return
+    t = threading.Timer(CLIP_CACHE_FLUSH_INTERVAL, flush_clip_cache, kwargs={"force": False})
+    t.daemon = True
+    _CLIP_CACHE_FLUSH_TIMER = t
+    t.start()
+
+
+atexit.register(flush_clip_cache)
+
+
 def get_cached_clips(item_id: str) -> dict:
     """Lấy các clip thành phần (clip_a / clip_b / clip_raw) còn tồn tại trên đĩa, kèm image_url đã lưu.
 
@@ -588,16 +720,21 @@ def _valid_cache_entry(item_data) -> dict:
 
 
 def get_cached_clips_many(item_ids) -> dict[str, dict]:
-    """Như get_cached_clips nhưng đọc/parse file cache MỘT lần cho cả danh sách ItemID."""
+    """Như get_cached_clips nhưng đọc trực tiếp từ cache RAM (nhả khóa trước khi stat file trên đĩa)."""
     with _CLIP_CACHE_LOCK:
-        data, _status = _load_json_file(CLIP_CACHE_FILE, "clip cache")
-    if not data:
+        data = _ensure_clip_cache_loaded_locked()
+        raw_hits = {}
+        for iid in item_ids:
+            sid = str(iid)
+            v = data.get(sid)
+            if isinstance(v, dict):
+                raw_hits[sid] = dict(v)
+    if not raw_hits:
         return {}
     out = {}
-    for iid in item_ids:
-        sid = str(iid)
+    for sid, entry_raw in raw_hits.items():
         try:
-            entry = _valid_cache_entry(data.get(sid))
+            entry = _valid_cache_entry(entry_raw)
         except Exception as e:  # noqa: BLE001
             log.warning("Lỗi đọc clip cache cho %s: %s", sid, e)
             continue
@@ -606,27 +743,59 @@ def get_cached_clips_many(item_ids) -> dict[str, dict]:
     return out
 
 
-def set_cached_clip(item_id: str, clip_key: str, filename: str) -> bool:
-    """Lưu lại tên file clip thành phần đã render thành công của sản phẩm (đọc-sửa-ghi dưới khóa, ghi nguyên tử)."""
+def set_cached_clips(item_id: str, updates: dict[str, str]) -> bool:
+    """Cập nhật nhiều khóa clip cache cùng lúc trong RAM và ghi gộp nền xuống đĩa (0ms chờ I/O)."""
+    global _CLIP_CACHE_DIRTY
+    clean_updates = {k: v for k, v in (updates or {}).items() if v}
+    if not clean_updates:
+        return True
     with _CLIP_CACHE_LOCK:
-        data, status = _load_json_file(CLIP_CACHE_FILE, "clip cache")
-        if status in (_JSON_CORRUPT_UNPRESERVED, _JSON_READ_ERROR):
-            log.error("Bỏ qua ghi clip cache (%s=%s) vì file hiện tại không đọc được/không sao lưu được.", item_id, clip_key)
+        data = _ensure_clip_cache_loaded_locked()
+        if not _CLIP_CACHE_CAN_WRITE:
+            log.error("Bỏ qua ghi clip cache (%s) vì file hiện tại không đọc được/không sao lưu được.", item_id)
             return False
-        data = data or {}
         str_id = str(item_id)
         entry = data.get(str_id)
         if not isinstance(entry, dict):
             entry = {}
             data[str_id] = entry
-        entry[clip_key] = filename
+        entry.update(clean_updates)
         entry["updated_at"] = int(time.time())
-        try:
-            _atomic_write_json(CLIP_CACHE_FILE, data)
-            return True
-        except Exception as e:
-            log.warning("Lỗi lưu clip cache: %s", e)
-            return False
+        if len(data) > CLIP_CACHE_MAX_ENTRIES + 2000:
+            _trim_clip_cache_locked(data)
+        _CLIP_CACHE_DIRTY = True
+        _schedule_clip_cache_flush_locked()
+        return True
+
+
+def set_cached_clip(item_id: str, clip_key: str, filename: str) -> bool:
+    """Lưu lại tên file clip thành phần đã render thành công của sản phẩm (cập nhật RAM + flush gộp nền)."""
+    return set_cached_clips(item_id, {clip_key: filename})
+
+
+def clear_cached_clip_keys(item_id: str, keys: tuple[str, ...] | list[str]) -> None:
+    """Xóa các khóa tạm (vd clip_raw sau khi đã ghép/xóa) khỏi cache để không giữ rác."""
+    global _CLIP_CACHE_DIRTY
+    str_id = str(item_id or "").strip()
+    if not str_id or not keys:
+        return
+    with _CLIP_CACHE_LOCK:
+        data = _ensure_clip_cache_loaded_locked()
+        entry = data.get(str_id)
+        if not isinstance(entry, dict):
+            return
+        changed = False
+        for k in keys:
+            if k in entry:
+                entry.pop(k, None)
+                changed = True
+        # Nếu chỉ còn updated_at (không còn clip_a/clip_b/clip_raw/image_url), bỏ hẳn mục cho gọn
+        if not any(k in entry for k in ("clip_a", "clip_b", "clip_raw", "image_url")):
+            data.pop(str_id, None)
+            changed = True
+        if changed and _CLIP_CACHE_CAN_WRITE:
+            _CLIP_CACHE_DIRTY = True
+            _schedule_clip_cache_flush_locked()
 
 
 BLACKLIST_FILE = os.path.join(CFG.data_dir, "shopee_blacklist.json")
@@ -850,6 +1019,36 @@ def is_product_blacklisted(product: dict, blacklist_data: dict | None = None) ->
     return False, ""
 
 
+def _nvenc_try_order(use_gpu: bool) -> list[bool]:
+    """Chỉ cấp slot GPU NVENC (tối đa _NVENC_MAX_SLOTS luồng cùng lúc); hết slot thì đi thẳng CPU libx264."""
+    return [True, False] if use_gpu else [False]
+
+
+def _run_encode_with_gpu_fallback(build_cmd_fn, output_path: str, timeout: int = 90) -> tuple[bool, str]:
+    """Thử encode qua GPU NVENC nếu có slot rảnh trong _NVENC_SEMAPHORE, ngược lại chạy CPU libx264 ngay."""
+    use_gpu = has_nvenc()
+    got_gpu_slot = False
+    try:
+        if use_gpu:
+            got_gpu_slot = _NVENC_SEMAPHORE.acquire(blocking=False)
+        order = [True, False] if got_gpu_slot else [False]
+        last_err = ""
+        for try_gpu in order:
+            cmd = build_cmd_fn(try_gpu)
+            res = _run_ffmpeg_cmd(cmd, timeout=timeout)
+            if res.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 1000:
+                return True, ""
+            last_err = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
+            _safe_remove(output_path)
+            if try_gpu and got_gpu_slot:
+                _NVENC_SEMAPHORE.release()
+                got_gpu_slot = False
+        return False, last_err
+    finally:
+        if got_gpu_slot:
+            _NVENC_SEMAPHORE.release()
+
+
 def concat_videos(clip_paths: list[str], output_path: str) -> bool:
     """Ghép nhiều clip video thành 1 video 16s hoàn chỉnh bằng FFmpeg (giới hạn đồng thời qua FFMPEG_SEMAPHORE,
     tiến trình ưu tiên thấp). Thất bại thì xóa file output dở dang."""
@@ -898,11 +1097,11 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
                 err1 = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
                 log.warning("concat_videos copy failed: %s; falling back to reencode", err1)
                 _safe_remove(output_path)  # bỏ output dở dang của lần stream-copy
-                # Thử 2: re-encode nếu stream khác codec hoặc timeline (ưu tiên GPU NVENC nếu có, tự động fallback về CPU libx264)
-                use_gpu = has_nvenc()
-                for try_gpu in ([True, False] if use_gpu else [False]):
-                    cmd_reencode = [
+                # Thử 2: re-encode nếu stream khác codec hoặc timeline (NVENC có kiểm soát slot -> CPU libx264)
+                ok_reenc, err2 = _run_encode_with_gpu_fallback(
+                    lambda try_gpu: [
                         "ffmpeg", "-y",
+                        *_ffmpeg_global_thread_args(),
                         "-reinit_filter", "0",  # clip Muse có thể đổi định dạng điểm ảnh giữa chừng (xem ghep_anh_12s)
                         "-f", "concat", "-safe", "0",
                         "-i", list_file,
@@ -910,16 +1109,18 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
                         "-c:a", "aac", "-b:a", "192k",
                         "-movflags", "+faststart",
                         output_path
-                    ]
-                    res = _run_ffmpeg_cmd(cmd_reencode, timeout=240)
-                    if res.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 1000:
-                        break
-                    _safe_remove(output_path)
-                if res.returncode != 0:
-                    err2 = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
+                    ],
+                    output_path,
+                    timeout=240,
+                )
+                if not ok_reenc:
                     log.error("concat_videos reencode failed: %s", err2)
+                    ok = False
+                else:
+                    ok = True
+            else:
+                ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 1000
 
-            ok = res.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 1000
             if ok:
                 log.info("✓ [FFmpeg] Đã ghép 16s thành công: %s (%.2fs)", os.path.basename(output_path), time.time() - t0)
             return ok
@@ -1191,7 +1392,7 @@ def take_requeue_slot(item_id) -> int:
             for k in list(counts)[:10000]:
                 counts.pop(k, None)
         try:
-            _atomic_write_json(REQUEUE_FILE, counts)
+            _atomic_write_json(REQUEUE_FILE, counts, compact=True)
         except Exception:  # noqa: BLE001
             pass
         return n + 1
@@ -1204,7 +1405,7 @@ def forget_requeue(item_id) -> None:
         counts = _load_requeue()
         if counts.pop(key, None) is not None:
             try:
-                _atomic_write_json(REQUEUE_FILE, counts)
+                _atomic_write_json(REQUEUE_FILE, counts, compact=True)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1367,17 +1568,39 @@ def _fetch_image_bytes(image_url: str, timeout: int = 15, require_image_type: bo
 
 
 
-def download_image_as_data_url(image_url: str, retries: int = 3) -> str | None:
+def download_image_as_data_url(image_url: str, retries: int = 3, cache_path: str | None = None) -> str | None:
     """Tải ảnh sản phẩm từ Shopee CDN về bộ nhớ và trả về chuỗi Data URL Base64.
+    Nếu truyền cache_path hợp lệ, lưu đệm file ảnh lên đĩa (và dùng lại ngay nếu đã có sẵn) để bước ghép Outro
+    12s dùng lại tức thì mà không phải tải lại hoặc truyền lại Base64.
     Ném ValueError nếu URL bị từ chối (scheme/IP nội bộ/không phải ảnh/quá 15MB); lỗi mạng -> thử lại rồi trả None."""
     if not image_url:
         return None
     _validate_public_http_url(image_url)
+    if cache_path and os.path.isfile(cache_path) and os.path.getsize(cache_path) > 100:
+        try:
+            with open(cache_path, "rb") as f:
+                cached_bytes = f.read()
+            if cached_bytes:
+                ctype = "image/png" if cached_bytes[:8] == b"\x89PNG\r\n\x1a\n" else (
+                    "image/webp" if cached_bytes[:4] == b"RIFF" and cached_bytes[8:12] == b"WEBP" else "image/jpeg"
+                )
+                return f"data:{ctype};base64,{base64.b64encode(cached_bytes).decode('utf-8')}"
+        except OSError:
+            pass
     last_err: Exception | None = None
     for attempt in range(retries):
         try:
             data, content_type = _fetch_image_bytes(image_url, timeout=15, require_image_type=True)
             if len(data) > 0:
+                if cache_path:
+                    try:
+                        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+                        tmp_img = f"{cache_path}.{os.getpid()}_{threading.get_ident()}.tmp"
+                        with open(tmp_img, "wb") as f:
+                            f.write(data)
+                        os.replace(tmp_img, cache_path)
+                    except OSError:
+                        pass
                 b64 = base64.b64encode(data).decode("utf-8")
                 return f"data:{content_type};base64,{b64}"
         except ValueError:
@@ -1419,6 +1642,53 @@ def download_image_to_file(image_url: str, target_path: str, retries: int = 3) -
 
 
 
+def probe_video_meta(vp: str) -> tuple[float | None, bool, int, int, float, bool]:
+    """Đo toàn bộ thông số cần thiết (thời lượng, có audio, width, height, fps) trong MỘT lần gọi ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration:stream=codec_type,width,height,r_frame_rate",
+        "-of", "json", vp,
+    ]
+    dur: float | None = None
+    has_audio = False
+    width, height, fps = 720, 1280, 24.0
+    has_dims = False
+    try:
+        result = _run_ffmpeg_cmd(cmd, timeout=10, text=True)
+        data = json.loads(result.stdout or "{}")
+        fmt_dur = (data.get("format") or {}).get("duration")
+        if fmt_dur is not None:
+            try:
+                d_val = float(fmt_dur)
+                if d_val > 0:
+                    dur = d_val
+            except (TypeError, ValueError):
+                pass
+        for s in (data.get("streams") or []):
+            ctype = s.get("codec_type")
+            if ctype == "audio":
+                has_audio = True
+            elif ctype == "video" and not has_dims:
+                try:
+                    w = int(s.get("width") or 0)
+                    h = int(s.get("height") or 0)
+                    if w > 0 and h > 0:
+                        width, height = w, h
+                        has_dims = True
+                    fps_str = str(s.get("r_frame_rate") or "")
+                    if "/" in fps_str:
+                        num, den = fps_str.split("/", 1)
+                        if float(den) > 0:
+                            fps = float(num) / float(den)
+                    elif fps_str:
+                        fps = float(fps_str)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return dur, has_audio, width, height, fps, has_dims
+
+
 def probe_media_duration(vp: str) -> float | None:
     """Đo thời lượng video bằng ffprobe. Trả về None nếu không đo được (thiếu ffprobe, file hỏng...)."""
     cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', vp]
@@ -1453,14 +1723,15 @@ def ghep_anh_12s(
     image_path: str,
     output_path: str,
     ai_duration: float | None = None,
-    total_duration: float = 12.0
+    total_duration: float = 12.0,
+    fallback_duration: float | None = None
 ) -> bool:
     """Ghép ảnh sản phẩm làm Outro vào video AI để tạo thành video chuẩn 12.0s:
     - Nếu video AI 8s: giữ nguyên tốc độ chuẩn 8s (không làm chậm), tạo Outro ảnh phóng to (zoom-in) 4s -> Tổng 12.0s.
     - Nếu video AI 10s: giữ nguyên tốc độ chuẩn 10s, tạo Outro ảnh phóng to (zoom-in) 2s -> Tổng 12.0s.
     - Xử lý làm mượt âm thanh (fade out tự nhiên cuối đoạn AI) để nối sang Outro không bị giật/nổ tiếng.
-    - Bước encode FFmpeg được giới hạn đồng thời qua FFMPEG_SEMAPHORE (ffprobe nhẹ chạy ngoài semaphore)
-      và chạy ưu tiên tiến trình thấp để CPU không bị quá tải làm đơ máy.
+    - Bước encode FFmpeg được giới hạn đồng thời qua FFMPEG_SEMAPHORE (1 lần ffprobe chạy ngoài semaphore),
+      giới hạn -threads 2 / -filter_threads 2 để tránh bùng nổ thread và ưu tiên tiến trình thấp.
     - Thất bại thì xóa file output dở dang.
     """
     if not os.path.isfile(video_path) or not os.path.isfile(image_path):
@@ -1468,45 +1739,22 @@ def ghep_anh_12s(
 
     t0 = time.time()
 
-    def check_has_audio(vp):
-        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', vp]
-        try:
-            result = _run_ffmpeg_cmd(cmd, timeout=10, text=True)
-            return len(result.stdout.strip()) > 0
-        except Exception:
-            return False
-
-    def get_video_info(vp):
-        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,r_frame_rate', '-of', 'json', vp]
-        try:
-            result = _run_ffmpeg_cmd(cmd, timeout=10, text=True)
-            data = json.loads(result.stdout)
-            stream = data['streams'][0]
-            width = int(stream['width'])
-            height = int(stream['height'])
-            fps_str = stream['r_frame_rate']
-            if '/' in fps_str:
-                num, den = fps_str.split('/')
-                fps = float(num) / float(den)
-            else:
-                fps = float(fps_str)
-            return width, height, fps
-        except Exception:
-            return 720, 1280, 24.0
-
-    # --- Chuẩn bị (ffprobe + dựng filter) — KHÔNG giữ semaphore ---
+    # --- Chuẩn bị (1 lần ffprobe gộp + dựng filter) — KHÔNG giữ semaphore ---
     try:
-        has_audio = check_has_audio(video_path)
-        width, height, fps = get_video_info(video_path)
+        probed_dur, has_audio, width, height, fps, has_dims = probe_video_meta(video_path)
         fps_int = int(round(fps))
         if fps_int <= 0:
             fps_int = 24
 
-        # Xác định độ dài video AI (8s hoặc 10s)
+        # Xác định độ dài video AI (8s hoặc 10s): ưu tiên giá trị truyền trực tiếp, rồi thời lượng thật vừa đo
         if ai_duration is not None and ai_duration > 0:
             chosen_ai_dur = float(ai_duration)
+        elif probed_dur is not None and probed_dur > 0:
+            chosen_ai_dur = float(probed_dur)
+        elif fallback_duration is not None and fallback_duration > 0:
+            chosen_ai_dur = float(fallback_duration)
         else:
-            chosen_ai_dur = get_media_duration(video_path)
+            chosen_ai_dur = 8.0
 
         if chosen_ai_dur >= 9.0:
             video_dur = 10.0
@@ -1528,14 +1776,15 @@ def ghep_anh_12s(
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
 
-        # Video AI nguyên bản, không làm chậm, cắt chuẩn video_dur
-        # setsar=1 (cả 2 đoạn): một số clip Muse có tỉ lệ điểm ảnh lạ (SAR 16:9, 1124:1125...) trong khi đoạn ảnh
-        # zoom là 1:1 -> concat không nối được 2 đoạn khác SAR, FFmpeg báo -22 (Invalid argument) -> ép về 1:1.
-        v_part = f"[0:v]scale={width}:{height},fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setsar=1,setpts=PTS-STARTPTS[v_part]"
+        # Video AI nguyên bản, không làm chậm, cắt chuẩn video_dur.
+        # Bỏ scale thừa trên [0:v] khi kích thước video nguồn đã đúng width x height.
+        # setsar=1 (cả 2 đoạn): một số clip Muse có tỉ lệ điểm ảnh lạ (SAR 16:9, 1124:1125...) -> ép về 1:1.
+        scale_v0 = "" if has_dims else f"scale={width}:{height}:flags=fast_bilinear,"
+        v_part = f"[0:v]{scale_v0}fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setsar=1,setpts=PTS-STARTPTS[v_part]"
 
         # Outro ảnh chuyển động phóng to (zoom-in) — chỉ đọc 1 khung ảnh rồi zoompan sinh ra đúng total_image_frames
         i_v = (
-            f"[1:v]scale={w_scale}:{h_scale}:force_original_aspect_ratio=increase,"
+            f"[1:v]scale={w_scale}:{h_scale}:force_original_aspect_ratio=increase:flags=fast_bilinear,"
             f"crop={w_scale}:{h_scale},"
             f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height}:fps={fps_int},"
             f"trim=0:{image_dur},setsar=1,setpts=PTS-STARTPTS[i_v]"
@@ -1567,6 +1816,7 @@ def ghep_anh_12s(
         # -> FFmpeg khởi tạo lại chuỗi bộ lọc, mốc thời gian quay về 0 và vứt ~35 khung -> video ra 10.54s thay vì 12s.
         base_cmd = [
             "ffmpeg", "-y",
+            *_ffmpeg_global_thread_args(),
             "-reinit_filter", "0", "-i", video_path,
             "-i", image_path,
             "-filter_complex", filter_complex_str,
@@ -1576,23 +1826,18 @@ def ghep_anh_12s(
         log.warning("Lỗi chuẩn bị ghép video 12s: %s", e)
         return False
 
-    # --- Encode (nặng) — giới hạn đồng thời qua FFMPEG_SEMAPHORE, ưu tiên GPU NVENC nếu có ---
+    # --- Encode (nặng) — giới hạn đồng thời qua FFMPEG_SEMAPHORE, GPU NVENC (giới hạn slot) hoặc CPU libx264 ---
     ok = False
     with FFMPEG_SEMAPHORE:
         try:
-            use_gpu = has_nvenc()
-            last_err = ""
-            for try_gpu in ([True, False] if use_gpu else [False]):
+            def _build(try_gpu: bool) -> list[str]:
                 cmd = list(base_cmd) + _video_encode_args(try_gpu)
                 if has_audio:
                     cmd.extend(["-c:a", "aac", "-b:a", "192k"])
-                cmd.append(output_path)
-                res = _run_ffmpeg_cmd(cmd, timeout=90)
-                if res.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 1000:
-                    ok = True
-                    break
-                last_err = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
-                _safe_remove(output_path)
+                cmd.extend(["-movflags", "+faststart", output_path])
+                return cmd
+
+            ok, last_err = _run_encode_with_gpu_fallback(_build, output_path, timeout=90)
             if not ok:
                 log.warning("ghep_anh_12s failed: %s", last_err)
                 return False
