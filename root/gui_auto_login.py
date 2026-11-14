@@ -54,6 +54,13 @@ except ImportError:
     CFG = None
     Store = None
 
+from mail_otp_api import (
+    fetch_otp_dongvan_or_smail1s,
+    is_recent_mail_time,
+    parse_mail_time,
+    snapshot_mailbox,
+)
+
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -100,37 +107,6 @@ def find_chrome_path() -> str:
 
 def format_cookie_header(cookies: dict[str, str]) -> str:
     return "; ".join([f"{k}={v}" for k, v in cookies.items()])
-
-
-def parse_dongvan_time(time_str: str):
-    """Cột thời gian DongVanFB 'HH:MM - D/M/YYYY' -> datetime (None nếu không đọc được)."""
-    try:
-        m = re.search(r'(\d{1,2}):(\d{2})\s*-\s*(\d{1,2})/(\d{1,2})/(\d{4})', time_str or "")
-        if not m:
-            return None
-        h, mi, d, mo, y = map(int, m.groups())
-        return datetime(y, mo, d, h, mi)
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def is_recent_dongvan_time(time_str: str, max_age_seconds: int = 3600) -> bool:
-    """Kiểm tra xem email trên DongVanFB có phải là email nhận gần đây hay không."""
-    try:
-        m = re.search(r'(\d{1,2}):(\d{2})\s*-\s*(\d{1,2})/(\d{1,2})/(\d{4})', time_str)
-        if not m:
-            return True
-        h, mi, d, mo, y = map(int, m.groups())
-        now = datetime.now()
-        # Nếu khác ngày (ví dụ thư từ những ngày trước) -> bỏ qua
-        if (d, mo, y) != (now.day, now.month, now.year):
-            return False
-        email_dt = datetime(y, mo, d, h, mi)
-        diff = (now - email_dt).total_seconds()
-        # Cho phép nhận trong vòng 1 tiếng, dung sai lệch đồng hồ tối đa 15 phút (-900s)
-        return -900 <= diff <= max_age_seconds
-    except Exception:
-        return True
 
 
 # ============================================================================
@@ -442,141 +418,9 @@ def tuan89_extract_otp(mail: dict) -> str | None:
 
 # ============================================================================
 # NGUỒN ĐỌC OTP CHÍNH (DONGVANFB OAUTH2 API - https://docs.dongvanfb.net/)
-# Không cần mở trình duyệt vào dongvanfb.net/read_mail_box: gọi thẳng API JSON:
-#   1) POST https://tools.dongvanfb.net/api/get_messages_oauth2  {email, refresh_token, client_id}
-#   2) POST https://tools.dongvanfb.net/api/get_code_oauth2      {email, refresh_token, client_id, type: "all"}
+# & NGUỒN DỰ PHÒNG (SMAIL1S API - https://smail1s.com/api-docs)
+# Toàn bộ logic API dùng chung nằm tại mail_otp_api.py
 # ============================================================================
-DONGVAN_API_MESSAGES = "https://tools.dongvanfb.net/api/get_messages_oauth2"
-DONGVAN_API_CODE = "https://tools.dongvanfb.net/api/get_code_oauth2"
-DONGVAN_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-
-
-def parse_dongvan_oauth2(acc_line: str, fallback_email: str = "") -> tuple[str, str, str] | None:
-    """Tách (email, refresh_token, client_id) từ dòng tài khoản định dạng:
-      - email|pass|refresh_token|client_id
-      - email|refresh_token|client_id
-    """
-    parts = [p.strip() for p in (acc_line or "").split("|") if p.strip()]
-    if len(parts) < 3:
-        return None
-    email = (fallback_email or parts[0]).strip()
-    client_id = ""
-    refresh_token = ""
-    for p in parts[1:]:
-        if not client_id and DONGVAN_UUID_RE.match(p):
-            client_id = p
-        elif not refresh_token and (p.startswith("M.") or len(p) >= 40) and not DONGVAN_UUID_RE.match(p):
-            refresh_token = p
-    if not refresh_token and len(parts) >= 4:
-        refresh_token = parts[2]
-    if not client_id and len(parts) >= 4:
-        client_id = parts[3]
-    elif not client_id and len(parts) == 3:
-        client_id = parts[2]
-        if not refresh_token:
-            refresh_token = parts[1]
-    if email and refresh_token and client_id:
-        return email, refresh_token, client_id
-    return None
-
-
-def dongvan_api_fetch_messages(email: str, refresh_token: str, client_id: str, timeout: float = 15.0) -> list[dict] | None:
-    """Gọi POST https://tools.dongvanfb.net/api/get_messages_oauth2 lấy danh sách thư trong hòm thư."""
-    import urllib.request
-    payload = {
-        "email": email.strip(),
-        "refresh_token": refresh_token.strip(),
-        "client_id": client_id.strip(),
-    }
-    try:
-        req = urllib.request.Request(
-            DONGVAN_API_MESSAGES,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        if isinstance(data, dict):
-            msgs = data.get("messages")
-            if isinstance(msgs, list):
-                return msgs
-            if "status" in data:
-                return []
-    except Exception:  # noqa: BLE001
-        pass
-    return None
-
-
-def dongvan_api_fetch_code(email: str, refresh_token: str, client_id: str, timeout: float = 12.0) -> dict | None:
-    """Gọi POST https://tools.dongvanfb.net/api/get_code_oauth2 (dự phòng)."""
-    import urllib.request
-    payload = {
-        "email": email.strip(),
-        "refresh_token": refresh_token.strip(),
-        "client_id": client_id.strip(),
-        "type": "all",
-    }
-    try:
-        req = urllib.request.Request(
-            DONGVAN_API_CODE,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        return data if isinstance(data, dict) else None
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def dongvan_msg_sig(mail: dict) -> str:
-    """Chữ ký nhận diện 1 bức thư trên DongVanFB để phân biệt thư cũ (trước khi bấm Continue) và thư mới."""
-    if not isinstance(mail, dict):
-        return ""
-    uid = str(mail.get("uid") or mail.get("id") or "").strip()
-    if uid:
-        return uid
-    dt = str(mail.get("date") or "").strip()
-    subj = str(mail.get("subject") or "").strip()
-    body = str(mail.get("message") or mail.get("body") or mail.get("content") or "")
-    return f"{dt}|{subj}|{len(body)}"
-
-
-def dongvan_extract_otp(mail: dict) -> str | None:
-    """Bóc mã OTP 6 số từ 1 thư trả về bởi get_messages_oauth2 của DongVanFB."""
-    if not isinstance(mail, dict):
-        return None
-    from_addr = str(mail.get("from") or "").lower()
-    subject = str(mail.get("subject") or "")
-    # Bỏ qua thư cảnh báo bảo mật của chính Microsoft để không lấy nhầm số trong nội dung
-    if "microsoft.com" in from_addr and "meta" not in subject.lower() and "muse" not in subject.lower():
-        return None
-    code_field = str(mail.get("code") or "").strip()
-    if code_field and re.fullmatch(r"\d{6}", code_field):
-        return code_field
-    body = str(mail.get("message") or mail.get("body") or mail.get("content") or "")
-    body = re.sub(r"(?is)<(style|script)\b.*?</\1>", " ", body)
-    body = re.sub(r"(?s)<[^>]+>", " ", body)
-    body = re.sub(r"&nbsp;|&#160;", " ", body)
-    text = re.sub(r"#[0-9a-fA-F]{3,8}\b", " ", f"{subject} {body}")
-    m = re.search(
-        r"(?:confirmation\s+code|use\s+code|login\s+code|security\s+code|verification\s+code|dùng\s+mã|mã\s+đăng\s+nhập|mã\s+xác\s+nhận|mã|code)\D{0,45}?(\d{6})\b",
-        text,
-        re.IGNORECASE,
-    )
-    if not m:
-        m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-    return m.group(1) if m else None
 
 
 def safe_activate_tab(page, tab_or_idx=0):
@@ -649,8 +493,8 @@ class LoginWorker(threading.Thread):
                 import proxy_manager as pm
                 fport = pm.start_local_forwarder(self.proxy_str)
                 co.set_argument(f"--proxy-server=http://127.0.0.1:{fport}")
-                # Trang đọc hòm thư (DongVanFB) đi thẳng, không qua proxy: nhanh và tránh proxy chặn làm không đọc được OTP
-                co.set_argument("--proxy-bypass-list=dongvanfb.net;*.dongvanfb.net;tuan89.site;*.tuan89.site;lay2fa.xyz;*.lay2fa.xyz;nguyenmaucole.io.vn;*.nguyenmaucole.io.vn;localhost;127.0.0.1")
+                # Trang đọc hòm thư đi thẳng, không qua proxy: nhanh và tránh proxy chặn làm không đọc được OTP
+                co.set_argument("--proxy-bypass-list=dongvanfb.net;*.dongvanfb.net;smail1s.com;*.smail1s.com;tuan89.site;*.tuan89.site;lay2fa.xyz;*.lay2fa.xyz;nguyenmaucole.io.vn;*.nguyenmaucole.io.vn;localhost;127.0.0.1")
             except Exception as exc:  # noqa: BLE001
                 self.controller.log(f"[Luồng {self.worker_id}] Không bật được proxy ({exc}) -> chạy IP thật")
         if prof:
@@ -795,9 +639,9 @@ class LoginWorker(threading.Thread):
             row_text = " ".join(row)
             time_col = row[3] if len(row) > 3 else ""
             # Kiểm tra xem thư này có phải thư mới nhận hôm nay hay không
-            if not is_recent_dongvan_time(time_col):
+            if not is_recent_mail_time(time_col):
                 continue
-            mail_dt = parse_dongvan_time(time_col)
+            mail_dt = parse_mail_time(time_col)
             if not_before is not None and mail_dt is not None and mail_dt < not_before:
                 continue   # thư cũ (trước lần yêu cầu mã này)
 
@@ -1017,57 +861,28 @@ class LoginWorker(threading.Thread):
         return None
 
     def _otp_from_dongvan(self, page, dongvan_tab, row_idx: int, acc_line: str, email: str, seen: set[str] | None = None) -> str | None:
-        """Đọc OTP qua DongVanFB OAuth2 API (https://tools.dongvanfb.net/api/get_messages_oauth2) — không cần mở trình duyệt."""
-        creds = parse_dongvan_oauth2(acc_line, email)
-        if not creds:
-            self.controller.log(
-                f"[Luồng {self.worker_id}] [{email}] ❌ Dòng tài khoản thiếu refresh_token hoặc client_id để gọi API DongVanFB!"
-            )
-            return None
-
-        dv_email, dv_rt, dv_cid = creds
+        """Đọc OTP qua DongVanFB OAuth2 API (https://docs.dongvanfb.net/), tự chuyển sang https://smail1s.com/api-docs nếu DongVanFB không lấy được."""
         self.controller.update_status(row_idx, "Đang lấy OTP qua API DongVanFB...", "#fbbf24")
-        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đọc OTP qua API DongVanFB (tools.dongvanfb.net/api/get_messages_oauth2)...")
+        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đọc OTP qua API DongVanFB (dự phòng Smail1s.com)...")
 
         not_before = getattr(self, "_otp_not_before", None)
         used = self.controller.used_otps(email)
 
-        for attempt in range(1, OTP_READ_ATTEMPTS + 1):
-            if not self.controller.is_running:
-                return None
-            self.controller.update_status(row_idx, f"Đang lấy OTP DongVanFB API (lần {attempt}/{OTP_READ_ATTEMPTS})...", "#fbbf24")
-
-            msgs = dongvan_api_fetch_messages(dv_email, dv_rt, dv_cid)
-            if msgs is None:
-                self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đang kết nối API DongVanFB (lần {attempt}/{OTP_READ_ATTEMPTS})...")
-            else:
-                for mail in msgs:
-                    sig = dongvan_msg_sig(mail)
-                    if seen is not None and sig and sig in seen:
-                        continue
-                    date_str = str(mail.get("date") or "").strip()
-                    if date_str:
-                        if not is_recent_dongvan_time(date_str):
-                            continue
-                        mail_dt = parse_dongvan_time(date_str)
-                        if not_before is not None and mail_dt is not None and mail_dt < not_before:
-                            continue
-                    code = dongvan_extract_otp(mail)
-                    if code and code not in used:
-                        return code
-
-            # Dự phòng gọi get_code_oauth2 nếu get_messages_oauth2 chưa trả mã
-            code_resp = dongvan_api_fetch_code(dv_email, dv_rt, dv_cid)
-            if isinstance(code_resp, dict):
-                direct_code = str(code_resp.get("code") or "").strip()
-                if direct_code and re.fullmatch(r"\d{6}", direct_code) and direct_code not in used:
-                    return direct_code
-
-            if attempt < OTP_READ_ATTEMPTS and self.controller.is_running:
-                self.controller.log(f"[Luồng {self.worker_id}] [{email}] Chưa thấy thư OTP mới trên API DongVanFB (lần {attempt}/{OTP_READ_ATTEMPTS}), chờ 4s...")
-                time.sleep(4)
-
-        return None
+        code, src = fetch_otp_dongvan_or_smail1s(
+            acc_line=acc_line,
+            email=email,
+            attempts=OTP_READ_ATTEMPTS,
+            interval_sec=4.0,
+            seen=seen,
+            used_otps=used,
+            not_before=not_before,
+            is_running_fn=lambda: self.controller.is_running,
+            on_status=lambda msg: self.controller.update_status(row_idx, msg, "#fbbf24"),
+            on_log=lambda msg: self.controller.log(f"[Luồng {self.worker_id}] [{email}] {msg}"),
+        )
+        if code and src.startswith("smail1s"):
+            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Lấy OTP thành công qua nguồn dự phòng {src}.")
+        return code
 
     def process_single_account(self, page: ChromiumPage, dongvan_tab, row_idx: int, acc_line: str, email: str):
         if not self.controller.is_running:
@@ -1202,19 +1017,11 @@ class LoginWorker(threading.Thread):
 
         dongvan_seen: set[str] | None = None
         if not (is_tuan89_account(acc_line, email) or is_lay2fa_account(acc_line, email) or is_mailapi_email(email)):
-            dv_creds = parse_dongvan_oauth2(acc_line, email)
-            if dv_creds:
-                dv_em, dv_rt, dv_cid = dv_creds
-                before_dv = dongvan_api_fetch_messages(dv_em, dv_rt, dv_cid, timeout=10.0)
-                if before_dv is not None:
-                    dongvan_seen = set()
-                    for m in before_dv:
-                        sig = dongvan_msg_sig(m)
-                        if sig:
-                            dongvan_seen.add(sig)
-                        old_c = dongvan_extract_otp(m)
-                        if old_c:
-                            self.controller.remember_otp(email, old_c)
+            dongvan_seen = snapshot_mailbox(
+                acc_line,
+                email,
+                remember_otp_fn=lambda c: self.controller.remember_otp(email, c),
+            )
 
         # Mốc thời gian yêu cầu mã (dung sai 2 phút): chỉ nhận thư gửi SAU mốc này
         self._otp_not_before = datetime.now().replace(second=0, microsecond=0) - timedelta(minutes=2)

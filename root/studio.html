@@ -3938,12 +3938,13 @@
 
   // Giữ tối đa N dòng: nối chuỗi innerText vô hạn khiến mỗi dòng log mới phải vẽ lại toàn bộ khung (càng chạy lâu càng lag).
   const SHOPEE_LOG_MAX_LINES = 400;
-  function appendShopeeLog(msg) {
+  function appendShopeeLog(msg, color = "") {
     const logEl = document.getElementById("shopeeLiveLog");
     if (!logEl) return;
     const time = new Date().toLocaleTimeString("vi-VN", {hour: "2-digit", minute: "2-digit", second: "2-digit"});
     const line = document.createElement("div");
     line.textContent = `[${time}] ${msg}`;
+    if (color) line.style.color = color;
     logEl.appendChild(line);
     while (logEl.childElementCount > SHOPEE_LOG_MAX_LINES) {
       logEl.removeChild(logEl.firstElementChild);
@@ -4725,7 +4726,7 @@
       }
       const saveData = saveOut16.data || {};
       const finalSavedPath = saveData.saved_path || `${outDir}/${targetFileName}`;
-      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video 16s hoàn chỉnh vào: ${finalSavedPath}`);
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video 16s hoàn chỉnh vào: ${finalSavedPath}`, "#4ade80");
 
       if (!prod._is_imported) {
         await fetch(shopeeBgUrl("/api/shopee/complete"), {
@@ -4934,11 +4935,11 @@
     const saveData = saveOut.data || {};
     const finalSavedPath = saveData.saved_path || `${outDir}/${targetFileName}`;
     if (saveData.stitched) {
-      appendShopeeLog(`✓ [Luồng ${workerId}] Đã ghép ảnh Outro thành công (12s) vào: ${finalSavedPath}`);
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã ghép ảnh Outro thành công (12s) vào: ${finalSavedPath}`, "#4ade80");
     } else if (effectiveIs16s) {
-      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video 16s hoàn chỉnh vào: ${finalSavedPath}`);
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video 16s hoàn chỉnh vào: ${finalSavedPath}`, "#4ade80");
     } else {
-      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video vào: ${finalSavedPath}`);
+      appendShopeeLog(`✓ [Luồng ${workerId}] Đã lưu video vào: ${finalSavedPath}`, "#4ade80");
     }
 
     if (!prod._is_imported) {
@@ -5599,7 +5600,7 @@
       const failList = data.failed || [];
 
       okList.forEach(item => {
-        appendShopeeLog(`   + Đã xuất xong video SP ${item.item_id}: ${item.filename}`);
+        appendShopeeLog(`   + Đã xuất xong video SP ${item.item_id}: ${item.filename}`, "#4ade80");
       });
       // Luôn in cả danh sách thất bại, kể cả khi có clip ghép thành công
       failList.forEach(item => {
