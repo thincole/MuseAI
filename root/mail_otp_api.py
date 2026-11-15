@@ -2,12 +2,15 @@
   1. DongVanFB OAuth2 API (chính): https://tools.dongvanfb.net/api/get_messages_oauth2 & get_code_oauth2
   2. Smail1s API (dự phòng khi DongVanFB không lấy được): https://smail1s.com/api-docs
      - POST https://smail1s.com/get_messages  {mode: "oauth" | "graph" | "roundcube" | "emailfake", data: ...}
+  3. TempMail.Plus API (cho @merepost.com / tempmail.plus): https://tempmail.plus/api/mails
 """
 from __future__ import annotations
 
+import email.utils
 import json
 import re
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from typing import Callable
@@ -15,6 +18,17 @@ from typing import Callable
 DONGVAN_API_MESSAGES = "https://tools.dongvanfb.net/api/get_messages_oauth2"
 DONGVAN_API_CODE = "https://tools.dongvanfb.net/api/get_code_oauth2"
 SMAIL1S_API_MESSAGES = "https://smail1s.com/get_messages"
+TEMPMAIL_PLUS_API_MAILS = "https://tempmail.plus/api/mails"
+TEMPMAIL_PLUS_DOMAINS = (
+    "@merepost.com",
+    "@mailto.plus",
+    "@fexpost.com",
+    "@fexbox.org",
+    "@mailbox.in.ua",
+    "@rover.info",
+    "@fextemp.com",
+    "@any.pink",
+)
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -29,12 +43,13 @@ DEFAULT_HEADERS = {
 
 
 def parse_mail_time(time_str: str) -> datetime | None:
-    """Chuyển đổi chuỗi thời gian thư từ DongVanFB hoặc Smail1s sang datetime (giờ nội bộ, naive).
+    """Chuyển đổi chuỗi thời gian thư từ DongVanFB, Smail1s hoặc TempMail.Plus sang datetime (giờ nội bộ, naive).
 
     Hỗ trợ các định dạng:
       - 'HH:MM - D/M/YYYY' (DongVanFB, Smail1s oauth)
       - ISO-8601 UTC/Offset: '2026-11-13T17:33:02Z' (Smail1s graph / emailfake)
       - 'YYYY-MM-DD HH:MM[:SS]' (Smail1s roundcube / docs)
+      - RFC 2822 Email Date: 'Sat, 14 Nov 2026 19:37:51 -0800' (TempMail.Plus detail API)
     """
     s = str(time_str or "").strip()
     if not s:
@@ -60,6 +75,15 @@ def parse_mail_time(time_str: str) -> datetime | None:
         try:
             y, mo, d, h, mi, sec = m_ymd.groups()
             return datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec or 0))
+        except Exception:  # noqa: BLE001
+            pass
+    if "," in s or re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", s):
+        try:
+            dt = email.utils.parsedate_to_datetime(s)
+            if dt is not None:
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone().replace(tzinfo=None)
+                return dt
         except Exception:  # noqa: BLE001
             pass
     return None
@@ -132,6 +156,96 @@ def format_smail1s_oauth_data(acc_line: str, fallback_email: str = "") -> str | 
             return "|".join(parts)
         return "|".join([email] + parts[1:])
     return f"{email}|x|{rt}|{cid}"
+
+
+def is_tempmailplus_account(acc_line: str = "", email: str = "") -> bool:
+    """Kiểm tra tài khoản có sử dụng hòm thư https://tempmail.plus (ví dụ @merepost.com) hay không."""
+    em = str(email or "").strip().lower()
+    if any(em.endswith(dom) for dom in TEMPMAIL_PLUS_DOMAINS):
+        return True
+    line_low = str(acc_line or "").lower()
+    if "tempmail.plus" in line_low:
+        return True
+    return any(dom in line_low for dom in TEMPMAIL_PLUS_DOMAINS)
+
+
+def parse_tempmailplus_creds(acc_line: str, fallback_email: str = "") -> tuple[str, str] | None:
+    """Tách (email, epin) cho TempMail.Plus từ dòng `email|epin|...` hoặc `email`."""
+    parts = [p.strip() for p in (acc_line or "").split("|") if p.strip()]
+    email_addr = (fallback_email or (parts[0] if parts else "")).strip()
+    if not any(email_addr.lower().endswith(dom) for dom in TEMPMAIL_PLUS_DOMAINS):
+        for p in parts:
+            if "@" in p and not p.startswith("http"):
+                email_addr = p
+                break
+    if "@" not in email_addr or email_addr.startswith("http"):
+        return None
+
+    epin = ""
+    m_ep = re.search(r"(?:^|[?&#|!])epin=([A-Za-z0-9_\-]+)", acc_line or "", re.IGNORECASE)
+    if m_ep:
+        epin = m_ep.group(1).strip()
+    elif len(parts) >= 2:
+        cand = parts[1]
+        if not cand.startswith("http") and "@" not in cand and len(cand) < 64:
+            epin = cand
+    return email_addr, epin
+
+
+def _get_json(url: str, timeout: float = 12.0) -> dict | list | None:
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": DEFAULT_HEADERS["User-Agent"],
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def tempmailplus_fetch_messages(
+    email: str,
+    epin: str = "",
+    limit: int = 20,
+    timeout: float = 12.0,
+) -> list[dict] | None:
+    """Gọi GET https://tempmail.plus/api/mails?email=...&limit=20&epin=... lấy danh sách thư."""
+    url = (
+        f"{TEMPMAIL_PLUS_API_MAILS}"
+        f"?email={urllib.parse.quote(email.strip())}"
+        f"&limit={int(limit)}"
+        f"&epin={urllib.parse.quote(epin.strip())}"
+    )
+    data = _get_json(url, timeout=timeout)
+    if not isinstance(data, dict):
+        return None
+    if data.get("result") is True and isinstance(data.get("mail_list"), list):
+        return data["mail_list"]
+    return None
+
+
+def tempmailplus_fetch_detail(
+    email: str,
+    mail_id: int | str,
+    epin: str = "",
+    timeout: float = 12.0,
+) -> dict | None:
+    """Gọi GET https://tempmail.plus/api/mails/<mail_id>?email=...&epin=... lấy nội dung và giờ RFC2822."""
+    url = (
+        f"{TEMPMAIL_PLUS_API_MAILS}/{urllib.parse.quote(str(mail_id))}"
+        f"?email={urllib.parse.quote(email.strip())}"
+        f"&epin={urllib.parse.quote(epin.strip())}"
+    )
+    data = _get_json(url, timeout=timeout)
+    if isinstance(data, dict) and data.get("result") is True:
+        return data
+    return None
 
 
 def _post_json(url: str, payload: dict, timeout: float = 15.0) -> dict | list | None:
@@ -230,14 +344,14 @@ def smail1s_fetch_messages(
 
 
 def mail_msg_sigs(mail: dict) -> list[str]:
-    """Tạo các chữ ký nhận diện 1 bức thư, khớp chéo được cả giữa DongVanFB và Smail1s (oauth/graph)."""
+    """Tạo các chữ ký nhận diện 1 bức thư, khớp chéo được cả giữa DongVanFB, Smail1s và TempMail.Plus."""
     if not isinstance(mail, dict):
         return []
     sigs: list[str] = []
-    uid = str(mail.get("uid") or mail.get("id") or "").strip()
+    uid = str(mail.get("uid") or mail.get("id") or mail.get("mail_id") or "").strip()
     if uid:
         sigs.append(f"uid:{uid}")
-    raw_dt = str(mail.get("date") or "").strip()
+    raw_dt = str(mail.get("date") or mail.get("time") or "").strip()
     parsed_dt = parse_mail_time(raw_dt)
     dt_norm = parsed_dt.strftime("%Y-%m-%d %H:%M") if parsed_dt else raw_dt
     subj = str(mail.get("subject") or "").strip()
@@ -247,10 +361,10 @@ def mail_msg_sigs(mail: dict) -> list[str]:
 
 
 def extract_mail_otp(mail: dict) -> str | None:
-    """Bóc mã OTP 6 số từ 1 thư của DongVanFB hoặc Smail1s."""
+    """Bóc mã OTP 6 số từ 1 thư của DongVanFB, Smail1s hoặc TempMail.Plus."""
     if not isinstance(mail, dict):
         return None
-    from_addr = str(mail.get("from") or "").lower()
+    from_addr = str(mail.get("from") or mail.get("from_mail") or "").lower()
     subject = str(mail.get("subject") or "")
     # Bỏ qua thư cảnh báo bảo mật của chính Microsoft để không lấy nhầm số trong nội dung
     if "microsoft.com" in from_addr and "meta" not in subject.lower() and "muse" not in subject.lower():
@@ -258,7 +372,15 @@ def extract_mail_otp(mail: dict) -> str | None:
     code_field = str(mail.get("code") or "").strip()
     if code_field and re.fullmatch(r"\d{6}", code_field):
         return code_field
-    body = str(mail.get("message") or mail.get("bodyText") or mail.get("body") or mail.get("content") or "")
+    body = str(
+        mail.get("message")
+        or mail.get("bodyText")
+        or mail.get("text")
+        or mail.get("body")
+        or mail.get("content")
+        or mail.get("html")
+        or ""
+    )
     body = re.sub(r"(?is)<(style|script)\b.*?</\1>", " ", body)
     body = re.sub(r"(?s)<[^>]+>", " ", body)
     body = re.sub(r"&nbsp;|&#160;", " ", body)
@@ -305,20 +427,25 @@ def snapshot_mailbox(
 ) -> set[str] | None:
     """Chụp danh sách thư đang có trước khi bấm Continue để sau đó chỉ nhận thư OTP MỚI.
 
-    Thử DongVanFB trước; nếu DongVanFB lỗi/không trả về thì tự chụp qua Smail1s để không bị hổng bước lọc thư cũ.
+    Hỗ trợ TempMail.Plus (@merepost.com), DongVanFB OAuth2 và dự phòng Smail1s.
     """
     msgs: list[dict] | None = None
-    dv_creds = parse_dongvan_oauth2(acc_line, email)
-    if dv_creds:
-        msgs = dongvan_api_fetch_messages(*dv_creds, timeout=10.0)
-        if msgs is None:
-            msgs = smail1s_fetch_messages(acc_line, mode="oauth", fallback_email=email, timeout=12.0)
-        if msgs is None:
-            msgs = smail1s_fetch_messages(acc_line, mode="graph", fallback_email=email, timeout=12.0)
-    elif parse_roundcube_creds(acc_line, email):
-        msgs = smail1s_fetch_messages(acc_line, mode="roundcube", fallback_email=email, timeout=12.0)
-    elif "@" in (email or ""):
-        msgs = smail1s_fetch_messages(acc_line, mode="emailfake", fallback_email=email, timeout=12.0)
+    if is_tempmailplus_account(acc_line, email):
+        tm_creds = parse_tempmailplus_creds(acc_line, email)
+        if tm_creds:
+            msgs = tempmailplus_fetch_messages(tm_creds[0], tm_creds[1], timeout=12.0)
+    else:
+        dv_creds = parse_dongvan_oauth2(acc_line, email)
+        if dv_creds:
+            msgs = dongvan_api_fetch_messages(*dv_creds, timeout=10.0)
+            if msgs is None:
+                msgs = smail1s_fetch_messages(acc_line, mode="oauth", fallback_email=email, timeout=12.0)
+            if msgs is None:
+                msgs = smail1s_fetch_messages(acc_line, mode="graph", fallback_email=email, timeout=12.0)
+        elif parse_roundcube_creds(acc_line, email):
+            msgs = smail1s_fetch_messages(acc_line, mode="roundcube", fallback_email=email, timeout=12.0)
+        elif "@" in (email or ""):
+            msgs = smail1s_fetch_messages(acc_line, mode="emailfake", fallback_email=email, timeout=12.0)
 
     if msgs is None:
         return None
@@ -332,6 +459,45 @@ def snapshot_mailbox(
             if old_c:
                 remember_otp_fn(old_c)
     return seen
+
+
+def _poll_tempmailplus_once(
+    email: str,
+    epin: str,
+    seen: set[str] | None,
+    used: set[str],
+    not_before: datetime | None,
+) -> tuple[str | None, bool]:
+    """Đọc 1 lượt trên TempMail.Plus; trả về (otp_code, api_ok)."""
+    msgs = tempmailplus_fetch_messages(email, epin, timeout=12.0)
+    if msgs is None:
+        return None, False
+
+    checked = 0
+    for mail in msgs:
+        sigs = mail_msg_sigs(mail)
+        if seen is not None and any(s in seen for s in sigs):
+            continue
+        if checked >= 5:
+            break
+        checked += 1
+
+        mid = mail.get("mail_id")
+        detail = tempmailplus_fetch_detail(email, mid, epin, timeout=12.0) if mid is not None else None
+        if isinstance(detail, dict):
+            # detail["date"] có múi giờ RFC2822 chuẩn; ưu tiên hơn mail["time"] (giờ server TempMail.Plus không kèm timezone)
+            merged = {**mail, **detail}
+            code = _pick_new_otp([merged], seen, used, not_before)
+            if code:
+                return code, True
+        elif seen is not None:
+            # Nếu detail lỗi tạm thời nhưng mail_id chắc chắn là thư mới sau khi bấm Continue -> bóc từ subject
+            fallback_item = dict(mail)
+            fallback_item.pop("date", None)
+            code = _pick_new_otp([fallback_item], seen, used, not_before)
+            if code:
+                return code, True
+    return None, True
 
 
 def _poll_smail1s_once(
@@ -380,6 +546,39 @@ def fetch_otp_dongvan_or_smail1s(
     Trả về (otp_code, source_label) trong đó source_label là 'dongvanfb' hoặc 'smail1s:<mode>'.
     """
     used = set(used_otps or ())
+
+    def _running() -> bool:
+        return True if is_running_fn is None else bool(is_running_fn())
+
+    # Hòm thư TempMail.Plus (@merepost.com, tempmail.plus, ...)
+    if is_tempmailplus_account(acc_line, email):
+        tm_creds = parse_tempmailplus_creds(acc_line, email)
+        if not tm_creds:
+            if on_log:
+                on_log("Không tách được địa chỉ email TempMail.Plus!")
+            return None, ""
+        tm_email, tm_epin = tm_creds
+        for attempt in range(1, attempts + 1):
+            if not _running():
+                return None, ""
+            if on_status:
+                on_status(f"Đang lấy OTP TempMail.Plus (lần {attempt}/{attempts})...")
+            if on_log and attempt == 1:
+                on_log(f"Đang đọc OTP qua API TempMail.Plus ({tm_email})...")
+            code, api_ok = _poll_tempmailplus_once(tm_email, tm_epin, seen, used, not_before)
+            if code:
+                return code, "tempmailplus"
+            if attempt < attempts and _running():
+                if on_log:
+                    msg = (
+                        f"Lỗi kết nối/epin TempMail.Plus (lần {attempt}/{attempts}), chờ {int(interval_sec)}s..."
+                        if not api_ok
+                        else f"Chưa thấy thư OTP mới trên TempMail.Plus (lần {attempt}/{attempts}), chờ {int(interval_sec)}s..."
+                    )
+                    on_log(msg)
+                time.sleep(interval_sec)
+        return None, ""
+
     dv_creds = parse_dongvan_oauth2(acc_line, email)
     has_oauth = dv_creds is not None
     has_roundcube = parse_roundcube_creds(acc_line, email) is not None
@@ -391,9 +590,6 @@ def fetch_otp_dongvan_or_smail1s(
 
     dv_consec_errors = 0
     smail_announced = False
-
-    def _running() -> bool:
-        return True if is_running_fn is None else bool(is_running_fn())
 
     for attempt in range(1, attempts + 1):
         if not _running():

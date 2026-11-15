@@ -456,6 +456,8 @@ class AccountRequest(BaseModel):
     batch: str | None = None          # 多行文本，每行一个账号
     expires: dict[str, int] = Field(default_factory=dict)   # cookie 名 -> 过期时间戳
     enabled: bool = False             # Mặc định tài khoản mới import vào ở trạng thái TẮT (không giao việc)
+    random_proxy: bool = False        # True: luôn gắn ngẫu nhiên proxy mới (dù TK cũ đã có proxy)
+    proxy_pool: list[str] | None = None  # Danh sách proxy dự phòng nếu Pool trên MuseAI Studio đang trống
 
 
 class AccountPatch(BaseModel):
@@ -2048,14 +2050,29 @@ def add_account(req: AccountRequest, _=Depends(admin_auth)):
     added: list[dict] = []
     seen: list[dict] = []          # 本次导入的所有 cookie，用来检查核心项是否齐全
 
+    def _attach_proxy_and_record(acc: dict, cookie_map: dict):
+        assigned_px = acc.get("proxy")
+        try:
+            import proxy_manager
+            assigned_px = proxy_manager.assign_random_proxy_for_account(
+                acc["id"],
+                fallback_pool=req.proxy_pool,
+                verify_async=True,
+                overwrite=bool(req.random_proxy),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Không gắn được proxy ngẫu nhiên cho TK %s: %s", acc.get("label", acc["id"]), exc)
+        added.append({"id": acc["id"], "label": acc["label"],
+                      "enabled": acc.get("enabled", False),
+                      "proxy": assigned_px,
+                      "cookie_count": len(cookie_map),
+                      "expires_at": acc.get("expires_at")})
+
     if req.batch:
         for label, cookies in parse_batch(req.batch):
             acc = store.add_account(cookies, label, enabled=req.enabled)
             seen.append(cookies)
-            added.append({"id": acc["id"], "label": acc["label"],
-                          "enabled": acc.get("enabled", False),
-                          "cookie_count": len(cookies),
-                          "expires_at": acc.get("expires_at")})
+            _attach_proxy_and_record(acc, cookies)
 
     cookies = dict(req.cookies)
     if req.cookie_header:
@@ -2063,10 +2080,7 @@ def add_account(req: AccountRequest, _=Depends(admin_auth)):
     if cookies:
         acc = store.add_account(cookies, req.label, cookies_exp=req.expires, enabled=req.enabled)
         seen.append(cookies)
-        added.append({"id": acc["id"], "label": acc["label"],
-                      "enabled": acc.get("enabled", False),
-                      "cookie_count": len(cookies),
-                      "expires_at": acc.get("expires_at")})
+        _attach_proxy_and_record(acc, cookies)
 
     if not added:
         raise HTTPException(400, "Không đọc được cookie nào, hãy kiểm tra định dạng")

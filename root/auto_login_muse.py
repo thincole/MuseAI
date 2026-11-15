@@ -49,7 +49,7 @@ except ImportError:
     CFG = None
     Store = None
 
-from mail_otp_api import fetch_otp_dongvan_or_smail1s, snapshot_mailbox
+from mail_otp_api import fetch_otp_dongvan_or_smail1s, is_tempmailplus_account, snapshot_mailbox
 
 try:
     from DrissionPage import ChromiumPage, ChromiumOptions
@@ -307,9 +307,12 @@ class MuseAutoLogin:
         return None
 
     def fetch_otp_from_dongvan(self, acc_line: str, email: str, max_wait_sec: int = 50, seen: set[str] | None = None) -> str | None:
-        """Đọc OTP qua DongVanFB OAuth2 API (docs.dongvanfb.net), dự phòng Smail1s API (smail1s.com/api-docs)."""
+        """Đọc OTP qua TempMail.Plus (nếu @merepost.com/tempmail.plus) hoặc DongVanFB OAuth2 + dự phòng Smail1s API."""
         attempts = max(1, (int(max_wait_sec) + 3) // 4)
-        log_info(f"[{email}] Đang đợi mã OTP qua API DongVanFB (dự phòng Smail1s.com, tối đa {max_wait_sec}s)...")
+        if is_tempmailplus_account(acc_line, email):
+            log_info(f"[{email}] Đang đợi mã OTP qua API TempMail.Plus (tối đa {max_wait_sec}s)...")
+        else:
+            log_info(f"[{email}] Đang đợi mã OTP qua API DongVanFB (dự phòng Smail1s.com, tối đa {max_wait_sec}s)...")
         code, src = fetch_otp_dongvan_or_smail1s(
             acc_line=acc_line,
             email=email,
@@ -323,8 +326,78 @@ class MuseAutoLogin:
             log_success(f"[{email}] Đã tìm thấy mã OTP qua {src_label}: {Colors.BOLD}{code}{Colors.ENDC}")
             return code
 
-        log_warn(f"[{email}] Quá thời gian {max_wait_sec}s không nhận được mã OTP trên API DongVanFB/Smail1s.")
+        log_warn(f"[{email}] Quá thời gian {max_wait_sec}s không nhận được mã OTP.")
         return None
+
+    def _save_account_to_studio(
+        self,
+        email: str,
+        cookies: dict,
+        cookies_exp: dict,
+        cookie_str: str,
+        save_to_store: bool,
+        prefix: str = "",
+        lock: threading.Lock | None = None,
+    ) -> None:
+        """Gửi tài khoản sang MuseAI Studio (hoặc ghi trực tiếp data/accounts.json) với trạng thái TẮT và gắn ngẫu nhiên Proxy."""
+        if not save_to_store:
+            return
+        synced_live = False
+        if CFG:
+            try:
+                import requests
+                url = f"http://127.0.0.1:{CFG.port}/admin/accounts"
+                headers = {"Authorization": f"Bearer {CFG.api_key}"} if CFG.api_key else {}
+                try:
+                    rl = requests.get(url, headers=headers, timeout=3)
+                    if rl.status_code == 200:
+                        for old_a in rl.json().get("accounts", []):
+                            if old_a.get("label") == email:
+                                requests.delete(f"{url}/{old_a['id']}", headers=headers, timeout=3)
+                except Exception:
+                    pass
+                payload = {
+                    "label": email,
+                    "cookies": cookies,
+                    "cookie_header": cookie_str,
+                    "expires": {k: int(v) for k, v in cookies_exp.items() if v > 0},
+                    "enabled": False,
+                    "random_proxy": True,
+                }
+                r = requests.post(url, json=payload, headers=headers, timeout=5)
+                if r.status_code == 200:
+                    synced_live = True
+                    assigned_px = None
+                    try:
+                        for item in (r.json().get("added") or []):
+                            if item.get("proxy") and not assigned_px:
+                                assigned_px = item.get("proxy")
+                            if item.get("id"):
+                                requests.patch(f"{url}/{item['id']}", json={"enabled": False}, headers=headers, timeout=5)
+                    except Exception:
+                        pass
+                    px_note = f", Proxy: {assigned_px}" if assigned_px else ""
+                    log_success(f"{prefix}[{email}] {Colors.BOLD}Đã nạp thành công vào MuseAI Studio (trạng thái TẮT{px_note})!{Colors.ENDC}")
+            except Exception:
+                pass
+
+        if not synced_live and self.store:
+            def _direct_save():
+                acc = self.store.add_account(cookies, label=email, cookies_exp=cookies_exp, enabled=False)
+                assigned_px = acc.get("proxy")
+                try:
+                    import proxy_manager as pm
+                    assigned_px = pm.assign_random_proxy_for_account(acc["id"], verify_async=False, overwrite=True)
+                except Exception:
+                    pass
+                px_note = f", Proxy: {assigned_px}" if assigned_px else ""
+                log_success(f"{prefix}[{email}] {Colors.BOLD}Đã lưu/ghi đè vào data/accounts.json (ID: {acc['id']}, trạng thái TẮT{px_note}).{Colors.ENDC}")
+
+            if lock is not None:
+                with lock:
+                    _direct_save()
+            else:
+                _direct_save()
 
     def login_account(self, acc_line: str) -> dict | None:
         """Quy trình đăng nhập 1 tài khoản hoàn chỉnh."""
@@ -739,39 +812,10 @@ class MuseAutoLogin:
                                 cstr = format_cookie_header(all_c)
                                 synced_live = False
 
-                                # Đồng bộ Live API máy chủ MuseAI Studio
-                                if save_to_store and CFG:
-                                    try:
-                                        import requests
-                                        url = f"http://127.0.0.1:{CFG.port}/admin/accounts"
-                                        headers = {"Authorization": f"Bearer {CFG.api_key}"} if CFG.api_key else {}
-                                        try:
-                                            rl = requests.get(url, headers=headers, timeout=3)
-                                            if rl.status_code == 200:
-                                                for old_a in rl.json().get("accounts", []):
-                                                    if old_a.get("label") == email:
-                                                        requests.delete(f"{url}/{old_a['id']}", headers=headers, timeout=3)
-                                        except Exception:
-                                            pass
-                                        payload = {
-                                            "label": email,
-                                            "cookies": all_c,
-                                            "cookie_header": cstr,
-                                            "expires": {k: int(v) for k, v in c_exp.items() if v > 0},
-                                            "enabled": False,
-                                        }
-                                        r = requests.post(url, json=payload, headers=headers, timeout=5)
-                                        if r.status_code == 200:
-                                            synced_live = True
-                                            try:
-                                                for item in (r.json().get("added") or []):
-                                                    if item.get("id"):
-                                                        requests.patch(f"{url}/{item['id']}", json={"enabled": False}, headers=headers, timeout=5)
-                                            except Exception:
-                                                pass
-                                            log_success(f"[Luồng {wid}] [{email}] {Colors.BOLD}Đã nạp thành công vào MuseAI Studio (trạng thái TẮT)!{Colors.ENDC}")
-                                    except Exception:
-                                        pass
+                                # Đồng bộ Live API máy chủ MuseAI Studio (trạng thái TẮT + gắn ngẫu nhiên Proxy)
+                                self._save_account_to_studio(
+                                    email, all_c, c_exp, cstr, save_to_store, prefix=f"[Luồng {wid}] ", lock=lock
+                                )
 
                                 with lock:
                                     success_count += 1
@@ -781,10 +825,6 @@ class MuseAutoLogin:
                                         "cookies_exp": c_exp,
                                         "time": int(time.time()),
                                     })
-                                    if save_to_store and not synced_live and self.store:
-                                        acc = self.store.add_account(all_c, label=email, cookies_exp=c_exp)
-                                        log_success(f"[Luồng {wid}] [{email}] {Colors.BOLD}Đã lưu/ghi đè vào data/accounts.json (ID: {acc['id']}){Colors.ENDC}")
-
                                     _update_export_txt(export_txt_path, email, cstr)
                             else:
                                 with lock:
@@ -848,45 +888,9 @@ class MuseAutoLogin:
                                 pass
 
                             cookie_str = format_cookie_header(res["cookies"])
-                            synced_live = False
-
-                            # Live API
-                            if save_to_store and CFG:
-                                try:
-                                    import requests
-                                    url = f"http://127.0.0.1:{CFG.port}/admin/accounts"
-                                    headers = {"Authorization": f"Bearer {CFG.api_key}"} if CFG.api_key else {}
-                                    try:
-                                        rl = requests.get(url, headers=headers, timeout=3)
-                                        if rl.status_code == 200:
-                                            for old_a in rl.json().get("accounts", []):
-                                                if old_a.get("label") == email:
-                                                    requests.delete(f"{url}/{old_a['id']}", headers=headers, timeout=3)
-                                    except Exception:
-                                        pass
-                                    payload = {
-                                        "label": email,
-                                        "cookies": res["cookies"],
-                                        "cookie_header": cookie_str,
-                                        "expires": {k: int(v) for k, v in res["cookies_exp"].items() if v > 0},
-                                        "enabled": False,
-                                    }
-                                    r = requests.post(url, json=payload, headers=headers, timeout=5)
-                                    if r.status_code == 200:
-                                        synced_live = True
-                                        try:
-                                            for item in (r.json().get("added") or []):
-                                                if item.get("id"):
-                                                    requests.patch(f"{url}/{item['id']}", json={"enabled": False}, headers=headers, timeout=5)
-                                        except Exception:
-                                            pass
-                                        log_success(f"[{email}] Đã nạp thành công vào MuseAI Studio (trạng thái TẮT)!")
-                                except Exception:
-                                    pass
-
-                            if save_to_store and not synced_live and self.store:
-                                acc = self.store.add_account(res["cookies"], label=email, cookies_exp=res["cookies_exp"])
-                                log_success(f"[{email}] Đã lưu/ghi đè vào data/accounts.json (ID: {acc['id']}).")
+                            self._save_account_to_studio(
+                                email, res["cookies"], res["cookies_exp"], cookie_str, save_to_store
+                            )
 
                             _update_export_txt(export_txt_path, email, cookie_str)
                             log_success(f"[{email}] Đã lưu/ghi đè dự phòng vào {export_txt_path}")

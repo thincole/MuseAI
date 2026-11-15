@@ -821,6 +821,85 @@ def assign_sticky_proxy(acc_id: str, proxy_str: str, ip: str = ""):
     log.info("📌 Đã gán proxy cố định cho TK %s: %s (IP: %s)", acc_id, proxy_str, ip or "Chưa kiểm tra")
 
 
+def _available_proxy_pool(fallback_pool: list[str] | None = None) -> list[str]:
+    """Lấy danh sách proxy khả dụng từ MuseAI Studio; chỉ dùng fallback_pool khi Studio chưa có proxy nào."""
+    pool = get_cached_proxy_pool()
+    if not pool:
+        try:
+            pool = load_proxies_from_thinaptm()
+        except Exception:  # noqa: BLE001
+            pool = []
+    if not pool and fallback_pool:
+        pool = normalize_proxy_lines(fallback_pool)[0]
+    return list(dict.fromkeys(str(p).strip() for p in (pool or []) if str(p).strip()))
+
+
+def assign_random_proxy_for_account(
+    acc_id: str,
+    fallback_pool: list[str] | None = None,
+    verify_async: bool = False,
+    overwrite: bool = False,
+) -> str | None:
+    """Gắn ngẫu nhiên 1 proxy từ Pool (ưu tiên proxy ít TK nhất) cho tài khoản mới/được gửi sang Muse AI.
+
+    Không thay đổi trạng thái `enabled` của tài khoản. Nếu `verify_async=True`, sẽ kiểm tra IP proxy
+    chạy nền để cập nhật `proxy_status`/`proxy_ip` hoặc tự xoay nếu proxy chết.
+    """
+    acc = store.get_account(acc_id)
+    if not acc:
+        return None
+
+    pool = _available_proxy_pool(fallback_pool=fallback_pool)
+    if not pool:
+        return acc.get("proxy")
+
+    cur_proxy = acc.get("proxy")
+    cur_dead = (acc.get("proxy_status") == "dead")
+    if not overwrite and cur_proxy and not cur_dead and cur_proxy in pool:
+        return cur_proxy
+
+    loads = _proxy_loads(pool, exclude_acc=acc_id)
+    candidates = [p for p in pool if p != cur_proxy] or pool
+    chosen = _least_loaded_first(candidates, loads)[0]
+
+    known_ip = ""
+    for other in store.list_accounts():
+        if other.get("proxy") == chosen and other.get("proxy_ip") and other.get("proxy_status") == "alive":
+            known_ip = str(other.get("proxy_ip"))
+            break
+
+    store.update_account(
+        acc_id,
+        proxy=chosen,
+        proxy_ip=known_ip,
+        proxy_status="alive" if known_ip else "unknown",
+        proxy_error="",
+        proxy_assigned_at=int(time.time()),
+    )
+    log.info("🎲 Đã gắn proxy ngẫu nhiên cho TK %s: %s%s",
+             acc.get("label", acc_id), chosen, f" (IP: {known_ip})" if known_ip else "")
+
+    if verify_async:
+        def _bg_verify():
+            try:
+                ok, ip_or_err = test_proxy(chosen)
+                latest = store.get_account(acc_id)
+                if not latest or latest.get("proxy") != chosen:
+                    return
+                if ok:
+                    store.update_account(acc_id, proxy_status="alive", proxy_ip=ip_or_err, proxy_error="")
+                else:
+                    store.update_account(acc_id, proxy_status="dead", proxy_error=ip_or_err)
+                    if is_proxy_enabled():
+                        ensure_alive_proxy_for_account(acc_id, force_check=True, force_rotate=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=_bg_verify, daemon=True, name=f"proxy-verify-{acc_id}").start()
+
+    return chosen
+
+
 def ensure_alive_proxy_for_account(acc_id: str, force_check: bool = False, force_rotate: bool = False) -> str | None:
     """Kiểm tra proxy của tài khoản. Nếu proxy còn sống, giữ nguyên (trừ khi force_rotate=True).
     Nếu chưa có proxy, proxy cũ đã chết (die), hoặc force_rotate=True, tự động chọn proxy mới còn sống từ Pool.

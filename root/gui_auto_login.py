@@ -57,6 +57,7 @@ except ImportError:
 from mail_otp_api import (
     fetch_otp_dongvan_or_smail1s,
     is_recent_mail_time,
+    is_tempmailplus_account,
     parse_mail_time,
     snapshot_mailbox,
 )
@@ -494,7 +495,7 @@ class LoginWorker(threading.Thread):
                 fport = pm.start_local_forwarder(self.proxy_str)
                 co.set_argument(f"--proxy-server=http://127.0.0.1:{fport}")
                 # Trang đọc hòm thư đi thẳng, không qua proxy: nhanh và tránh proxy chặn làm không đọc được OTP
-                co.set_argument("--proxy-bypass-list=dongvanfb.net;*.dongvanfb.net;smail1s.com;*.smail1s.com;tuan89.site;*.tuan89.site;lay2fa.xyz;*.lay2fa.xyz;nguyenmaucole.io.vn;*.nguyenmaucole.io.vn;localhost;127.0.0.1")
+                co.set_argument("--proxy-bypass-list=dongvanfb.net;*.dongvanfb.net;smail1s.com;*.smail1s.com;tempmail.plus;*.tempmail.plus;tuan89.site;*.tuan89.site;lay2fa.xyz;*.lay2fa.xyz;nguyenmaucole.io.vn;*.nguyenmaucole.io.vn;localhost;127.0.0.1")
             except Exception as exc:  # noqa: BLE001
                 self.controller.log(f"[Luồng {self.worker_id}] Không bật được proxy ({exc}) -> chạy IP thật")
         if prof:
@@ -861,9 +862,13 @@ class LoginWorker(threading.Thread):
         return None
 
     def _otp_from_dongvan(self, page, dongvan_tab, row_idx: int, acc_line: str, email: str, seen: set[str] | None = None) -> str | None:
-        """Đọc OTP qua DongVanFB OAuth2 API (https://docs.dongvanfb.net/), tự chuyển sang https://smail1s.com/api-docs nếu DongVanFB không lấy được."""
-        self.controller.update_status(row_idx, "Đang lấy OTP qua API DongVanFB...", "#fbbf24")
-        self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đọc OTP qua API DongVanFB (dự phòng Smail1s.com)...")
+        """Đọc OTP qua TempMail.Plus API (nếu @merepost.com/tempmail.plus) hoặc DongVanFB OAuth2 + dự phòng Smail1s."""
+        if is_tempmailplus_account(acc_line, email):
+            self.controller.update_status(row_idx, "Đang lấy OTP qua TempMail.Plus API...", "#fbbf24")
+            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đọc OTP qua API TempMail.Plus (tempmail.plus)...")
+        else:
+            self.controller.update_status(row_idx, "Đang lấy OTP qua API DongVanFB...", "#fbbf24")
+            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Đọc OTP qua API DongVanFB (dự phòng Smail1s.com)...")
 
         not_before = getattr(self, "_otp_not_before", None)
         used = self.controller.used_otps(email)
@@ -882,6 +887,8 @@ class LoginWorker(threading.Thread):
         )
         if code and src.startswith("smail1s"):
             self.controller.log(f"[Luồng {self.worker_id}] [{email}] Lấy OTP thành công qua nguồn dự phòng {src}.")
+        elif code and src == "tempmailplus":
+            self.controller.log(f"[Luồng {self.worker_id}] [{email}] Lấy OTP thành công qua TempMail.Plus.")
         return code
 
     def process_single_account(self, page: ChromiumPage, dongvan_tab, row_idx: int, acc_line: str, email: str):
@@ -1503,9 +1510,19 @@ class WorkerController(QThread):
         with open(self.export_txt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
+    def _fallback_proxy_pool(self) -> list[str]:
+        if self.proxy_source != PROXY_SRC_FILE:
+            return []
+        try:
+            import proxy_manager as pm
+            return _proxy_pool_for(pm, PROXY_SRC_FILE, self.proxy_file_path)
+        except Exception:  # noqa: BLE001
+            return []
+
     def save_account_success(self, row_idx: int, email: str, cookies: dict, cookies_exp: dict):
         cstr = format_cookie_header(cookies)
         synced_studio = False
+        fallback_pool = self._fallback_proxy_pool()
 
         # 1. Đồng bộ trực tiếp vào máy chủ MuseAI Studio đang chạy (Live API)
         if self.save_to_store and CFG:
@@ -1520,26 +1537,45 @@ class WorkerController(QThread):
                     "cookie_header": cstr,
                     "expires": {k: int(v) for k, v in cookies_exp.items() if v > 0},
                     "enabled": False,
+                    "random_proxy": True,
                 }
+                if fallback_pool:
+                    payload["proxy_pool"] = fallback_pool
                 r = requests.post(url, json=payload, headers=headers, timeout=5)
                 if r.status_code == 200:
                     synced_studio = True
+                    assigned_px = None
                     try:
-                        for item in (r.json().get("added") or []):
+                        added_list = r.json().get("added") or []
+                        for item in added_list:
+                            if item.get("proxy") and not assigned_px:
+                                assigned_px = item.get("proxy")
                             if item.get("id"):
                                 requests.patch(f"{url}/{item['id']}", json={"enabled": False}, headers=headers, timeout=5)
                     except Exception:
                         pass
-                    self.log(f"[✓] [{email}] Đã đồng bộ vào MuseAI Studio (trạng thái TẮT — không giao việc)!")
+                    px_note = f", Proxy: {assigned_px}" if assigned_px else ""
+                    self.log(f"[✓] [{email}] Đã đồng bộ vào MuseAI Studio (trạng thái TẮT{px_note})!")
             except Exception:
                 pass
 
         with self.lock:
-            # 2. Luôn ghi đè cập nhật vào data/accounts.json (trạng thái TẮT mặc định)
+            # 2. Luôn ghi đè cập nhật vào data/accounts.json (trạng thái TẮT mặc định + gắn random Proxy)
             if self.save_to_store and not synced_studio and self.store:
                 acc = self.store.add_account(cookies, label=email, cookies_exp=cookies_exp, enabled=False)
-                if True:
-                    self.log(f"[✓] [{email}] Đã ghi đè trực tiếp vào data/accounts.json (ID: {acc['id']}).")
+                assigned_px = acc.get("proxy")
+                try:
+                    import proxy_manager as pm
+                    assigned_px = pm.assign_random_proxy_for_account(
+                        acc["id"],
+                        fallback_pool=fallback_pool,
+                        verify_async=False,
+                        overwrite=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                px_note = f", Proxy: {assigned_px}" if assigned_px else ""
+                self.log(f"[✓] [{email}] Đã ghi đè trực tiếp vào data/accounts.json (ID: {acc['id']}, trạng thái TẮT{px_note}).")
 
             # 3. Ghi đè vào file text dự phòng
             try:
