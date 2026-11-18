@@ -1402,8 +1402,8 @@
                 <th>Số Cookie</th>
                 <th>Hạn Sử Dụng</th>
                 <th>Hạn Mức Token</th>
-                <th title="Số video đã ra VÀ ghép xong. Lượt dùng nhiều mà video ít = TK hay lỗi">Video Thành Công</th>
-                <th title="Thời điểm cuối cùng tài khoản xuất và lưu xong video thành công">Lần Cuối TC</th>
+                <th title="Số video thành công / Tổng số lượt hệ thống đã giao việc cho TK (kèm tỉ lệ thành công)">Video TC / Lượt Dùng</th>
+                <th title="Dòng trên: lần được giao việc gần nhất (kể cả lượt lỗi); Dòng dưới: lần tạo video thành công gần nhất">Hoạt Động Cuối</th>
                 <th>Thao Tác</th>
               </tr>
             </thead>
@@ -1678,7 +1678,7 @@
             </select>
 
             <span class="shopee-lbl" style="margin-left:8px;">Lưu Video:</span>
-            <input type="text" class="shopee-input" id="sp_out_dir" value="F:/Video AI/PH/shopapi" style="width:360px;">
+            <input type="text" class="shopee-input" id="sp_out_dir" value="" placeholder="Mặc định: thư mục output cạnh app" style="width:360px;">
             <button type="button" class="shopee-btn shopee-btn-blue" onclick="pickShopeeFolder()">Chọn</button>
           </div>
           </div>
@@ -1801,7 +1801,20 @@
                 <span style="font-size:12px;font-weight:700;color:#34d399;">🎞️ Luồng ghép FFmpeg:</span>
                 <input type="number" id="sp_ffmpeg_threads" min="1" max="64" value="16" style="width:58px;padding:4px 6px;background:#0d1117;border:1px solid #10b981;border-radius:6px;color:#34d399;font-weight:bold;text-align:center;font-size:12px;" onchange="onFfmpegConcurrencyChange()" title="Nhập số luồng ghép video FFmpeg chạy cùng lúc (1 - 64; khuyến nghị khoảng số luồng CPU / 3)">
               </div>
-              <input type="hidden" id="sp_jobs_per_account" value="1">
+              <div style="display:flex;align-items:center;gap:6px;background:rgba(168,85,247,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(168,85,247,0.35);" title="Số video chạy song song tối đa trên cùng 1 tài khoản Muse.ai. Chọn 2 video/TK để tăng tốc từng tài khoản (lệch pha 15-18s để tránh nghẽn VM).">
+                <span style="font-size:12px;font-weight:700;color:#c084fc;">🎬 Video/TK:</span>
+                <select class="shopee-select" id="sp_jobs_per_account" onchange="onJobsPerAccountChange()" style="font-weight:bold;color:#c084fc;padding:4px 8px;background:#0d1117;border-color:#a855f7;">
+                  <option value="1" selected>1 video / TK (Ổn định)</option>
+                  <option value="2">2 video / TK (Tăng tốc)</option>
+                </select>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;background:rgba(245,158,11,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(245,158,11,0.35);" title="Chia đều: quay vòng hết các TK (ít kẹt VM). Dồn TK: lấp đầy 2 slot và bám chặt các TK đang chạy để chạm limit 24h nhanh nhất trước khi chuyển TK khác.">
+                <span style="font-size:12px;font-weight:700;color:#fbbf24;">🎯 Chia TK:</span>
+                <select class="shopee-select" id="sp_account_dispatch_mode" onchange="onDispatchModeChange()" style="font-weight:bold;color:#fbbf24;padding:4px 8px;background:#0d1117;border-color:#f59e0b;">
+                  <option value="even" selected>Chia đều luân phiên</option>
+                  <option value="concentrate">Dồn TK (Chạm 24h nhanh)</option>
+                </select>
+              </div>
 
               <label style="display:flex;align-items:center;gap:5px;font-size:12px;font-weight:700;color:#a78bfa;cursor:pointer;" title="Khi hàng đợi sắp hết, tự nhận thêm lô SP mới từ Database (cùng bộ lọc) để batch chạy liên tục không phải bấm Nhận SP">
                 <input type="checkbox" id="sp_auto_claim" checked onchange="saveShopeeSettings()">
@@ -2995,11 +3008,22 @@
 
       tbody.innerHTML = shownAccs.map(a => {
         const isEnabled = a.enabled !== false;
+        const busySlots = a.busy_slots || 0;
+        const cdSec = a.cooldown_remaining || 0;
         let statusBadge = `<span class="status-pill unknown">Chưa kiểm tra</span>`;
         if (!isEnabled) {
-          statusBadge = `<span class="status-pill unknown" style="background:rgba(148,163,184,0.15);color:#cbd5e1;border:1px solid rgba(148,163,184,0.4);" title="Tài khoản đang ở trạng thái TẮT — phần mềm không giao việc cho TK này. Bấm nút Bật ở cột Thao Tác để cho phép nhận việc.">⚪ Đang tắt</span>`;
+          statusBadge = `<span class="status-pill unknown" style="background:rgba(148,163,184,0.15);color:#cbd5e1;border:1px solid rgba(148,163,184,0.4);" title="Tài khoản đang ở trạng thái TẮT — phần mềm không giao việc cho TK này. Bấm nút Tắt/Bật ở cột Thao Tác để cho phép nhận việc.">⚪ Đang tắt</span>`;
+        } else if (a.muse_locked) {
+          statusBadge = `<span class="status-pill bad" title="Tài khoản đang bị khoá — phần mềm không giao việc cho tới khi mở khoá.">🔒 Đã khoá</span>`;
+        } else if (busySlots > 0) {
+          statusBadge = `<span class="status-pill good" style="background:rgba(59,130,246,0.18);color:#60a5fa;border:1px solid rgba(59,130,246,0.45);" title="Tài khoản đang xử lý ${busySlots} luồng render.">⚡ Đang chạy (${busySlots})</span>`;
+        } else if (cdSec > 0) {
+          const cdStr = cdSec >= 3600 ? `${Math.floor(cdSec / 3600)}g${Math.round((cdSec % 3600) / 60)}p` : `${Math.max(1, Math.round(cdSec / 60))}p`;
+          statusBadge = `<span class="status-pill unknown" style="background:rgba(245,158,11,0.15);color:#fbbf24;border:1px solid rgba(245,158,11,0.45);" title="Đang tạm nghỉ (cooldown) do lỗi gần nhất; còn khoảng ${cdStr} sẽ tự động giao việc lại.">⏸ Nghỉ ${cdStr}</span>`;
+        } else if (a.quota_exhausted) {
+          statusBadge = `<span class="status-pill bad" title="Đã hết 100% gói tuần và 0 token phụ — hệ thống tạm bỏ qua TK này khi giao việc.">🔴 Hết sạch token</span>`;
         } else if (a.ok === true) {
-          statusBadge = `<span class="status-pill good">🟢 Hoạt động</span>`;
+          statusBadge = `<span class="status-pill good" title="Phiên hợp lệ, sẵn sàng nhận việc ngay khi tới lượt.">🟢 Sẵn sàng</span>`;
         } else if (a.ok === false) {
           statusBadge = `<span class="status-pill bad" title="${translateLegacyNote(a.note || '')}">🔴 Lỗi / Hết hạn</span>`;
         }
@@ -3027,7 +3051,8 @@
             displayNote = "🔒 Đã khoá — không giao việc";
           }
         }
-        const noteColor = a.muse_locked ? "#f87171" : (a.ok === true) ? "#34d399" : (a.ok === false ? "#f87171" : "var(--text-dim)");
+        const isInterruptWarn = !a.muse_locked && a.ok !== false && /Tác vụ gián đoạn|hết hạn ngạch|hết sạch|hết mức sử dụng|chỉ phản hồi văn bản|chặn khu vực|403 Region/i.test(displayNote);
+        const noteColor = a.muse_locked ? "#f87171" : (a.ok === false ? "#f87171" : (isInterruptWarn ? "#fbbf24" : (a.ok === true ? "#34d399" : "var(--text-dim)")));
         const noteHtml = displayNote ? `<div style="font-size:11px;color:${noteColor};margin-top:2px;">${displayNote}</div>` : "";
 
         let proxyHtml = `<span style="color:var(--text-dim);font-size:11px;">Chưa gán</span> <button class="btn-tiny" onclick="rotateAccountProxy('${a.id}')" style="margin-left:4px;padding:2px 6px;">Gán Proxy</button>`;
@@ -3167,26 +3192,46 @@
   }
 
   function successCellHtml(a) {
-      const ok = a.success_count || 0, used = Math.max(0, (a.use_count || 0) - (a.success_since_use || 0));
-      if (!used) return `<b>${ok}</b>`;
+      const ok = a.success_count || 0;
+      const totalUsed = a.use_count || 0;
+      const used = Math.max(0, totalUsed - (a.success_since_use || 0));
+      if (!used && !totalUsed) return `<b>${ok}</b>`;
+      const usedHtml = `<span style="font-size:11px;color:var(--text-dim);"> / ${totalUsed} lượt</span>`;
+      if (!used) return `<b>${ok}</b>${usedHtml}`;
       const rate = Math.min(100, Math.round(ok * 100 / used));
       // Tỉ lệ = video thành công / lượt dùng, đều tính từ lúc bản có cột này. Chỉ cảnh báo khi đã đủ lượt để kết luận.
       const color = used >= 20 && rate < 40 ? "#f87171" : (rate < 70 ? "#fbbf24" : "#4ade80");
-      return `<b>${ok}</b><div style="font-size:10.5px;color:${color};">${rate}% / lượt</div>`;
+      return `<b>${ok}</b>${usedHtml}<div style="font-size:10.5px;color:${color};">${rate}% TC</div>`;
   }
 
   function lastSuccessCellHtml(a) {
       const ok = a.success_count || 0;
-      if (!ok) return `<span style="font-size:11px;color:var(--text-dim);">Chưa có video</span>`;
-      const lastTs = resolveLastSuccessTs(a);
-      if (!lastTs) return `<span style="font-size:11px;color:var(--text-dim);">Không rõ</span>`;
-      const tInfo = formatSuccessTime(lastTs);
-      const minsAgo = (Date.now() / 1000 - lastTs) / 60;
-      const color = minsAgo <= 60 ? "#34d399" : (minsAgo <= 360 ? "#60a5fa" : "var(--text)");
-      return `<div title="Lần cuối tạo video thành công: ${tInfo.full}">
-        <div style="font-size:11.5px;font-weight:600;color:${color};">🕒 ${tInfo.rel}</div>
-        <div style="font-size:10.5px;color:var(--text-dim);font-family:monospace;margin-top:2px;">${tInfo.clock}</div>
-      </div>`;
+      const lastUsed = a.last_used ? Math.floor(a.last_used) : 0;
+      const lastTs = ok ? resolveLastSuccessTs(a) : 0;
+
+      let usedLine = `<div style="font-size:11px;color:var(--text-dim);">📤 Giao: Chưa từng</div>`;
+      if (lastUsed) {
+        const uInfo = formatSuccessTime(lastUsed);
+        const uMins = (Date.now() / 1000 - lastUsed) / 60;
+        const uColor = uMins <= 60 ? "#34d399" : (uMins <= 360 ? "#60a5fa" : "var(--text)");
+        usedLine = `<div title="Lần cuối hệ thống giao việc (kể cả lượt lỗi): ${uInfo.full}" style="font-size:11px;font-weight:600;color:${uColor};">📤 Giao: ${uInfo.rel} <span style="font-weight:400;color:var(--text-dim);font-family:monospace;">(${uInfo.clock})</span></div>`;
+      }
+
+      let sucLine = `<div style="font-size:10.5px;color:var(--text-dim);margin-top:2px;">✅ Video: Chưa có</div>`;
+      if (ok && lastTs) {
+        const sInfo = formatSuccessTime(lastTs);
+        const lagHours = lastUsed ? (lastUsed - lastTs) / 3600 : 0;
+        const noRecentWin = lagHours >= 24;
+        const sColor = noRecentWin ? "#fbbf24" : "var(--text-dim)";
+        const lagTip = noRecentWin
+          ? `Lần cuối ra video: ${sInfo.full} (vẫn được giao việc nhưng ${Math.round(lagHours)} giờ qua chưa có video thành công mới)`
+          : `Lần cuối tạo video thành công: ${sInfo.full}`;
+        sucLine = `<div title="${lagTip}" style="font-size:10.5px;color:${sColor};margin-top:2px;">✅ Video: ${sInfo.rel} <span style="font-family:monospace;">(${sInfo.clock})</span></div>`;
+      } else if (!ok && lastUsed) {
+        sucLine = `<div title="Đã giao việc nhưng chưa có video nào thành công" style="font-size:10.5px;color:#fbbf24;margin-top:2px;">✅ Video: Chưa có</div>`;
+      }
+
+      return `<div>${usedLine}${sucLine}</div>`;
   }
 
     function quotaCellHtml(q) {
@@ -3219,6 +3264,9 @@
     if (!allAccs.length) { el.innerHTML = ""; return; }
     const enabledCount = allAccs.filter(a => a.enabled !== false).length;
     const disabledCount = allAccs.length - enabledCount;
+    const runningCount = allAccs.filter(a => a.enabled !== false && (a.busy_slots || 0) > 0).length;
+    const cooldownCount = allAccs.filter(a => a.enabled !== false && !a.muse_locked && (a.busy_slots || 0) === 0 && (a.cooldown_remaining || 0) > 0).length;
+    const lockedCount = allAccs.filter(a => a.muse_locked).length;
     let ok = 0, low = 0, ex = 0, unk = 0, totalTokens = 0, oldest = Infinity;
     allAccs.forEach(a => {
       const st = quotaState(a.quota);
@@ -3229,8 +3277,15 @@
         if (a.quota.checked_at) oldest = Math.min(oldest, a.quota.checked_at);
       }
     });
+    const stDetails = [
+      `<span style="color:#34d399;">🟢 Bật ${enabledCount}</span>`,
+      runningCount ? `<span style="color:#60a5fa;">⚡ đang chạy ${runningCount}</span>` : "",
+      cooldownCount ? `<span style="color:#fbbf24;">⏸ đang nghỉ ${cooldownCount}</span>` : "",
+      lockedCount ? `<span style="color:#f87171;">🔒 khoá ${lockedCount}</span>` : "",
+      `<span style="color:#cbd5e1;">⚪ Tắt ${disabledCount}</span>`,
+    ].filter(Boolean).join(" · ");
     const parts = [
-      `<b>Trạng thái (${allAccs.length} TK):</b> <span style="color:#34d399;">🟢 Bật ${enabledCount}</span> · <span style="color:#cbd5e1;">⚪ Tắt ${disabledCount}</span> &nbsp;|&nbsp;`,
+      `<b>Trạng thái (${allAccs.length} TK):</b> ${stDetails} &nbsp;|&nbsp;`,
       `<b>Hạn mức token:</b>`,
       `<span style="color:#34d399;">🟢 còn ${ok}</span>`,
       `<span style="color:#fbbf24;">🟠 sắp hết ${low}</span>`,
@@ -3782,9 +3837,13 @@
       if (data.del_img !== undefined) document.getElementById("sp_del_img").checked = !!data.del_img;
       if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
       if (data.auto_claim !== undefined) document.getElementById("sp_auto_claim").checked = !!data.auto_claim;
-      if (data.jobs_per_account) {
+      if (data.jobs_per_account !== undefined) {
         const elJobs = document.getElementById("sp_jobs_per_account");
-        if (elJobs) elJobs.value = "1";
+        if (elJobs) elJobs.value = String(parseInt(data.jobs_per_account) >= 2 ? 2 : 1);
+      }
+      if (data.account_dispatch_mode !== undefined) {
+        const elMode = document.getElementById("sp_account_dispatch_mode");
+        if (elMode) elMode.value = data.account_dispatch_mode === "concentrate" ? "concentrate" : "even";
       }
       if (data.ffmpeg_concurrency !== undefined) {
         const elFf = document.getElementById("sp_ffmpeg_threads");
@@ -3866,7 +3925,12 @@
   }
 
   function getShopeeJobsPerAccount() {
-    return 1;
+    const el = document.getElementById("sp_jobs_per_account");
+    return Math.max(1, Math.min(2, parseInt(el?.value) || 1));
+  }
+
+  function getShopeeDispatchMode() {
+    return document.getElementById("sp_account_dispatch_mode")?.value === "concentrate" ? "concentrate" : "even";
   }
 
   function onShopeeThreadsChange() {
@@ -3897,6 +3961,23 @@
     showToast(`🎞️ Đã lưu số luồng ghép FFmpeg đồng thời: ${v} luồng`, "success");
   }
 
+  async function onJobsPerAccountChange() {
+    const v = getShopeeJobsPerAccount();
+    const el = document.getElementById("sp_jobs_per_account");
+    if (el) el.value = String(v);
+    updateShopeeThreadsHint();
+    await saveShopeeSettings();
+    showToast(`🎬 Đã lưu số video cùng lúc / TK: ${v} video/TK`, "success");
+  }
+
+  async function onDispatchModeChange() {
+    const mode = getShopeeDispatchMode();
+    await saveShopeeSettings();
+    showToast(mode === "concentrate"
+      ? "🎯 Đã bật chế độ Dồn TK: lấp đầy 2 slot để các TK chạm limit 24h nhanh nhất"
+      : "⚖️ Đã chuyển sang chế độ Chia đều luân phiên", "success");
+  }
+
   function getShopeeFormData() {
     return {
       threads: parseInt(document.getElementById("sp_threads")?.value) || 2,
@@ -3910,6 +3991,7 @@
       ghep_anh: document.getElementById("sp_ghep_anh").checked,
       auto_claim: !!document.getElementById("sp_auto_claim")?.checked,
       jobs_per_account: getShopeeJobsPerAccount(),
+      account_dispatch_mode: getShopeeDispatchMode(),
       ffmpeg_concurrency: Math.max(1, Math.min(64, parseInt(document.getElementById("sp_ffmpeg_threads")?.value) || 16)),
       skip_exhausted_accounts: !!document.getElementById("skipExhausted")?.checked,
       naming: document.getElementById("sp_naming").value,
@@ -4002,8 +4084,11 @@
       }
     }
     const outInput = document.getElementById("sp_out_dir");
-    if (outInput && outInput.value.includes("/Video AI/")) {
-      outInput.value = `F:/Video AI/${m}/shopapi`;
+    if (outInput && /^[A-Za-z]:[/\\]Video AI[/\\]/i.test(outInput.value)) {
+      outInput.value = outInput.value.replace(
+        /^([A-Za-z]:[/\\]Video AI[/\\])[^/\\]+([/\\].*)?$/i,
+        (_, prefix, suffix) => `${prefix}${m}${suffix || ""}`
+      );
     }
     renderShopeeProductsConsole();
     saveShopeeSettings();
@@ -4149,7 +4234,7 @@
   async function batchCheckClipsForConsole() {
     if (!shopeeClaimedProducts || shopeeClaimedProducts.length === 0) return;
     const form = getShopeeFormData();
-    const outDir = form.out_dir || "F:/Video AI/PH/shopapi";
+    const outDir = form.out_dir || "";
     const durStr = String(form.duration || "").toLowerCase();
     // Chế độ 2 clip A + B chỉ do độ dài 16s quyết định (8s/10s luôn 1 clip + ghép Outro 12s)
     const is16s = durStr.includes("16");
@@ -4918,7 +5003,7 @@
         // Video AI đã render xong và nằm an toàn trong temp ({item_id}-raw.mp4): vẫn báo hoàn tất về Database
         // để SP không bị nhận lại; phần ghép Outro 12s làm sau bằng nút "Ghép Clip Temp".
         appendShopeeLog(`⚠️ [Luồng ${workerId}] SP ${prod.item_id}: chưa ghép được Outro 12s (${saveOut.status}) -> giữ video AI trong temp/${prod.item_id}-raw.mp4, bấm "Ghép Clip Temp" để ghép sau.`);
-        const pendingPath = `${outDir}/${targetFileName}`;
+        const pendingPath = outDir ? `${outDir}/${targetFileName}` : targetFileName;
         if (!prod._is_imported) {
           await fetch(shopeeBgUrl("/api/shopee/complete"), {
             method: "POST",
@@ -5010,7 +5095,7 @@
     }, 1000);
 
     const form = getShopeeFormData();
-    const outDir = form.out_dir || "F:/Video AI/PH/shopapi";
+    const outDir = form.out_dir || "";
     clearShopeePrefetch(); // bỏ dữ liệu chuẩn bị từ batch trước (có thể khác cài đặt)
     const requestedWorkers = Math.max(1, parseInt(document.getElementById("sp_threads").value) || 2);
 

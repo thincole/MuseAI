@@ -169,7 +169,72 @@ def get_computer_name() -> str:
 DEFAULT_SERVER_URL = os.environ.get("SHOPEE_SERVER_URL", "").strip() or "http://100.79.170.67:3000"
 DEFAULT_API_KEY = os.environ.get("SHOPEE_API_KEY", "").strip() or "shopee_secret_2026"
 DEFAULT_CLIENT_ID = os.environ.get("SHOPEE_CLIENT_ID", "").strip() or get_computer_name()
-DEFAULT_OUT_DIR = os.environ.get("SHOPEE_OUT_DIR", "").strip() or os.path.join(CFG.base_dir, "output")
+_LOCAL_FALLBACK_OUT_DIR = os.path.join(CFG.base_dir, "output")
+DEFAULT_OUT_DIR = os.environ.get("SHOPEE_OUT_DIR", "").strip() or _LOCAL_FALLBACK_OUT_DIR
+
+_OUT_DIR_WARN_LOCK = threading.Lock()
+_WARNED_INVALID_OUT_DIRS: set[str] = set()
+
+
+def _has_drive_root(path: str) -> bool:
+    """Kiểm tra nhanh ổ đĩa dạng X: có tồn tại trên Windows hay không (tránh chạm UNC mạng)."""
+    drive, _ = os.path.splitdrive(path)
+    if len(drive) == 2 and drive[1] == ":":
+        return os.path.exists(drive + os.sep)
+    return True
+
+
+def _warn_out_dir_once(bad_path: str, reason: str, fallback: str) -> None:
+    with _OUT_DIR_WARN_LOCK:
+        if bad_path in _WARNED_INVALID_OUT_DIRS:
+            return
+        _WARNED_INVALID_OUT_DIRS.add(bad_path)
+    log.warning(
+        "⚠️ [Thư mục xuất] '%s' không khả dụng trên máy này (%s) -> tự động chuyển sang '%s'.",
+        bad_path, reason, fallback,
+    )
+
+
+def resolve_out_dir(raw_dir: str | None = None, fallback_dir: str | None = None) -> str:
+    """Chuẩn hóa đường dẫn thư mục xuất video; tự fallback về thư mục cục bộ nếu ổ đĩa không tồn tại."""
+    local_fb = os.path.normpath(_LOCAL_FALLBACK_OUT_DIR)
+    fb_cand = os.path.normpath(str(fallback_dir or "").strip() or DEFAULT_OUT_DIR)
+    fb = fb_cand if _has_drive_root(fb_cand) else local_fb
+
+    cand = str(raw_dir or "").strip()
+    if not cand:
+        return fb
+    norm = os.path.normpath(cand)
+    if not _has_drive_root(norm):
+        drive, _ = os.path.splitdrive(norm)
+        _warn_out_dir_once(norm, f"ổ đĩa {drive} không tồn tại", fb)
+        return fb
+    return norm
+
+
+def ensure_out_dir(raw_dir: str | None = None, fallback_dir: str | None = None, subdir: str = "") -> tuple[str, str]:
+    """Đảm bảo tạo được thư mục xuất (hoặc thư mục con như 'temp'); lỗi OS/ổ đĩa tự fallback an toàn."""
+    target = resolve_out_dir(raw_dir, fallback_dir=fallback_dir)
+    full = os.path.join(target, subdir) if subdir else target
+    try:
+        os.makedirs(full, exist_ok=True)
+        return target, full
+    except OSError as exc:
+        fb = resolve_out_dir("", fallback_dir=fallback_dir)
+        if fb == target:
+            fb = os.path.normpath(_LOCAL_FALLBACK_OUT_DIR)
+        _warn_out_dir_once(target, str(exc), fb)
+        full_fb = os.path.join(fb, subdir) if subdir else fb
+        try:
+            os.makedirs(full_fb, exist_ok=True)
+            return fb, full_fb
+        except OSError:
+            local_fb = os.path.normpath(_LOCAL_FALLBACK_OUT_DIR)
+            if fb == local_fb:
+                raise
+            local_full = os.path.join(local_fb, subdir) if subdir else local_fb
+            os.makedirs(local_full, exist_ok=True)
+            return local_fb, local_full
 
 
 # Đọc lại tại thời điểm gọi (không đóng băng giá trị lúc import) — dùng khi caller không truyền server_url/api_key.

@@ -53,7 +53,8 @@ from pydantic import BaseModel, Field
 from config import CFG
 from engine import (BROWSER_MANAGES_VM, ESSENTIAL_COOKIES, MuseAccountDisconnectedError, MuseAuthError, MuseEngine,
                     MuseGenerationError, MuseVMUnavailableError)
-from store import STUCK_COOLDOWN_SECONDS, Store, account_expiry, min_expiry
+from store import (STUCK_COOLDOWN_SECONDS, Store, account_expiry, min_expiry,
+                   normalize_dispatch_mode, normalize_jobs_per_account)
 
 import sys
 import logger_setup
@@ -1049,6 +1050,55 @@ _NEUTRAL_PROMPT_SUFFIX = (
 )
 
 
+_QUOTA_CHECK_SLOTS = threading.BoundedSemaphore(3)  # tối đa 3 lần đọc hạn mức cùng lúc (mỗi lần mở 1 tab tạm)
+_AUTO_QUOTA_REFRESH_LOCK = threading.Lock()
+_AUTO_QUOTA_REFRESH_TS: dict[str, float] = {}
+
+
+def _refresh_account_quota_sync(aid: str, raise_on_empty: bool = True) -> dict | None:
+    """Đọc hạn mức thật (gói / % tuần / token phụ còn lại) qua proxy cố định của TK và lưu vào store."""
+    acc = store.get_account(aid)
+    if not acc or not acc.get("cookies"):
+        return None
+    with _QUOTA_CHECK_SLOTS:
+        engine.start()
+        q = engine.quota_worker(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+        if not q.get("found"):
+            if raise_on_empty:
+                raise MuseGenerationError("Không đọc được hạn mức (bảng Usage chưa tải xong qua proxy). Thử lại sau.")
+            return None
+        q["checked_at"] = int(time.time())
+        store.update_account(aid, quota=q)
+        return q
+
+
+def _kick_quota_refresh(acc: dict, max_cache_age_sec: int = 6 * 3600):
+    """Nếu cache hạn mức của TK đã cũ khi gặp lỗi quota, tự đọc lại hạn mức thật ngoài nền (tối đa 1 lần / 30 phút)."""
+    aid = (acc or {}).get("id")
+    if not aid or store.is_hub_client():
+        return
+    q = (acc or {}).get("quota") or {}
+    checked_at = int(q.get("checked_at") or 0)
+    now = time.time()
+    if checked_at > 0 and (now - checked_at) < max_cache_age_sec:
+        return
+    with _AUTO_QUOTA_REFRESH_LOCK:
+        if now - _AUTO_QUOTA_REFRESH_TS.get(aid, 0.0) < 1800:
+            return
+        _AUTO_QUOTA_REFRESH_TS[aid] = now
+
+    def _run():
+        try:
+            q_new = _refresh_account_quota_sync(aid, raise_on_empty=False)
+            if q_new:
+                log.info("🔄 [Hạn mức] Đã tự cập nhật lại số token cho TK %s (%s): %s (tuần %s%%)",
+                         aid, acc.get("label", aid), q_new.get("extra_left"), q_new.get("weekly_used_pct"))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[Hạn mức] Tự làm mới cho TK %s thất bại: %s", aid, exc)
+
+    threading.Thread(target=_run, daemon=True, name=f"quota-refresh-{aid[:6]}").start()
+
+
 def _quota_has_tokens(acc: dict) -> bool:
     """Lần kiểm tra hạn mức gần nhất cho thấy TK vẫn còn token (token bổ sung > 0 hoặc gói tuần chưa dùng hết)."""
     q = (acc or {}).get("quota") or {}
@@ -1238,7 +1288,10 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     store.block_until(cur_acc["id"], 3600)
                     if token_out_soft:
                         store.mark(cur_acc["id"], True,
-                                   "Muse báo hết mức sử dụng nhưng TK vẫn còn token -> coi là chạm trần 24h, nghỉ 1 giờ rồi thử lại")
+                                   "Tác vụ gián đoạn: Muse báo hết mức sử dụng (số bảng là cache cũ) — nghỉ 1 giờ, đang tự kiểm tra lại hạn mức")
+                        _kick_quota_refresh(cur_acc, max_cache_age_sec=6 * 3600)
+                    else:
+                        _kick_quota_refresh(cur_acc, max_cache_age_sec=12 * 3600)
                     try:
                         engine.close_session_for_account(cur_acc["id"])
                     except Exception:
@@ -2288,9 +2341,6 @@ async def query_quota(aid: str, _=Depends(admin_auth)):
         raise HTTPException(502, f"Kiểm tra hạn mức thất bại: {exc}") from exc
 
 
-_QUOTA_CHECK_SLOTS = threading.BoundedSemaphore(3)  # tối đa 3 lần đọc hạn mức cùng lúc (mỗi lần mở 1 tab tạm)
-
-
 @app.post("/admin/accounts/{aid}/unlock")
 def unlock_account(aid: str, _=Depends(admin_auth)):
     """Mở khoá TK đã bị khoá vì 'Muse is disconnected' (sau khi đã gửi ticket / TK đã dùng lại được)."""
@@ -2650,19 +2700,11 @@ async def check_account_quota(aid: str, _=Depends(admin_auth)):
     if not acc.get("cookies"):
         raise HTTPException(400, "Tài khoản chưa có cookie")
 
-    def _probe():
-        with _QUOTA_CHECK_SLOTS:
-            engine.start()
-            q = engine.quota_worker(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
-            if not q.get("found"):
-                # Không lưu kết quả rỗng: tránh ghi đè số liệu tốt đã đọc trước đó
-                raise MuseGenerationError("Không đọc được hạn mức (bảng Usage chưa tải xong qua proxy). Thử lại sau.")
-            q["checked_at"] = int(time.time())
-            store.update_account(aid, quota=q)
-            return q
-
     try:
-        return await asyncio.to_thread(_probe)
+        q = await asyncio.to_thread(_refresh_account_quota_sync, aid, True)
+        if not q:
+            raise MuseGenerationError("Không thể kiểm tra hạn mức cho tài khoản này")
+        return q
     except MuseAuthError as exc:
         raise HTTPException(401, f"Phiên Muse đã bị đăng xuất: {exc}") from exc
     except MuseGenerationError as exc:
@@ -3060,6 +3102,13 @@ def _video_source(path_or_name, field: str = "filename") -> str:
     return s
 
 
+def _resolve_shopee_out_dir(raw_out_dir: str | None = None) -> str:
+    """Resolve thư mục xuất Shopee, fallback sang thư mục hợp lệ nếu ổ đĩa/đường dẫn không tồn tại."""
+    fallback_out = _get_shopee_settings().get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    candidate = (raw_out_dir or "").strip() or fallback_out
+    return shopee_engine.resolve_out_dir(candidate, fallback_dir=fallback_out)
+
+
 def _get_shopee_settings() -> dict:
     default_settings = {
         "sv_server_url": shopee_engine.DEFAULT_SERVER_URL,
@@ -3084,6 +3133,7 @@ def _get_shopee_settings() -> dict:
         "min_price": "0",
         "max_price": "",
         "jobs_per_account": 1,
+        "account_dispatch_mode": "even",
         "ffmpeg_concurrency": shopee_engine.FFMPEG_CONCURRENCY,
         "skip_exhausted_accounts": True
     }
@@ -3094,7 +3144,15 @@ def _get_shopee_settings() -> dict:
                 default_settings.update(saved)
         except Exception:
             pass
-    default_settings["jobs_per_account"] = 1
+    default_settings["out_dir"] = shopee_engine.resolve_out_dir(
+        default_settings.get("out_dir")
+    )
+    default_settings["jobs_per_account"] = normalize_jobs_per_account(
+        default_settings.get("jobs_per_account", 1)
+    )
+    default_settings["account_dispatch_mode"] = normalize_dispatch_mode(
+        default_settings.get("account_dispatch_mode", "even")
+    )
     return default_settings
 
 
@@ -3104,24 +3162,39 @@ def get_shopee_settings():
 
 
 def _apply_jobs_per_account(value) -> int:
-    """Cố định mỗi tài khoản chỉ chạy tối đa 1 luồng video tại một thời điểm."""
-    n = store.set_max_jobs_per_account(1)
-    engine.max_jobs_per_account = 1
+    """Cấu hình số luồng video tối đa chạy đồng thời trên mỗi tài khoản (1 hoặc 2)."""
+    n = store.set_max_jobs_per_account(value)
+    engine.max_jobs_per_account = n
     return n
+
+
+def _apply_dispatch_mode(value) -> str:
+    """Cấu hình chế độ chia tài khoản ('even' hoặc 'concentrate')."""
+    return store.set_account_dispatch_mode(value)
 
 
 @app.post("/api/shopee/save-settings")
 def save_shopee_settings(settings: dict):
     os.makedirs(CFG.data_dir, exist_ok=True)
+    clean_settings = dict(settings)
+    if "out_dir" in clean_settings:
+        clean_settings["out_dir"] = shopee_engine.resolve_out_dir(clean_settings.get("out_dir"))
+    if "jobs_per_account" in clean_settings:
+        clean_settings["jobs_per_account"] = _apply_jobs_per_account(clean_settings["jobs_per_account"])
+    if "account_dispatch_mode" in clean_settings:
+        clean_settings["account_dispatch_mode"] = _apply_dispatch_mode(clean_settings["account_dispatch_mode"])
     with open(SHOPEE_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
-    if "jobs_per_account" in settings:
-        _apply_jobs_per_account(settings["jobs_per_account"])
-    if "ffmpeg_concurrency" in settings:
-        shopee_engine.set_ffmpeg_concurrency(settings["ffmpeg_concurrency"])
-    if "skip_exhausted_accounts" in settings:
-        store.set_skip_exhausted(settings["skip_exhausted_accounts"])
-    return {"success": True, "ffmpeg_concurrency": shopee_engine.FFMPEG_CONCURRENCY}
+        json.dump(clean_settings, f, ensure_ascii=False, indent=2)
+    if "ffmpeg_concurrency" in clean_settings:
+        shopee_engine.set_ffmpeg_concurrency(clean_settings["ffmpeg_concurrency"])
+    if "skip_exhausted_accounts" in clean_settings:
+        store.set_skip_exhausted(clean_settings["skip_exhausted_accounts"])
+    return {
+        "success": True,
+        "jobs_per_account": store.MAX_JOBS_PER_ACCOUNT,
+        "account_dispatch_mode": store.ACCOUNT_DISPATCH_MODE,
+        "ffmpeg_concurrency": shopee_engine.FFMPEG_CONCURRENCY,
+    }
 
 
 def _update_env_file(env_path: str, updates: dict[str, str]):
@@ -3595,7 +3668,8 @@ def set_shopee_clip_cache(item_id: str, req: dict):
 def save_temp_clip(req: dict):
     """Lưu clip video thô từ Muse.ai vào thư mục output_dir/temp/{item_id}-{part}.mp4."""
     filename = str(req.get("filename", "")).strip()
-    out_dir = req.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    fallback_out = _resolve_shopee_out_dir()
+    out_dir = _resolve_shopee_out_dir(req.get("out_dir"))
     item_id = str(req.get("item_id", "")).strip()
     part = str(req.get("part", "a")).lower().strip()  # "a", "b", "raw"
     if not filename or not item_id:
@@ -3609,8 +3683,9 @@ def save_temp_clip(req: dict):
     if not os.path.isfile(src_path) or os.path.getsize(src_path) < 200000:
         raise HTTPException(400, f"File video nguồn '{filename}' không hợp lệ hoặc dung lượng quá nhỏ ({os.path.getsize(src_path) if os.path.isfile(src_path) else 0} bytes)")
 
-    temp_dir = os.path.join(out_dir, "temp")
-    os.makedirs(temp_dir, exist_ok=True)
+    out_dir, temp_dir = shopee_engine.ensure_out_dir(
+        out_dir, fallback_dir=fallback_out, subdir="temp"
+    )
     target_filename = f"{item_id}-{part}.mp4"
     target_path = os.path.join(temp_dir, target_filename)
 
@@ -3747,8 +3822,7 @@ class _ClipIndex:
 
 
 def _inspect_product_clips(target_out: str, item_id: str, duration: int = 16) -> dict:
-    if not target_out:
-        target_out = _get_shopee_settings().get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    target_out = _resolve_shopee_out_dir(target_out)
     return _ClipIndex(target_out, duration).inspect(item_id)
 
 
@@ -3756,18 +3830,14 @@ def _inspect_product_clips(target_out: str, item_id: str, duration: int = 16) ->
 def check_temp_clips(out_dir: str = "", item_id: str = "", duration: int = 16):
     """Kiểm tra xem các clip thô {item_id}-a.mp4 và {item_id}-b.mp4 hoặc video hoàn chỉnh đã có sẵn chưa.
     Với video độ dài 8s và 10s: chỉ kiểm tra video hoàn chỉnh trong out_dir, bỏ qua thư mục temp."""
-    saved_cfg = _get_shopee_settings()
-    target_out = (out_dir or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
-    target_out = os.path.normpath(target_out)
+    target_out = _resolve_shopee_out_dir(out_dir)
     return _inspect_product_clips(target_out, item_id, duration=duration)
 
 
 @app.post("/api/shopee/batch-check-clips")
 def batch_check_shopee_clips(req: dict):
     """Kiểm tra nhanh hàng loạt sản phẩm xem đã có clip -a, -b hoặc video hoàn chỉnh chưa."""
-    saved_cfg = _get_shopee_settings()
-    out_dir = (req.get("out_dir") or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
-    out_dir = os.path.normpath(out_dir)
+    out_dir = _resolve_shopee_out_dir(req.get("out_dir"))
     duration = int(req.get("duration", 16) or 16)
     ids = [s for s in (str(iid).strip() for iid in (req.get("item_ids") or [])) if s]
     index = _ClipIndex(out_dir, duration, cache_ids=ids)
@@ -3824,9 +3894,7 @@ def query_shopee_db_images(item_ids: list[str], market: str = "PH") -> dict[str,
 @app.get("/api/shopee/temp-stitch-summary")
 def get_temp_stitch_summary(out_dir: str = ""):
     """Thống kê các clip trong thư mục temp: có bao nhiêu cặp -a, -b và bao nhiêu cặp chưa ghép thành 16s."""
-    saved_cfg = _get_shopee_settings()
-    target_out = (out_dir or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
-    target_out = os.path.normpath(target_out)
+    target_out = _resolve_shopee_out_dir(out_dir)
     temp_dir = os.path.join(target_out, "temp")
 
     if not os.path.isdir(temp_dir):
@@ -3925,9 +3993,7 @@ def get_temp_stitch_summary(out_dir: str = ""):
 @app.post("/api/shopee/auto-stitch-temp")
 def auto_stitch_temp_clips(req: dict):
     """Tự động quét thư mục temp, tìm tất cả cặp clip -a/-b và clip -raw chưa ghép và xử lý hoàn tất thành video xuất."""
-    saved_cfg = _get_shopee_settings()
-    out_dir = (req.get("out_dir") or "").strip() or saved_cfg.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
-    out_dir = os.path.normpath(out_dir)
+    out_dir = _resolve_shopee_out_dir(req.get("out_dir"))
     temp_dir = os.path.join(out_dir, "temp")
 
     if not os.path.isdir(temp_dir):
@@ -4500,7 +4566,8 @@ _SAVE_JOBS_LOCK = threading.Lock()
 def _save_rendered_video_sync(req: dict) -> dict:
     """Thực thi đồng bộ việc lưu / ghép ảnh Outro 12s cho video đã render."""
     filename = str(req.get("filename") or "").strip()
-    out_dir = req.get("out_dir") or shopee_engine.DEFAULT_OUT_DIR
+    fallback_out = _resolve_shopee_out_dir()
+    out_dir = _resolve_shopee_out_dir(req.get("out_dir"))
     target_name = req.get("target_name") or filename
     ghep_anh = bool(req.get("ghep_anh", False))
     del_img = bool(req.get("del_img", True))
@@ -4587,7 +4654,7 @@ def _save_rendered_video_sync(req: dict) -> dict:
         raise HTTPException(400, f"Không tìm thấy file video nguồn hợp lệ (>200KB) '{filename}' cho sản phẩm {item_id or target_name}")
 
     try:
-        os.makedirs(out_dir, exist_ok=True)
+        out_dir, _ = shopee_engine.ensure_out_dir(out_dir, fallback_dir=fallback_out)
         dst = os.path.join(out_dir, target_name)
 
         # Tự động lấy image_url từ cache nếu client không gửi kèm
@@ -5397,12 +5464,13 @@ async def _startup():
             200, anyio.to_thread.current_default_thread_limiter().total_tokens)
     except Exception as exc:
         log.warning("Không nới được threadpool anyio: %s", exc)
-    n_jobs = _apply_jobs_per_account(1)
-    log.info("🎬 Số video cùng lúc / tài khoản: %d", n_jobs)
     sp_init = _get_shopee_settings()
+    n_jobs = _apply_jobs_per_account(sp_init.get("jobs_per_account", 1))
+    disp_mode = _apply_dispatch_mode(sp_init.get("account_dispatch_mode", "even"))
+    log.info("🎬 Số video cùng lúc / tài khoản: %d · Chế độ chia TK: %s", n_jobs, disp_mode)
     if sp_init.get("ffmpeg_concurrency"):
         shopee_engine.set_ffmpeg_concurrency(sp_init["ffmpeg_concurrency"])
-    skip_ex = store.set_skip_exhausted(_get_shopee_settings().get("skip_exhausted_accounts", False))
+    skip_ex = store.set_skip_exhausted(sp_init.get("skip_exhausted_accounts", False))
     log.info("🔋 Bỏ qua TK hết token khi giao việc: %s", "BẬT" if skip_ex else "tắt")
     # Luồng xử lý (ảnh lẫn video) đã chết khi tắt app: đóng các task còn treo để không bị đếm/kẹt mãi.
     for task in list(store.tasks.values()):

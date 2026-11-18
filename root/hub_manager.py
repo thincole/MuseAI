@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from config import CFG
 import store as store_module
-from store import ESSENTIAL_COOKIES, account_exhausted
+from store import ESSENTIAL_COOKIES, account_exhausted, account_sort_key
 
 log = logging.getLogger("hub_manager")
 
@@ -391,6 +391,7 @@ class AccountHubManager:
             "locked_accounts": locked,
             "exhausted_accounts": exhausted,
             "max_slots_per_account": max_per_acc,
+            "account_dispatch_mode": self.store.ACCOUNT_DISPATCH_MODE,
             "total_slots": total_slots,
             "used_slots": used_slots,
             "remote_used_slots": remote_used_slots,
@@ -513,17 +514,7 @@ class AccountHubManager:
                 )
                 return False, f"Đang chờ độ trễ lệch pha máy ảo Muse ({int(soonest)}s)...", None, None
 
-            # Ưu tiên tuyệt đối:
-            # 1) 0 slot đang chạy trước 1 slot đang chạy
-            # 2) Tài khoản ok != False trước
-            # 3) Ít dùng gần đây nhất (last_used nhỏ nhất)
-            # 4) Số lần dùng ít nhất (use_count nhỏ nhất)
-            ready_pool.sort(key=lambda item: (
-                item[1],
-                0 if item[0].get("ok") is not False else 1,
-                item[0].get("last_used") or 0.0,
-                item[0].get("use_count") or 0,
-            ))
+            ready_pool.sort(key=lambda item: account_sort_key(item[0], item[1], now_ts=now))
 
             target_acc, current_slots = ready_pool[0]
 
@@ -837,10 +828,12 @@ def get_accounts(
         include_cookies=include_cookies,
         limit=limit,
     )
+    max_per_acc = HUB.store.MAX_JOBS_PER_ACCOUNT or MAX_CONCURRENT_PER_ACCOUNT
     return {
         "server_time": time.time(),
         "total": len(accs),
-        "max_slots_per_account": MAX_CONCURRENT_PER_ACCOUNT,
+        "max_slots_per_account": max_per_acc,
+        "account_dispatch_mode": HUB.store.ACCOUNT_DISPATCH_MODE,
         "accounts": accs,
     }
 
@@ -887,12 +880,13 @@ def lease_account(
     if not ok:
         raise HTTPException(503, msg)
 
+    max_per_acc = HUB.store.MAX_JOBS_PER_ACCOUNT or MAX_CONCURRENT_PER_ACCOUNT
     return {
         "success": True,
         "message": msg,
         "lease_id": lease.lease_id,
         "slot_number": lease.slot_number,
-        "slot_label": f"Slot {lease.slot_number}/{MAX_CONCURRENT_PER_ACCOUNT}",
+        "slot_label": f"Slot {lease.slot_number}/{max_per_acc}",
         "expires_at": lease.expires_at,
         "timeout_sec": lease.timeout_sec,
         "account": acc,

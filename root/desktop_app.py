@@ -26,6 +26,7 @@ import logger_setup
 logger_setup.setup_logging()
 
 from config import CFG
+import shopee_engine
 import store
 
 
@@ -116,9 +117,13 @@ class DesktopAPI:
         if not self._window:
             return {"success": False, "error": "Cửa sổ chưa sẵn sàng"}
         try:
+            initial_dir = shopee_engine.resolve_out_dir(default_path or shopee_engine.DEFAULT_OUT_DIR)
+            if not os.path.isdir(initial_dir):
+                parent_dir = os.path.dirname(initial_dir)
+                initial_dir = parent_dir if os.path.isdir(parent_dir) else CFG.base_dir
             res = self._window.create_file_dialog(
                 webview.FOLDER_DIALOG,
-                directory=default_path or "F:\\Video AI\\PH\\shopapi",
+                directory=initial_dir,
             )
             if res and len(res) > 0:
                 selected_dir = res[0]
@@ -178,9 +183,9 @@ class DesktopAPI:
     def open_folder_path(self, folder_path: str) -> dict:
         """Mở thư mục bất kỳ trên Windows Explorer."""
         try:
-            os.makedirs(folder_path, exist_ok=True)
-            os.startfile(folder_path)
-            return {"success": True}
+            _, resolved_folder = shopee_engine.ensure_out_dir(folder_path)
+            os.startfile(resolved_folder)
+            return {"success": True, "path": resolved_folder}
         except Exception as e:
             return {"success": False, "error": str(e)}
 

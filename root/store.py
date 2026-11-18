@@ -92,6 +92,32 @@ def account_exhausted(acc: dict, today: date | None = None) -> bool:
     return not (reset and today >= reset)
 
 
+def normalize_jobs_per_account(n) -> int:
+    try:
+        return 2 if int(n) >= 2 else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def normalize_dispatch_mode(mode) -> str:
+    val = str(mode or "").strip().lower()
+    return "concentrate" if val in ("concentrate", "pack", "24h", "fast24h", "sticky") else "even"
+
+
+def account_sort_key(acc: dict, busy_slots: int, mode: str | None = None, now_ts: float | None = None) -> tuple:
+    """Khóa sắp xếp chọn tài khoản:
+    - 'even': chia đều luân phiên (ưu tiên 0 slot trước, ít dùng gần đây nhất).
+    - 'concentrate': dồn từng TK chạm trần 24h nhanh (ưu tiên TK khỏe không vừa lỗi, lấp đủ 2 slot trước khi mở TK mới, giữ tab ấm).
+    """
+    ok_rank = 0 if acc.get("ok") is not False else 1
+    m = mode or Store.ACCOUNT_DISPATCH_MODE
+    if m == "concentrate":
+        t = time.time() if now_ts is None else now_ts
+        recent_fail = 1 if (t - Store._LAST_FAIL_TS.get(acc["id"], 0.0)) < 180.0 else 0
+        return (ok_rank, recent_fail, -busy_slots, -(acc.get("last_used") or 0.0), -(acc.get("use_count") or 0))
+    return (busy_slots, ok_rank, acc.get("last_used") or 0.0, acc.get("use_count") or 0)
+
+
 # hatch_vml 固定约 2 天，且不因使用而延长 —— 它就是决定账号寿命的那条 cookie。
 # 实测对照：生成前后 synced_at 变了、也捞到新 cookie，但 4 条核心 cookie 的
 # expires 一动不动。所以拿不到 hatch_vml 的 expires 时，按「导入时间 + 2 天」估算，
@@ -474,6 +500,8 @@ class Store:
         with _LOCK:
             self._sync_from_disk()
             out = []
+            now_sec = time.time()
+            now_ts = int(now_sec)
             for a in self.accounts:
                 item = {k: v for k, v in a.items() if k != "cookies"}
                 ce = a.get("cookies_exp") or {}
@@ -484,13 +512,15 @@ class Store:
                     a.get("cookies", {}).get(n) for n in ESSENTIAL_COOKIES)
                 # 有效期是 hatch_vml 的实测 expires，还是按「2 天寿命」推算的
                 item["expires_estimated"] = not _is_pos(ce.get("hatch_vml"))
-                now_ts = int(time.time())
                 item["is_alive"] = bool(
                     a.get("enabled", True) and a.get("cookies")
                     and a.get("ok") is not False
                     and (not a.get("expires_at") or a["expires_at"] > now_ts)
                 )
                 item["quota_exhausted"] = account_exhausted(a)  # một nguồn sự thật cho giao diện
+                cd_until = float(self._COOLDOWN_UNTIL.get(a["id"], 0.0) or 0.0)
+                item["cooldown_remaining"] = max(0, int(cd_until - now_sec))
+                item["busy_slots"] = int(self._BUSY_COUNT.get(a["id"], 0) + self._hub_remote_busy(a["id"]))
                 out.append(item)
             return out
 
@@ -551,10 +581,13 @@ class Store:
             self._save_accounts(force=False)
             return acc
 
-    # Số việc đang chạy của từng TK; mỗi TK nhận tối đa MAX_JOBS_PER_ACCOUNT việc cùng lúc (ô "Số video cùng lúc / tài khoản": 1 hoặc 2).
+    # Số việc đang chạy của từng TK; mỗi TK nhận tối đa MAX_JOBS_PER_ACCOUNT việc cùng lúc (ô "Video/TK": 1 hoặc 2).
     _BUSY_COUNT: dict[str, int] = {}
     _LAST_ACQUIRE_TS: dict[str, float] = {}
+    _LAST_FAIL_TS: dict[str, float] = {}
     MAX_JOBS_PER_ACCOUNT = 1
+    # Chế độ chia TK: "even" = chia đều luân phiên, "concentrate" = dồn TK đang chạy chạm limit 24h nhanh nhất.
+    ACCOUNT_DISPATCH_MODE = "even"
     # Khoảng cách tối thiểu (giây) trước khi giao luồng thứ 2 vào cùng 1 tài khoản đang bận để tránh nghẽn máy ảo Muse.
     SAME_ACCOUNT_STAGGER_SECONDS = 15.0
     # Bỏ qua TK hết sạch cả gói tuần (100%) lẫn token bổ sung (0 token) khi giao việc.
@@ -578,10 +611,18 @@ class Store:
             self._COND.notify_all()
 
     def set_max_jobs_per_account(self, n) -> int:
+        v = normalize_jobs_per_account(n)
         with self._COND:
-            Store.MAX_JOBS_PER_ACCOUNT = 1
+            Store.MAX_JOBS_PER_ACCOUNT = v
             self._COND.notify_all()
         return Store.MAX_JOBS_PER_ACCOUNT
+
+    def set_account_dispatch_mode(self, mode) -> str:
+        v = normalize_dispatch_mode(mode)
+        with self._COND:
+            Store.ACCOUNT_DISPATCH_MODE = v
+            self._COND.notify_all()
+        return Store.ACCOUNT_DISPATCH_MODE
     # Cooldown (trong RAM, mở lại app là xóa): TK kẹt VM liên tiếp thì cho nghỉ, hết giờ nghỉ được thử lại 1 lần.
     _STUCK_STREAK: dict[str, int] = {}
     _COOLDOWN_UNTIL: dict[str, float] = {}
@@ -656,6 +697,10 @@ class Store:
                 dq = self._OUTCOMES[aid] = deque(maxlen=self.QUALITY_WINDOW)
             dq.append(bool(ok))
             self._OUTCOME_TS[aid] = time.time()
+            if ok:
+                self._LAST_FAIL_TS.pop(aid, None)
+            else:
+                self._LAST_FAIL_TS[aid] = self._OUTCOME_TS[aid]
 
     def quality_rate(self, aid: str) -> tuple[float | None, int]:
         """(tỉ lệ thành công, số lượt đã ghi) trong cửa sổ gần nhất; tỉ lệ None nếu chưa đủ dữ liệu."""
@@ -706,6 +751,7 @@ class Store:
             self._ATTACH_STREAK.pop(aid, None)
             self._STUCK_STREAK.pop(aid, None)
             self._COOLDOWN_UNTIL.pop(aid, None)
+            self._LAST_FAIL_TS.pop(aid, None)
             self._COND.notify_all()
 
     def clear_cooldown(self, aid: str):
@@ -714,6 +760,7 @@ class Store:
             self._STUCK_STREAK.pop(aid, None)
             self._TIMEOUT_STREAK.pop(aid, None)
             self._COOLDOWN_UNTIL.pop(aid, None)
+            self._LAST_FAIL_TS.pop(aid, None)
             self._COND.notify_all()
 
     def _acquire_from_hub(self, preferred_id: str | None = None, exclude_id: str | None = None,
@@ -807,10 +854,9 @@ class Store:
                         )
                         wait_hint = min(2.0, soonest)
                     else:
-                        # Ưu tiên tuyệt đối TK đang rảnh hoàn toàn (busy == 0) trước khi chồng việc thứ 2 lên cùng 1 VM Muse
-                        least_busy = lambda a: (busy.get(a["id"], 0) + self._hub_remote_busy(a["id"]), 0 if a.get("ok") is not False else 1, a.get("last_used") or 0.0, a.get("use_count") or 0)  # noqa: E731
+                        pick_key = lambda a: account_sort_key(a, busy.get(a["id"], 0) + self._hub_remote_busy(a["id"]), now_ts=now_ts)  # noqa: E731
                         pref = next((a for a in ready if a["id"] == preferred_id and a.get("ok") is not False), None) if preferred_id else None
-                        acc = pref if pref else min(ready, key=least_busy)
+                        acc = pref if pref else min(ready, key=pick_key)
 
                         busy[acc["id"]] = busy.get(acc["id"], 0) + 1
                         self._LAST_ACQUIRE_TS[acc["id"]] = now_ts
