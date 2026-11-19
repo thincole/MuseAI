@@ -1728,6 +1728,9 @@
 
             <span class="shopee-lbl" style="margin-left:6px;">SL bán từ:</span>
             <input type="number" class="shopee-input" id="sp_min_sold" value="0" style="width:55px;">
+
+            <span class="shopee-lbl" style="margin-left:6px;" title="Lọc sản phẩm có lượng bán theo tháng (monthly_sold) tối thiểu bằng giá trị này (0 = không lọc)">Sale/tháng:</span>
+            <input type="number" class="shopee-input" id="sp_min_monthly_sold" value="100" min="0" style="width:55px;" title="Mặc định 100 (đặt 0 để tắt lọc sale/tháng)">
           </div>
 
           <!-- Row 2: Giá bán từ ... đến -->
@@ -3815,7 +3818,14 @@
       if (data.market) document.getElementById("sp_market").value = data.market;
       if (data.min_item_id) document.getElementById("sp_min_item_id").value = data.min_item_id;
       if (data.min_commission) document.getElementById("sp_min_commission").value = data.min_commission;
-      if (data.min_sold) document.getElementById("sp_min_sold").value = data.min_sold;
+      if (data.min_sold !== undefined && data.min_sold !== null && data.min_sold !== "") {
+        document.getElementById("sp_min_sold").value = data.min_sold;
+      }
+      if (data.min_monthly_sold !== undefined && data.min_monthly_sold !== null && data.min_monthly_sold !== "") {
+        document.getElementById("sp_min_monthly_sold").value = data.min_monthly_sold;
+      } else {
+        document.getElementById("sp_min_monthly_sold").value = "100";
+      }
       if (data.min_price !== undefined) document.getElementById("sp_min_price").value = data.min_price;
       if (data.max_price !== undefined) document.getElementById("sp_max_price").value = data.max_price || "";
       if (data.threads) {
@@ -4002,6 +4012,11 @@
       min_item_id: document.getElementById("sp_min_item_id").value.trim(),
       min_commission: parseFloat(document.getElementById("sp_min_commission").value) || 1,
       min_sold: parseInt(document.getElementById("sp_min_sold").value) || 0,
+      min_monthly_sold: (() => {
+        const raw = document.getElementById("sp_min_monthly_sold")?.value ?? "100";
+        const parsed = parseInt(raw, 10);
+        return Number.isNaN(parsed) ? 100 : Math.max(0, parsed);
+      })(),
       min_price: parseFloat(document.getElementById("sp_min_price").value) || 0,
       max_price: document.getElementById("sp_max_price").value.trim() ? parseFloat(document.getElementById("sp_max_price").value) : null
     };
@@ -4162,12 +4177,13 @@
   }
 
   function _shopeeRowKey(p, sym) {
-    return `${p._status || ""}|${p._finalizing ? 1 : 0}|${p._has_final ? 1 : 0}|${p._final_video || ""}|${p._clipA ? 1 : 0}|${p._clipB ? 1 : 0}|${p.name || ""}|${sym}`;
+    return `${p._status || ""}|${p._finalizing ? 1 : 0}|${p._has_final ? 1 : 0}|${p._final_video || ""}|${p._clipA ? 1 : 0}|${p._clipB ? 1 : 0}|${p.name || ""}|${p.monthly_sold ?? ""}|${sym}`;
   }
 
   function _buildShopeeRowHtml(p, idx, sym) {
     const statusIcon = p._status === "completed" ? "✅" : (p._status === "processing" ? "🔄" : (p._status === "failed" ? "❌" : (p._status === "skipped" ? "⏭" : "⏳")));
     const sold = p.historical_sold ?? p.sold ?? 0;
+    const msText = (p.monthly_sold !== undefined && p.monthly_sold !== null) ? ` | Sale/tháng: ${_escHtml(p.monthly_sold)}` : "";
     const comm = p.commission_rate ? (p.commission_rate * 100).toFixed(0) : (p.commission ?? "0");
     const price = p.price_min ?? p.price ?? 0;
     const isImportedBadge = p._is_imported ? `<span style="background:rgba(234,88,12,0.25);color:#fb923c;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(234,88,12,0.4);margin-right:4px;">TXT</span>` : '';
@@ -4181,7 +4197,7 @@
     } else if (p._clipB) {
       clipHint = ` <span style="background:rgba(251,191,36,0.2);color:#fbbf24;font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid rgba(251,191,36,0.3);">[Có sẵn Clip B]</span>`;
     }
-    const line = `${statusIcon} [${idx + 1}] ${isImportedBadge}ID: ${_escHtml(p.item_id)} | ${_escHtml(p.name || '')} | ${sym}${_escHtml(price)} | Sold: ${_escHtml(sold)} | Comm: ${_escHtml(comm)}%${clipHint}`;
+    const line = `${statusIcon} [${idx + 1}] ${isImportedBadge}ID: ${_escHtml(p.item_id)} | ${_escHtml(p.name || '')} | ${sym}${_escHtml(price)} | Sold: ${_escHtml(sold)}${msText} | Comm: ${_escHtml(comm)}%${clipHint}`;
     return `<div style="margin-bottom:3px;${p._status === 'completed' ? 'color:#34d399;' : (p._status === 'failed' ? 'color:#f87171;' : (p._status === 'skipped' ? 'color:#64748b;' : ''))}">${line}</div>`;
   }
 
@@ -4316,6 +4332,9 @@
       renderShopeeProductsConsole();
       batchCheckClipsForConsole();
       appendShopeeLog(`✓ Đã nhận thành công ${shopeeClaimedProducts.length} sản phẩm từ Database!`);
+      if (shopeeClaimedProducts.length === 0 && form.min_monthly_sold > 0) {
+        appendShopeeLog(`⚠️ Không có SP đạt Sale/tháng >= ${form.min_monthly_sold} ở thị trường ${form.market} (nếu thị trường này chưa có dữ liệu monthly_sold, đặt Sale/tháng = 0 để tắt lọc).`, "#fbbf24");
+      }
       if (data.blacklisted_count > 0) {
         appendShopeeLog(`🛡️ Blacklist: Đã tự động phát hiện và loại bỏ ${data.blacklisted_count} sản phẩm vi phạm chính sách / từ khóa cấm!`);
       }

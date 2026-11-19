@@ -3130,6 +3130,7 @@ def _get_shopee_settings() -> dict:
         "min_item_id": "40000000000",
         "min_commission": "1",
         "min_sold": "0",
+        "min_monthly_sold": "100",
         "min_price": "0",
         "max_price": "",
         "jobs_per_account": 1,
@@ -3326,6 +3327,119 @@ def save_shopee_db_config(data: dict):
     }
 
 
+def _claim_shopee_jobs_pg(
+    server_url: str,
+    client_id: str,
+    market: str,
+    limit: int,
+    sort_by: str,
+    min_item_id: int,
+    min_commission: float,
+    min_sold: int,
+    min_monthly_sold: int,
+    min_price: float,
+    max_price: float | None,
+) -> tuple[list[dict], int]:
+    """Claim lô sản phẩm trực tiếp trên PostgreSQL shopee_products khi có lọc sale/tháng (monthly_sold)."""
+    import psycopg2.extras
+
+    cols = (
+        "item_id, shop_id, name, price, sold, rating, image_url, "
+        "product_url, commission_rate, market, monthly_sold"
+    )
+    where_parts = [
+        "market = %s",
+        "item_id >= %s",
+        "(CASE WHEN COALESCE(commission_rate, 0) <= 1 THEN COALESCE(commission_rate, 0) * 100.0 ELSE COALESCE(commission_rate, 0) END) >= %s",
+        "COALESCE(sold, 0) >= %s",
+        "monthly_sold >= %s",
+        "COALESCE(price, 0) >= %s",
+        "COALESCE(image_url, '') <> ''",
+    ]
+    filter_params: list = [
+        market,
+        int(min_item_id),
+        float(min_commission),
+        int(min_sold),
+        int(min_monthly_sold),
+        float(min_price),
+    ]
+    if max_price is not None:
+        where_parts.append("COALESCE(price, 0) <= %s")
+        filter_params.append(float(max_price))
+
+    where_sql = " AND ".join(where_parts)
+    ret_cols = ", ".join("p." + c.strip() for c in cols.split(","))
+    if sort_by == "commission":
+        order_sql = "commission_rate DESC NULLS LAST, monthly_sold DESC NULLS LAST, sold DESC NULLS LAST"
+    else:
+        order_sql = "monthly_sold DESC NULLS LAST, sold DESC NULLS LAST"
+
+    conn = _shopee_db_connect(server_url)
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Lấy trước các SP đang dở (processing) của chính máy này mà vẫn đạt bộ lọc
+        cur.execute(
+            f"SELECT {cols} FROM shopee_products "
+            f"WHERE video_status = 'processing' AND claimed_by = %s AND {where_sql} "
+            f"ORDER BY {order_sql} LIMIT %s",
+            [client_id, *filter_params, int(limit)],
+        )
+        rows = list(cur.fetchall())
+
+        remain = max(0, int(limit) - len(rows))
+        if remain > 0:
+            cur.execute(
+                f"WITH picked AS ("
+                f"  SELECT item_id FROM shopee_products "
+                f"  WHERE video_status = 'pending' AND {where_sql} "
+                f"  ORDER BY {order_sql} LIMIT %s "
+                f"  FOR UPDATE SKIP LOCKED"
+                f") "
+                f"UPDATE shopee_products p "
+                f"SET video_status = 'processing', claimed_by = %s, claimed_at = NOW() "
+                f"FROM picked WHERE p.item_id = picked.item_id "
+                f"RETURNING {ret_cols}",
+                [*filter_params, remain, client_id],
+            )
+            rows.extend(cur.fetchall())
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    raw_products = []
+    for r in rows:
+        raw_products.append({
+            "item_id": int(r["item_id"]) if r.get("item_id") is not None else 0,
+            "shop_id": int(r["shop_id"]) if r.get("shop_id") is not None else 0,
+            "name": r.get("name") or "",
+            "price": float(r["price"]) if r.get("price") is not None else 0.0,
+            "sold": int(r["sold"] or 0),
+            "rating": float(r["rating"]) if r.get("rating") is not None else 0.0,
+            "image_url": r.get("image_url") or "",
+            "product_url": r.get("product_url") or "",
+            "commission_rate": float(r["commission_rate"]) if r.get("commission_rate") is not None else 0.0,
+            "market": r.get("market") or market,
+            "monthly_sold": int(r["monthly_sold"]) if r.get("monthly_sold") is not None else None,
+        })
+
+    return shopee_engine.normalize_and_filter_products(
+        raw_products,
+        min_item_id=min_item_id,
+        min_commission=min_commission,
+        min_sold=min_sold,
+        min_monthly_sold=min_monthly_sold,
+        min_price=min_price,
+        max_price=max_price,
+    )
+
+
 @app.post("/api/shopee/claim")
 def claim_shopee_jobs(req: dict):
     cfg = _get_shopee_settings()
@@ -3342,24 +3456,44 @@ def claim_shopee_jobs(req: dict):
     min_item_id = int(req.get("min_item_id") or 40000000000)
     min_commission = float(req.get("min_commission") or 1.0)
     min_sold = int(req.get("min_sold") or 0)
+    raw_ms = req.get("min_monthly_sold")
+    if raw_ms is None or str(raw_ms).strip() == "":
+        raw_ms = cfg.get("min_monthly_sold", 100)
+    min_monthly_sold = max(0, int(raw_ms or 0))
     min_price = float(req.get("min_price") or 0.0)
     max_price = float(req.get("max_price")) if req.get("max_price") else None
 
     try:
-        products, bl_count = shopee_engine.claim_jobs_from_server(
-            server_url=server_url,
-            api_key=api_key,
-            client_id=client_id,
-            market=market,
-            limit=limit,
-            sort_by=sort_by,
-            min_item_id=min_item_id,
-            min_commission=min_commission,
-            min_sold=min_sold,
-            min_price=min_price,
-            max_price=max_price,
-            return_stats=True
-        )
+        if min_monthly_sold > 0:
+            products, bl_count = _claim_shopee_jobs_pg(
+                server_url=server_url,
+                client_id=client_id,
+                market=market,
+                limit=limit,
+                sort_by=sort_by,
+                min_item_id=min_item_id,
+                min_commission=min_commission,
+                min_sold=min_sold,
+                min_monthly_sold=min_monthly_sold,
+                min_price=min_price,
+                max_price=max_price,
+            )
+        else:
+            products, bl_count = shopee_engine.claim_jobs_from_server(
+                server_url=server_url,
+                api_key=api_key,
+                client_id=client_id,
+                market=market,
+                limit=limit,
+                sort_by=sort_by,
+                min_item_id=min_item_id,
+                min_commission=min_commission,
+                min_sold=min_sold,
+                min_monthly_sold=0,
+                min_price=min_price,
+                max_price=max_price,
+                return_stats=True
+            )
         return {"success": True, "count": len(products), "products": products, "blacklisted_count": bl_count}
     except Exception as e:
         raise HTTPException(500, f"Lỗi lấy sản phẩm từ Database: {e}")
@@ -3844,10 +3978,21 @@ def batch_check_shopee_clips(req: dict):
     return {"success": True, "results": {sid: index.inspect(sid) for sid in ids}}
 
 
-def _shopee_db_connect():
+def _shopee_db_connect(server_url: str | None = None):
     import psycopg2
+    import urllib.parse
+
+    host = "100.79.170.67"
+    if server_url:
+        try:
+            raw_url = str(server_url).strip()
+            parsed = urllib.parse.urlsplit(raw_url if "://" in raw_url else f"http://{raw_url}")
+            if parsed.hostname:
+                host = parsed.hostname
+        except Exception:
+            pass
     return psycopg2.connect(
-        host="100.79.170.67",
+        host=host,
         port=5432,
         dbname="shopee_db",
         user="postgres",

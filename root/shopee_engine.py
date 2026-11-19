@@ -1301,6 +1301,78 @@ def parse_price(v, default=0.0) -> float:
         return default
 
 
+def normalize_and_filter_products(
+    raw: list[dict],
+    min_item_id: int = 0,
+    min_commission: float = 0.0,
+    min_sold: int = 0,
+    min_monthly_sold: int = 0,
+    min_price: float = 0.0,
+    max_price: float | None = None,
+) -> tuple[list[dict], int]:
+    """Chuẩn hóa dữ liệu sản phẩm và lọc chặt theo thông số + Blacklist."""
+    bl = get_blacklist()
+    blacklisted_count = 0
+    blacklisted_samples = []
+
+    products = []
+    for item in raw:
+        p = dict(item)
+        try:
+            iid = int(re.sub(r'\D', '', str(p.get("item_id", 0))))
+        except Exception:
+            iid = 0
+        try:
+            rc = float(p.get("commission_rate", 0) or 0)
+            comm = rc * 100.0 if 0 < rc <= 1.0 else rc
+            p["commission_rate"] = comm
+        except Exception:
+            comm = 0.0
+
+        sold_val = parse_count(p.get("sold", 0))
+        ms_raw = p.get("monthly_sold")
+        ms_val = parse_count(ms_raw) if ms_raw is not None and str(ms_raw).strip() != "" else None
+        if ms_val is not None:
+            p["monthly_sold"] = ms_val
+        price_val = parse_price(p.get("price", 0))
+
+        # Lọc chặt chẽ ở client
+        if (min_item_id > 0 and iid < min_item_id) or comm < min_commission \
+                or sold_val < min_sold or price_val < min_price \
+                or (max_price is not None and price_val > max_price):
+            continue
+        if min_monthly_sold > 0 and ms_raw is not None and (ms_val or 0) < min_monthly_sold:
+            continue
+
+        # Kiểm tra Blacklist
+        is_bl, reason = is_product_blacklisted(p, bl)
+        if is_bl:
+            blacklisted_count += 1
+            if len(blacklisted_samples) < 5:
+                blacklisted_samples.append(f"SP {p.get('item_id')}: {reason}")
+            continue
+
+        # Chuẩn hóa link ảnh sản phẩm: đảm bảo luôn có cả image và image_url
+        mkt_code = str(p.get("market") or "ph").strip().lower() or "ph"
+        img_val = str(p.get("image_url") or p.get("image") or "").strip()
+        if not img_val and p.get("images") and isinstance(p["images"], list) and len(p["images"]) > 0:
+            img_val = str(p["images"][0]).strip()
+        if img_val:
+            if img_val.startswith("//"):
+                img_val = "https:" + img_val
+            elif not img_val.startswith(("http://", "https://", "data:")):
+                img_val = f"https://cf.shopee.{mkt_code}/file/{img_val}"
+        p["image"] = img_val
+        p["image_url"] = img_val
+
+        products.append(p)
+
+    if blacklisted_count > 0:
+        log.info("🚫 Blacklist đã loại bỏ %d sản phẩm vi phạm (%s)", blacklisted_count, "; ".join(blacklisted_samples))
+
+    return products, blacklisted_count
+
+
 def claim_jobs_from_server(
     server_url: str | None = None,
     api_key: str | None = None,
@@ -1311,6 +1383,7 @@ def claim_jobs_from_server(
     min_item_id: int = 40000000000,
     min_commission: float = 1.0,
     min_sold: int = 0,
+    min_monthly_sold: int = 0,
     min_price: float = 0.0,
     max_price: float = None,
     return_stats: bool = False,
@@ -1331,6 +1404,8 @@ def claim_jobs_from_server(
         "minCommission": min_commission,
         "min_sold": min_sold,
         "minSold": min_sold,
+        "min_monthly_sold": min_monthly_sold,
+        "minMonthlySold": min_monthly_sold,
         "min_price": min_price,
         "minPrice": min_price,
     }
@@ -1341,56 +1416,15 @@ def claim_jobs_from_server(
     res = call_seed_api(server_url, api_key, "POST", "/api/thinaptm/claim-jobs", payload)
     raw = res.get("products", []) if isinstance(res, dict) else []
 
-    bl = get_blacklist()
-    blacklisted_count = 0
-    blacklisted_samples = []
-
-    products = []
-    for p in raw:
-        try:
-            iid = int(re.sub(r'\D', '', str(p.get("item_id", 0))))
-        except Exception:
-            iid = 0
-        try:
-            rc = float(p.get("commission_rate", 0) or 0)
-            comm = rc * 100.0 if 0 < rc <= 1.0 else rc
-            p["commission_rate"] = comm
-        except Exception:
-            comm = 0.0
-
-        sold_val = parse_count(p.get("sold", 0))
-        price_val = parse_price(p.get("price", 0))
-
-        # Lọc chặt chẽ ở client
-        if (min_item_id > 0 and iid < min_item_id) or comm < min_commission \
-                or sold_val < min_sold or price_val < min_price \
-                or (max_price is not None and price_val > max_price):
-            continue
-
-        # Kiểm tra Blacklist
-        is_bl, reason = is_product_blacklisted(p, bl)
-        if is_bl:
-            blacklisted_count += 1
-            if len(blacklisted_samples) < 5:
-                blacklisted_samples.append(f"SP {p.get('item_id')}: {reason}")
-            continue
-
-        # Chuẩn hóa link ảnh sản phẩm: đảm bảo luôn có cả image và image_url
-        img_val = str(p.get("image_url") or p.get("image") or "").strip()
-        if not img_val and p.get("images") and isinstance(p["images"], list) and len(p["images"]) > 0:
-            img_val = str(p["images"][0]).strip()
-        if img_val:
-            if img_val.startswith("//"):
-                img_val = "https:" + img_val
-            elif not img_val.startswith(("http://", "https://", "data:")):
-                img_val = f"https://cf.shopee.ph/file/{img_val}"
-        p["image"] = img_val
-        p["image_url"] = img_val
-
-        products.append(p)
-
-    if blacklisted_count > 0:
-        log.info("🚫 Blacklist đã loại bỏ %d sản phẩm vi phạm (%s)", blacklisted_count, "; ".join(blacklisted_samples))
+    products, blacklisted_count = normalize_and_filter_products(
+        raw,
+        min_item_id=min_item_id,
+        min_commission=min_commission,
+        min_sold=min_sold,
+        min_monthly_sold=min_monthly_sold,
+        min_price=min_price,
+        max_price=max_price,
+    )
 
     if return_stats:
         return products, blacklisted_count
