@@ -1212,6 +1212,21 @@ class Store:
     def get_task(self, tid: str) -> dict | None:
         return self.tasks.get(tid)
 
+    def fail_interrupted_tasks(self) -> int:
+        """Đóng hàng loạt task ảnh/video còn treo khi khởi động lại, chỉ ghi tasks.json 1 lần."""
+        now_ts = int(time.time())
+        changed = 0
+        with _TASK_LOCK:
+            for t in self.tasks.values():
+                if t.get("kind") in ("image", "video") and t.get("status") in ("queued", "processing"):
+                    t["status"] = "failed"
+                    t["error"] = "Dịch vụ khởi động lại làm gián đoạn tác vụ, hãy gửi lại"
+                    t["updated_at"] = now_ts
+                    changed += 1
+            if changed > 0:
+                self._flush_tasks_locked()
+        return changed
+
     def list_tasks(self, limit: int = 50) -> list[dict]:
         with _TASK_LOCK:
             items = list(self.tasks.values())

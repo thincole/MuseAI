@@ -5618,9 +5618,10 @@ async def _startup():
     skip_ex = store.set_skip_exhausted(sp_init.get("skip_exhausted_accounts", False))
     log.info("🔋 Bỏ qua TK hết token khi giao việc: %s", "BẬT" if skip_ex else "tắt")
     # Luồng xử lý (ảnh lẫn video) đã chết khi tắt app: đóng các task còn treo để không bị đếm/kẹt mãi.
-    for task in list(store.tasks.values()):
-        if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
-            store.update_task(task["id"], status="failed", error="Dịch vụ khởi động lại làm gián đoạn tác vụ, hãy gửi lại")
+    try:
+        store.fail_interrupted_tasks()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Không đóng được task cũ khi khởi động: %s", exc)
     # Key rỗng hoặc trùng key mặc định công khai (ai đọc source cũng biết) -> tự sinh key ngẫu nhiên.
     if not CFG.api_key or CFG.api_key in _PUBLIC_DEFAULT_KEYS:
         new_key = "m2a_" + secrets.token_hex(24)

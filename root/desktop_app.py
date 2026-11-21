@@ -198,49 +198,77 @@ class DesktopAPI:
             return {"success": False, "error": str(e)}
 
 
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _is_server_running(url: str) -> bool:
-    """Kiểm tra máy chủ FastAPI có đang phản hồi không."""
+    """Kiểm tra máy chủ FastAPI có đang phản hồi không (đi thẳng loopback, bỏ qua proxy Windows)."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "MuseStudioHealthCheck"})
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
+        with _LOOPBACK_OPENER.open(req, timeout=1.5) as resp:
             return resp.status in (200, 401, 404)
     except Exception:
         return False
 
 
-def _start_background_server():
+def _start_background_server(err_box: dict | None = None):
     """Khởi chạy máy chủ FastAPI ngầm trong luồng daemon."""
-    import uvicorn
-    from app import app
+    try:
+        import uvicorn
+        from app import app
 
-    uvicorn.run(
-        app,
-        host=CFG.host or "127.0.0.1",
-        port=CFG.port or 18610,
-        log_level="warning",
-        access_log=False,
-    )
+        uvicorn.run(
+            app,
+            host=CFG.host or "127.0.0.1",
+            port=CFG.port or 18610,
+            log_level="warning",
+            access_log=False,
+        )
+    except BaseException as exc:  # noqa: BLE001
+        if err_box is not None:
+            err_box["error"] = f"{type(exc).__name__}: {exc}"
 
 
 def main():
     CFG.ensure_dirs()
-    server_url = f"http://127.0.0.1:{CFG.port or 18610}"
+    port = CFG.port or 18610
+    server_url = f"http://127.0.0.1:{port}"
+    probe_url = f"{server_url}/api/studio/config"
 
     print(f"[*] Khởi động MuseAI Video Studio Pro...")
     print(f"[*] Thư mục lưu trữ: {CFG.media_dir}")
     print(f"[*] Trình duyệt: {CFG.chromium}")
 
     # Kiểm tra máy chủ đã chạy chưa
-    if not _is_server_running(f"{server_url}/api/studio/config"):
-        print(f"[*] Đang khởi chạy máy chủ backend trên cổng {CFG.port or 18610}...")
-        t = threading.Thread(target=_start_background_server, daemon=True)
+    if not _is_server_running(probe_url):
+        print(f"[*] Đang khởi chạy máy chủ backend trên cổng {port}...")
+        err_box: dict = {}
+        t = threading.Thread(target=_start_background_server, args=(err_box,), daemon=True)
         t.start()
 
-        # Đợi máy chủ sẵn sàng
-        for _ in range(30):
+        # Đợi máy chủ thực sự lắng nghe trên loopback (tối đa ~30 giây), dừng sớm nếu thread backend thoát lỗi
+        ready = False
+        for _ in range(150):
             time.sleep(0.2)
-            if _is_server_running(f"{server_url}/api/studio/config"):
+            if _is_server_running(probe_url):
+                ready = True
                 break
+            if not t.is_alive():
+                break
+
+        if not ready:
+            detail = err_box.get("error") or (
+                "Tiến trình máy chủ backend đã tự thoát trước khi mở cổng"
+                if not t.is_alive()
+                else f"Quá thời gian chờ cổng {port} phản hồi"
+            )
+            print(f"[!] KHÔNG THỂ KHỞI ĐỘNG MÁY CHỦ TRÊN {server_url} ({detail}).")
+            print(f"[!] Gợi ý kiểm tra:")
+            print(f"    1. Đóng tiến trình python/uvicorn cũ đang chiếm cổng {port} (hoặc đổi MUSE2API_PORT).")
+            print(f"    2. Kiểm tra file .env: đảm bảo MUSE2API_HOST=0.0.0.0 (hoặc 127.0.0.1), hiện đang là '{CFG.host}'.")
+            print(f"    3. Xem chi tiết lỗi tại: {os.path.join(BASE_DIR, 'log.txt')}")
+            sys.exit(1)
+
         print(f"[+] Máy chủ đã hoạt động: {server_url}")
     else:
         print(f"[+] Máy chủ đã sẵn sàng từ trước: {server_url}")
