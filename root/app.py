@@ -108,6 +108,7 @@ async def _require_key_for_internal_api(request: Request, call_next):
 
 store = Store(CFG)
 engine = MuseEngine(CFG)
+store.set_warm_ids_provider(engine.get_warm_idle_account_ids)
 GEN_LOCK = threading.Lock()
 IMAGE_TASK_LOCK = threading.Lock()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1050,6 +1051,48 @@ _NEUTRAL_PROMPT_SUFFIX = (
 )
 
 
+_SLOW_PROXY_LOCK = threading.Lock()
+_SLOW_PROXY_STREAK: dict[str, int] = {}
+_SLOW_PROXY_ROTATE_TS: dict[str, float] = {}
+_SLOW_PROXY_THRESHOLD_SEC = float(os.environ.get("MUSE2API_SLOW_PROXY_SEC", "28") or 28)
+_SLOW_PROXY_STREAK_LIMIT = 3
+
+
+def _track_proxy_open_speed(aid: str, open_seconds: float):
+    """Phát hiện proxy quá chậm (>28s mở trang muse.ai 3 lần liên tiếp) -> tự xoay sang proxy nhanh hơn ngoài nền."""
+    if not aid or not open_seconds or open_seconds <= 0 or store.is_hub_client():
+        return
+    should_rotate = False
+    now = time.time()
+    with _SLOW_PROXY_LOCK:
+        if open_seconds >= _SLOW_PROXY_THRESHOLD_SEC:
+            n = _SLOW_PROXY_STREAK.get(aid, 0) + 1
+            _SLOW_PROXY_STREAK[aid] = n
+            if n >= _SLOW_PROXY_STREAK_LIMIT and (now - _SLOW_PROXY_ROTATE_TS.get(aid, 0.0)) >= 900:
+                _SLOW_PROXY_STREAK[aid] = 0
+                _SLOW_PROXY_ROTATE_TS[aid] = now
+                should_rotate = True
+        elif open_seconds <= 20.0:
+            _SLOW_PROXY_STREAK.pop(aid, None)
+
+    if should_rotate:
+        def _rotate():
+            try:
+                import proxy_manager
+                if not proxy_manager.is_proxy_enabled():
+                    return
+                old_p = proxy_manager.get_account_proxy(aid)
+                new_p = proxy_manager.rotate_proxy_for_account(aid)
+                if new_p and new_p != old_p:
+                    engine.close_session_for_account(aid)
+                    log.warning("🐢 [Slow-Proxy Eviction] TK %s mở trang chậm %.1fs (%d lần liên tiếp) -> tự đổi proxy mới để tăng tốc",
+                                aid, open_seconds, _SLOW_PROXY_STREAK_LIMIT)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("[Slow-Proxy Eviction] Không xoay được proxy TK %s: %s", aid, exc)
+
+        threading.Thread(target=_rotate, daemon=True, name=f"slow-px-{aid[:6]}").start()
+
+
 _QUOTA_CHECK_SLOTS = threading.BoundedSemaphore(3)  # tối đa 3 lần đọc hạn mức cùng lúc (mỗi lần mở 1 tab tạm)
 _AUTO_QUOTA_REFRESH_LOCK = threading.Lock()
 _AUTO_QUOTA_REFRESH_TS: dict[str, float] = {}
@@ -1150,12 +1193,14 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 if remaining <= 0:
                     raise MuseGenerationError("Đã hết thời gian chờ tác vụ")
 
+                t_gen_start = time.monotonic()
                 session = engine.acquire_session(
                     account_id=cur_acc["id"],
                     cookies=cur_acc["cookies"],
                     expires=cur_acc.get("cookies_exp"),
                     timeout=75
                 )
+                _track_proxy_open_speed(cur_acc["id"], getattr(session, "open_seconds", 0.0))
                 res = session.generate(
                     prompt=prompt,
                     expect=kind,
@@ -1163,8 +1208,9 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     on_progress=on_progress,
                     reference_image=reference_image
                 )
+                gen_duration_s = max(1.0, time.monotonic() - t_gen_start)
                 store.touch_keepalive(cur_acc["id"], True, "Phiên hợp lệ · Sẵn sàng")
-                store.record_vm_ok(cur_acc["id"])
+                store.record_vm_ok(cur_acc["id"], duration_s=gen_duration_s)
                 _TEXT_ONLY_STREAK.pop(cur_acc["id"], None)
                 _TEXT_ONLY_LEVEL.pop(cur_acc["id"], None)
                 _record_gen_event(True)
@@ -2179,7 +2225,31 @@ def del_account(aid: str, _=Depends(admin_auth)):
     ok = store.delete_account(aid)
     if not ok:
         raise HTTPException(404, "Tài khoản không tồn tại")
+    try:
+        engine.close_session_for_account(aid)
+    except Exception:
+        pass
     return {"deleted": True, "id": aid}
+
+
+@app.post("/admin/accounts/bulk-delete")
+def bulk_delete_accounts(payload: dict = Body(default={}), _=Depends(admin_auth)):
+    """Xóa hàng loạt tài khoản theo chế độ: 'all' (tất cả), 'locked' (bị khoá), 'exhausted' (hết token)."""
+    mode = str((payload or {}).get("mode") or "").strip().lower()
+    if mode not in ("all", "locked", "exhausted"):
+        raise HTTPException(400, f"Chế độ xóa không hợp lệ: {mode!r}")
+    removed_ids = store.delete_accounts_by_mode(mode)
+    for aid in removed_ids:
+        try:
+            engine.close_session_for_account(aid)
+        except Exception:
+            pass
+    return {
+        "ok": True,
+        "mode": mode,
+        "deleted": len(removed_ids),
+        "remaining": len(store.list_accounts()),
+    }
 
 
 def _sync_from_manual_browser(aid: str) -> dict:
@@ -3135,6 +3205,7 @@ def _get_shopee_settings() -> dict:
         "max_price": "",
         "jobs_per_account": 1,
         "account_dispatch_mode": "even",
+        "threads_mode": "manual",
         "ffmpeg_concurrency": shopee_engine.FFMPEG_CONCURRENCY,
         "skip_exhausted_accounts": True
     }
@@ -3540,12 +3611,163 @@ def shopee_fail_stats(window_minutes: int = 60):
     return gen_stats(max(1, min(window_minutes, 1440)) * 60.0)
 
 
+_CPU_SAMPLE_LOCK = threading.Lock()
+_CPU_LAST_SAMPLE_TS = 0.0
+_CPU_EWMA_PCT = 0.0
+_CPU_PREV_WIN_TIMES: tuple[int, int, int] | None = None
+
+
+def _sample_cpu_pct() -> float:
+    """Đo % CPU hiện tại không chặn luồng (EWMA làm mượt, hỗ trợ cả psutil lẫn Windows GetSystemTimes)."""
+    global _CPU_LAST_SAMPLE_TS, _CPU_EWMA_PCT, _CPU_PREV_WIN_TIMES
+    now = time.monotonic()
+    with _CPU_SAMPLE_LOCK:
+        if now - _CPU_LAST_SAMPLE_TS < 1.5 and _CPU_LAST_SAMPLE_TS > 0:
+            return round(_CPU_EWMA_PCT, 1)
+        raw_pct = None
+        try:
+            import psutil
+            val = float(psutil.cpu_percent(interval=None))
+            if _CPU_LAST_SAMPLE_TS > 0 or val > 0:
+                raw_pct = val
+        except Exception:
+            pass
+        if raw_pct is None and os.name == "nt":
+            try:
+                import ctypes
+                class _FileTime(ctypes.Structure):
+                    _fields_ = [("dwLowDateTime", ctypes.c_uint32), ("dwHighDateTime", ctypes.c_uint32)]
+                idle_ft, kern_ft, user_ft = _FileTime(), _FileTime(), _FileTime()
+                if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle_ft), ctypes.byref(kern_ft), ctypes.byref(user_ft)):
+                    to_int = lambda ft: (ft.dwHighDateTime << 32) | ft.dwLowDateTime  # noqa: E731
+                    cur = (to_int(idle_ft), to_int(kern_ft), to_int(user_ft))
+                    if _CPU_PREV_WIN_TIMES is not None:
+                        d_idle = cur[0] - _CPU_PREV_WIN_TIMES[0]
+                        d_total = (cur[1] - _CPU_PREV_WIN_TIMES[1]) + (cur[2] - _CPU_PREV_WIN_TIMES[2])
+                        if d_total > 0:
+                            raw_pct = max(0.0, min(100.0, (1.0 - d_idle / d_total) * 100.0))
+                    _CPU_PREV_WIN_TIMES = cur
+            except Exception:
+                pass
+        _CPU_LAST_SAMPLE_TS = now
+        if raw_pct is not None:
+            _CPU_EWMA_PCT = raw_pct if _CPU_EWMA_PCT <= 0 else (0.45 * raw_pct + 0.55 * _CPU_EWMA_PCT)
+        return round(_CPU_EWMA_PCT, 1)
+
+
+class SmartThreadController:
+    """Bộ điều khiển luồng động theo thuật toán AIMD + Dual-Backpressure (RAM, CPU, timeout và số ô TK Muse)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._current = 0
+        self._last_adjust_ts = 0.0
+        self._high_cpu_streak = 0
+        self._reason = "Khởi tạo"
+
+    def evaluate(self, mode: str = "manual", requested: int = 0, reset: bool = False) -> dict:
+        auto_mode = str(mode or "").strip().lower() in ("auto", "smart", "aimd")
+        sys_cap = system_capacity()
+        cpu_pct = _sample_cpu_pct()
+        ram_used_pct = float(sys_cap.get("ram_used_pct") or 0)
+        ram_avail_gb = float(sys_cap.get("ram_available_gb") or 0)
+        machine_max = max(1, int(sys_cap.get("max_threads") or 8))
+
+        # Điều tiết FFmpeg tự động theo tải CPU để không làm nghẽn Chrome WebSocket
+        shopee_engine.apply_dynamic_ffmpeg_throttle(cpu_pct)
+        ff_st = shopee_engine.get_ffmpeg_status()
+
+        snap = dict(store.capacity_snapshot() or {})
+        slots = max(0, int(snap.get("slots") or 0))
+        pool_total, pool_in_use = engine.active_session_counts()
+
+        st5 = gen_stats(300.0)
+        total_5m = int(st5.get("total") or 0)
+        ok_5m = int(st5.get("ok") or 0)
+        timeout_5m = int((st5.get("fail_reasons") or {}).get("Hết giờ chờ", 0))
+        timeout_rate = (timeout_5m / total_5m) if total_5m >= 8 else 0.0
+        goodput_vpm = round(ok_5m / 5.0, 2)
+
+        req_cap = max(1, int(requested or 0)) if not auto_mode and int(requested or 0) > 0 else machine_max
+        # Nếu tạm thời mọi TK đều cooldown (slots == 0), giữ tối thiểu vài luồng để chờ TK mở lại
+        slot_cap = slots if slots > 0 else min(4, machine_max, req_cap)
+        hard_cap = max(1, min(req_cap, machine_max, slot_cap))
+        floor = min(hard_cap, max(2, min(6, int(hard_cap * 0.2))))
+
+        now = time.monotonic()
+        with self._lock:
+            if reset or self._current <= 0:
+                if auto_mode:
+                    self._current = max(floor, min(hard_cap, int(round(hard_cap * 0.65))))
+                else:
+                    self._current = hard_cap
+                self._high_cpu_streak = 0
+                self._last_adjust_ts = now
+                self._reason = "Khởi động thông minh (AIMD)" if auto_mode else "Mức cấu hình"
+            elif now - self._last_adjust_ts >= 8.0:
+                self._last_adjust_ts = now
+                if cpu_pct >= 92.0:
+                    self._high_cpu_streak += 1
+                else:
+                    self._high_cpu_streak = 0
+
+                if ram_used_pct >= 88.0 or ram_avail_gb < 3.0:
+                    self._current = max(floor, int(self._current * 0.75))
+                    self._reason = f"Giảm tải RAM ({ram_used_pct:.0f}%, trống {ram_avail_gb:.1f}GB)"
+                elif self._high_cpu_streak >= 2:
+                    self._current = max(floor, int(self._current * 0.80))
+                    self._reason = f"Giảm tải CPU ({cpu_pct:.0f}%)"
+                elif timeout_rate >= 0.30:
+                    self._current = max(floor, int(self._current * 0.80))
+                    self._reason = f"Giảm do timeout cao ({timeout_rate*100:.0f}%)"
+                elif self._current > hard_cap:
+                    self._current = hard_cap
+                    self._reason = "Khớp giới hạn TK sống / sức máy"
+                elif (
+                    self._current < hard_cap
+                    and ram_used_pct < 80.0
+                    and ram_avail_gb >= 4.0
+                    and cpu_pct < 80.0
+                    and timeout_rate < 0.15
+                ):
+                    gap = hard_cap - self._current
+                    step = 4 if gap >= 16 else (2 if gap >= 4 else 1)
+                    self._current = min(hard_cap, self._current + step)
+                    self._reason = f"Tăng tốc +{step} (AIMD)"
+                else:
+                    self._reason = "Ổn định tối ưu"
+
+            rec = max(1, min(self._current, hard_cap))
+            reason = self._reason
+
+        snap.update({
+            "threads_hint": rec if auto_mode else snap.get("slots", 0),
+            "recommended_workers": rec,
+            "hard_cap": hard_cap,
+            "scheduler_mode": "auto" if auto_mode else "manual",
+            "reason": reason,
+            "cpu_pct": cpu_pct,
+            "ram_used_pct": ram_used_pct,
+            "ram_available_gb": ram_avail_gb,
+            "machine_max_threads": machine_max,
+            "active_sessions": pool_total,
+            "sessions_in_use": pool_in_use,
+            "ffmpeg_active": ff_st["active"],
+            "ffmpeg_limit": ff_st["limit"],
+            "ffmpeg_base": ff_st["base"],
+            "goodput_vpm": goodput_vpm,
+            "timeout_rate_5m": round(timeout_rate, 3),
+        })
+        return snap
+
+
+_SMART_SCHED = SmartThreadController()
+
+
 @app.get("/api/shopee/capacity")
-def shopee_capacity():
-    """Số TK dùng được và số 'ô' việc song song hiện có (giao diện dùng để tự hạ số luồng khi có ít TK tốt)."""
-    snap = store.capacity_snapshot()
-    snap["threads_hint"] = snap["slots"]
-    return snap
+def shopee_capacity(mode: str = "manual", requested: int = 0, reset: bool = False):
+    """Telemetry tài nguyên máy + kho TK Muse + khuyến nghị số luồng động theo thuật toán AIMD."""
+    return _SMART_SCHED.evaluate(mode=mode, requested=requested, reset=reset)
 
 
 def reclaim_stale_processing(hours: float = 24.0, market: str = "PH") -> int:
@@ -4632,6 +4854,7 @@ def system_capacity():
         "ram_total_gb": round(total_gb, 1),
         "ram_available_gb": round(avail_gb, 1),
         "ram_used_pct": round((1 - avail_gb / total_gb) * 100) if total_gb else 0,
+        "cpu_pct": _sample_cpu_pct(),
         "cpu_threads": cpu,
         "ram_cap": ram_cap,
         "cpu_cap": cpu_cap,

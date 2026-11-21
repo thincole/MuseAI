@@ -124,7 +124,7 @@ class Config:
 
     # Trình duyệt Anti-Detect & TTL (Tránh phát hiện bot & rò rỉ IP)
     browser_ttl_seconds: int = field(default_factory=lambda: int(_env("MUSE2API_BROWSER_TTL", "1800")))
-    browser_max_tasks: int = field(default_factory=lambda: int(_env("MUSE2API_BROWSER_MAX_TASKS", "5")))
+    browser_max_tasks: int = field(default_factory=lambda: int(_env("MUSE2API_BROWSER_MAX_TASKS", "10")))
     browser_process_ttl_seconds: int = field(default_factory=lambda: int(_env("MUSE2API_PROCESS_TTL", "7200")))
     anti_detect: bool = field(default_factory=lambda: _env("MUSE2API_ANTI_DETECT", "1").strip() != "0")
 

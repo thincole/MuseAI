@@ -92,6 +92,18 @@ def account_exhausted(acc: dict, today: date | None = None) -> bool:
     return not (reset and today >= reset)
 
 
+def is_quota_exhausted_badge(acc: dict) -> bool:
+    """Kiểm tra TK có đang ở trạng thái 'Hết token' (0 token phụ & tuần >= 100% hoặc chưa rõ) để hiển thị/dọn dẹp."""
+    q = (acc or {}).get("quota") or {}
+    if not q.get("found"):
+        return False
+    tokens = parse_token_count(q.get("extra_left"))
+    if tokens != 0:
+        return False
+    weekly = q.get("weekly_used_pct")
+    return weekly is None or weekly >= 100
+
+
 def normalize_jobs_per_account(n) -> int:
     try:
         return 2 if int(n) >= 2 else 1
@@ -101,19 +113,49 @@ def normalize_jobs_per_account(n) -> int:
 
 def normalize_dispatch_mode(mode) -> str:
     val = str(mode or "").strip().lower()
-    return "concentrate" if val in ("concentrate", "pack", "24h", "fast24h", "sticky") else "even"
+    if val in ("smart", "auto", "adaptive", "max", "bandit", "fast"):
+        return "smart"
+    if val in ("concentrate", "pack", "24h", "fast24h", "sticky"):
+        return "concentrate"
+    return "even"
 
 
-def account_sort_key(acc: dict, busy_slots: int, mode: str | None = None, now_ts: float | None = None) -> tuple:
+def account_sort_key(
+    acc: dict,
+    busy_slots: int,
+    mode: str | None = None,
+    now_ts: float | None = None,
+    warm_ids: set[str] | None = None,
+) -> tuple:
     """Khóa sắp xếp chọn tài khoản:
     - 'even': chia đều luân phiên (ưu tiên 0 slot trước, ít dùng gần đây nhất).
     - 'concentrate': dồn từng TK chạm trần 24h nhanh (ưu tiên TK khỏe không vừa lỗi, lấp đủ 2 slot trước khi mở TK mới, giữ tab ấm).
+    - 'smart': tối đa hóa sản lượng video/phút — kết hợp độ ấm phiên Chrome (warm session), tỉ lệ thành công EWMA,
+      tốc độ phản hồi proxy/VM, độ ưu tiên khám phá công bằng (tránh bỏ đói TK cũ) và hạn mức token.
     """
     ok_rank = 0 if acc.get("ok") is not False else 1
     m = mode or Store.ACCOUNT_DISPATCH_MODE
+    t = time.time() if now_ts is None else now_ts
+    aid = acc["id"]
+    if m == "smart":
+        recent_fail = 1 if (t - Store._LAST_FAIL_TS.get(aid, 0.0)) < 120.0 else 0
+        dq = Store._OUTCOMES.get(aid)
+        # Bayesian prior 0.75 (2.25 / 3) để TK mới có cơ hội thăm dò, TK hay lỗi nhanh chóng bị hạ điểm
+        eff_rate = ((sum(dq) + 2.25) / (len(dq) + 3.0)) if dq else 0.75
+        lat = Store._LATENCY_EWMA.get(aid, 75.0)
+        speed_bonus = 60.0 / max(20.0, min(lat, 240.0))
+        is_warm = bool(warm_ids and aid in warm_ids)
+        warm_bonus = 1.6 if (is_warm and busy_slots == 0) else (0.5 if is_warm else 0.0)
+        lu = acc.get("last_used") or 0.0
+        idle_min = max(0.0, (t - lu) / 60.0) if lu else 120.0
+        fairness_bonus = min(2.4, idle_min / 25.0)
+        tok = parse_token_count((acc.get("quota") or {}).get("extra_left"))
+        token_bonus = 0.4 if (tok is not None and tok >= 200e6) else (-0.25 if (tok is not None and tok < 50e6) else 0.0)
+        slot_penalty = 0.9 * busy_slots
+        score = 4.0 * eff_rate + 1.8 * speed_bonus + warm_bonus + fairness_bonus + token_bonus - slot_penalty
+        return (ok_rank, recent_fail, -round(score, 4), lu)
     if m == "concentrate":
-        t = time.time() if now_ts is None else now_ts
-        recent_fail = 1 if (t - Store._LAST_FAIL_TS.get(acc["id"], 0.0)) < 180.0 else 0
+        recent_fail = 1 if (t - Store._LAST_FAIL_TS.get(aid, 0.0)) < 180.0 else 0
         return (ok_rank, recent_fail, -busy_slots, -(acc.get("last_used") or 0.0), -(acc.get("use_count") or 0))
     return (busy_slots, ok_rank, acc.get("last_used") or 0.0, acc.get("use_count") or 0)
 
@@ -536,13 +578,57 @@ class Store:
                        and a.get("ok") is not False
                        and (not a.get("expires_at") or a["expires_at"] > now_ts))
 
+    def _purge_account_runtime(self, aid: str):
+        for dct in (
+            self._COOLDOWN_UNTIL, self._STUCK_STREAK, self._TIMEOUT_STREAK,
+            self._ATTACH_STREAK, self._OUTCOMES, self._OUTCOME_TS,
+            self._LAST_FAIL_TS, self._LAST_ACQUIRE_TS, self._LATENCY_EWMA,
+        ):
+            dct.pop(aid, None)
+
     def delete_account(self, aid: str) -> bool:
-        with _LOCK:
+        with self._COND:
             self._sync_from_disk()
             n = len(self.accounts)
             self.accounts = [a for a in self.accounts if a["id"] != aid]
-            self._save_accounts()
-            return len(self.accounts) != n
+            if len(self.accounts) != n:
+                self._purge_account_runtime(aid)
+                self._save_accounts()
+                self._COND.notify_all()
+                return True
+            return False
+
+    def delete_accounts_by_mode(self, mode: str) -> list[str]:
+        """Xóa hàng loạt tài khoản theo chế độ: 'all', 'locked', 'exhausted'.
+        Tự sao lưu kho hiện tại ra data/backups trước khi xóa và chỉ ghi đĩa 1 lần."""
+        if self.is_hub_client():
+            return []
+        m = str(mode or "").strip().lower()
+        if m not in ("all", "locked", "exhausted"):
+            raise ValueError(f"Unsupported delete mode: {mode!r}")
+
+        def _matches(acc: dict) -> bool:
+            if m == "all":
+                return True
+            if m == "locked":
+                return bool(acc.get("muse_locked"))
+            return is_quota_exhausted_badge(acc) or account_exhausted(acc)
+
+        with self._COND:
+            self._sync_from_disk()
+            removed_ids = [a["id"] for a in self.accounts if _matches(a)]
+            if not removed_ids:
+                return []
+            if self.accounts:
+                self._save_accounts(force=True)
+                backup_accounts(self.cfg.accounts_file, force=True)
+            rem_set = set(removed_ids)
+            self.accounts = [a for a in self.accounts if a["id"] not in rem_set]
+            for aid in removed_ids:
+                self._purge_account_runtime(aid)
+            self._save_accounts(force=True)
+            self._COND.notify_all()
+            return removed_ids
 
     def pick_account(self, preferred_id: str | None = None, rotate: bool = True,
                      force_rotate: bool = False, exclude_id: str | None = None) -> dict | None:
@@ -585,8 +671,10 @@ class Store:
     _BUSY_COUNT: dict[str, int] = {}
     _LAST_ACQUIRE_TS: dict[str, float] = {}
     _LAST_FAIL_TS: dict[str, float] = {}
+    _LATENCY_EWMA: dict[str, float] = {}
+    _WARM_IDS_PROVIDER = None
     MAX_JOBS_PER_ACCOUNT = 1
-    # Chế độ chia TK: "even" = chia đều luân phiên, "concentrate" = dồn TK đang chạy chạm limit 24h nhanh nhất.
+    # Chế độ chia TK: "smart" = tối ưu tốc độ & warm session, "even" = chia đều, "concentrate" = dồn chạm limit 24h nhanh.
     ACCOUNT_DISPATCH_MODE = "even"
     # Khoảng cách tối thiểu (giây) trước khi giao luồng thứ 2 vào cùng 1 tài khoản đang bận để tránh nghẽn máy ảo Muse.
     SAME_ACCOUNT_STAGGER_SECONDS = 15.0
@@ -594,6 +682,34 @@ class Store:
     SKIP_EXHAUSTED = True
     _last_all_exhausted_warn = 0.0
     _COND = threading.Condition(_LOCK)
+
+    @classmethod
+    def set_warm_ids_provider(cls, provider_fn):
+        cls._WARM_IDS_PROVIDER = provider_fn
+
+    @classmethod
+    def _get_warm_ids(cls) -> set[str]:
+        fn = cls._WARM_IDS_PROVIDER
+        if not callable(fn):
+            return set()
+        try:
+            res = fn()
+            return set(res) if res else set()
+        except Exception:
+            return set()
+
+    def record_latency(self, aid: str, duration_s: float):
+        """Cập nhật EWMA thời gian tạo video thành công (giây) cho tài khoản (dùng cho chế độ 'smart')."""
+        try:
+            d = float(duration_s)
+        except (TypeError, ValueError):
+            return
+        if d <= 0:
+            return
+        d = max(5.0, min(d, 360.0))
+        with self._COND:
+            prev = self._LATENCY_EWMA.get(aid)
+            self._LATENCY_EWMA[aid] = d if prev is None else (0.35 * d + 0.65 * prev)
 
     def set_skip_exhausted(self, on) -> bool:
         with self._COND:
@@ -730,20 +846,45 @@ class Store:
             total = int(st.get("total_accounts") or 0)
             usable = int(st.get("alive_accounts") or 0)
             slots = int(st.get("total_slots") or (usable * base))
-            return {"accounts_total": total, "accounts_usable": usable, "slots": slots, "jobs_per_account": base, "is_hub_client": True}
+            return {
+                "accounts_total": total,
+                "accounts_usable": usable,
+                "slots": slots,
+                "jobs_per_account": base,
+                "warm_accounts": len(Store._get_warm_ids()),
+                "busy_total": sum(self._BUSY_COUNT.values()),
+                "dispatch_mode": Store.ACCOUNT_DISPATCH_MODE,
+                "is_hub_client": True,
+            }
         with self._COND:
             base = Store.MAX_JOBS_PER_ACCOUNT
             live = [a for a in self.accounts if a.get("enabled", True) and (a.get("cookies") or {}).get("hatch_vml")]
             usable = [a for a in live if not a.get("muse_locked") and not self.in_cooldown(a["id"])]
+            if Store.SKIP_EXHAUSTED and live and not all(account_exhausted(a) for a in live):
+                usable = [a for a in usable if not account_exhausted(a)]
             slots = sum(self.effective_limit(a["id"], base) for a in usable)
-            return {"accounts_total": len(self.accounts), "accounts_usable": len([a for a in usable if self.effective_limit(a["id"], base) > 0]),
-                    "slots": slots, "jobs_per_account": base}
+            usable_ids = {a["id"] for a in usable if self.effective_limit(a["id"], base) > 0}
+            warm_ids = Store._get_warm_ids() & usable_ids
+            return {
+                "accounts_total": len(self.accounts),
+                "accounts_usable": len(usable_ids),
+                "slots": slots,
+                "jobs_per_account": base,
+                "warm_accounts": len(warm_ids),
+                "busy_total": sum(self._BUSY_COUNT.values()),
+                "dispatch_mode": Store.ACCOUNT_DISPATCH_MODE,
+            }
 
-    def record_vm_ok(self, aid: str):
-        """TK vừa render thành công: xóa chuỗi kẹt và giờ nghỉ."""
+    def record_vm_ok(self, aid: str, duration_s: float | None = None):
+        """TK vừa render thành công: xóa chuỗi kẹt và giờ nghỉ, cập nhật tốc độ EWMA."""
+        if duration_s is not None:
+            self.record_latency(aid, duration_s)
         if self.is_hub_client():
             with self._COND:
-                self._HUB_PENDING_FB.setdefault(aid, {})["vm_ok"] = True
+                fb = self._HUB_PENDING_FB.setdefault(aid, {})
+                fb["vm_ok"] = True
+                if duration_s is not None:
+                    fb["duration_s"] = round(float(duration_s), 2)
             return
         self.record_outcome(aid, True)
         with self._COND:
@@ -854,7 +995,8 @@ class Store:
                         )
                         wait_hint = min(2.0, soonest)
                     else:
-                        pick_key = lambda a: account_sort_key(a, busy.get(a["id"], 0) + self._hub_remote_busy(a["id"]), now_ts=now_ts)  # noqa: E731
+                        warm_ids = Store._get_warm_ids()
+                        pick_key = lambda a: account_sort_key(a, busy.get(a["id"], 0) + self._hub_remote_busy(a["id"]), now_ts=now_ts, warm_ids=warm_ids)  # noqa: E731
                         pref = next((a for a in ready if a["id"] == preferred_id and a.get("ok") is not False), None) if preferred_id else None
                         acc = pref if pref else min(ready, key=pick_key)
 
@@ -945,6 +1087,7 @@ class Store:
             self._ATTACH_STREAK.clear()
             self._OUTCOMES.clear()
             self._OUTCOME_TS.clear()
+            self._LATENCY_EWMA.clear()
             self._save_accounts(force=True)
             self._COND.notify_all()
             return count

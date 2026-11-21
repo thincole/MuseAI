@@ -1370,6 +1370,12 @@
               <button class="btn-header" id="btnDeleteLockedAccs" onclick="deleteLockedAccounts()" style="background:rgba(239,68,68,0.18);border:1px solid #ef4444;color:#f87171;" title="Xóa toàn bộ các tài khoản đang bị khoá (Muse is disconnected) khỏi hệ thống">
                 🗑 Xóa TK bị khoá
               </button>
+              <button class="btn-header" id="btnDeleteExhaustedAccs" onclick="deleteExhaustedAccounts()" style="background:rgba(245,158,11,0.18);border:1px solid #f59e0b;color:#fbbf24;" title="Xóa toàn bộ các tài khoản đã hết sạch token (0 token phụ & 100% gói tuần theo lần kiểm tra gần nhất)">
+                🧹 Xóa TK hết token
+              </button>
+              <button class="btn-header" id="btnDeleteAllAccs" onclick="deleteAllAccounts()" style="background:rgba(220,38,38,0.28);border:1px solid #dc2626;color:#fca5a5;" title="Xóa vĩnh viễn TẤT CẢ tài khoản khỏi hệ thống (có bản sao lưu tự động tại data/backups/)">
+                💣 Xóa tất cả
+              </button>
             </div>
           </div>
 
@@ -1785,7 +1791,8 @@
               <!-- Concurrency thread selector control -->
               <div style="display:flex;align-items:center;gap:6px;background:rgba(56,189,248,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(56,189,248,0.35);" title="Chọn số luồng chạy song song để máy tính không bị quá tải. Hệ thống sẽ tự động ép số luồng không bao giờ vượt quá số tài khoản còn sống.">
                 <span style="font-size:12px;font-weight:700;color:#38bdf8;">⚡ Luồng chạy song song:</span>
-                <select class="shopee-select" id="sp_threads_select" onchange="onShopeeThreadsChange()" style="font-weight:bold;color:#38bdf8;padding:4px 8px;min-width:130px;background:#0d1117;">
+                <select class="shopee-select" id="sp_threads_select" onchange="onShopeeThreadsChange()" style="font-weight:bold;color:#38bdf8;padding:4px 8px;min-width:165px;background:#0d1117;">
+                  <option value="auto">🤖 Tự động tối ưu (AIMD)</option>
                   <option value="1">1 Luồng (Rất nhẹ)</option>
                   <option value="2" selected>2 Luồng (Khuyên dùng)</option>
                   <option value="3">3 Luồng</option>
@@ -1811,9 +1818,10 @@
                   <option value="2">2 video / TK (Tăng tốc)</option>
                 </select>
               </div>
-              <div style="display:flex;align-items:center;gap:6px;background:rgba(245,158,11,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(245,158,11,0.35);" title="Chia đều: quay vòng hết các TK (ít kẹt VM). Dồn TK: lấp đầy 2 slot và bám chặt các TK đang chạy để chạm limit 24h nhanh nhất trước khi chuyển TK khác.">
+              <div style="display:flex;align-items:center;gap:6px;background:rgba(245,158,11,0.12);padding:5px 10px;border-radius:8px;border:1px solid rgba(245,158,11,0.35);" title="Thông minh: ưu tiên TK khỏe, có phiên Chrome ấm sẵn, proxy nhanh và vẫn quay vòng TK cũ. Chia đều: luân phiên hết kho TK. Dồn TK: bám chặt từng TK chạm limit 24h nhanh nhất.">
                 <span style="font-size:12px;font-weight:700;color:#fbbf24;">🎯 Chia TK:</span>
                 <select class="shopee-select" id="sp_account_dispatch_mode" onchange="onDispatchModeChange()" style="font-weight:bold;color:#fbbf24;padding:4px 8px;background:#0d1117;border-color:#f59e0b;">
+                  <option value="smart">🤖 Thông minh (Tối đa sản lượng)</option>
                   <option value="even" selected>Chia đều luân phiên</option>
                   <option value="concentrate">Dồn TK (Chạm 24h nhanh)</option>
                 </select>
@@ -2985,9 +2993,13 @@
         : accs.filter(a => a.is_alive !== false && a.ok !== false && a.enabled !== false && (!a.expires_at || a.expires_at > nowTs)).length;
       updateShopeeThreadsHint();
 
+      _updateAccountDeleteButtons(accs);
+
       if (!accs || accs.length === 0) {
         cachedAliveCount = 0;
         updateShopeeThreadsHint();
+        const hiddenElEmpty = document.getElementById("hiddenLockedCount");
+        if (hiddenElEmpty) hiddenElEmpty.textContent = "";
         tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-dim);padding:30px;">Chưa có tài khoản nào. Vui lòng thêm tài khoản để bắt đầu tạo video!</td></tr>`;
         renderQuotaSummary();
         return;
@@ -2998,10 +3010,6 @@
       const lockedCount = accs.filter(a => a.muse_locked).length;
       const hiddenEl = document.getElementById("hiddenLockedCount");
       if (hiddenEl) hiddenEl.textContent = lockedCount ? `(${hideLocked ? "đang ẩn" : "có"} ${lockedCount} TK bị khoá)` : "";
-      const delLockedBtn = document.getElementById("btnDeleteLockedAccs");
-      if (delLockedBtn && !delLockedBtn.disabled) {
-        delLockedBtn.innerText = lockedCount ? `🗑 Xóa TK bị khoá (${lockedCount})` : "🗑 Xóa TK bị khoá";
-      }
       const shownAccs = hideLocked ? accs.filter(a => !a.muse_locked) : accs;
       if (shownAccs.length === 0) {
         tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-dim);padding:30px;">Không có TK nào để hiển thị — ${lockedCount} TK bị khoá đang được ẩn (bỏ chọn "Ẩn các TK bị khoá" để xem).</td></tr>`;
@@ -3308,6 +3316,9 @@
     const cell = document.getElementById("qc_" + aid);
     if (cell) cell.innerHTML = quotaCellHtml(q);
     renderQuotaSummary();
+    if (typeof _updateAccountDeleteButtons === "function") {
+      _updateAccountDeleteButtons(cachedAccounts || []);
+    }
   }
 
   async function checkAccountQuota(aid, silent) {
@@ -3721,50 +3732,98 @@
     }
   }
 
-  async function deleteLockedAccounts() {
-    const locked = (cachedAccounts || []).filter(a => a.muse_locked);
-    if (!locked.length) {
-      showToast("Hiện không có tài khoản nào đang bị khoá (Muse is disconnected)!", "info");
+  function _isAccountExhaustedForDelete(a) {
+    return !!a && (quotaState(a.quota).state === "exhausted" || !!a.quota_exhausted);
+  }
+
+  function _updateAccountDeleteButtons(accs) {
+    const list = Array.isArray(accs) ? accs : [];
+    const lockedCount = list.filter(a => a.muse_locked).length;
+    const exhaustedCount = list.filter(_isAccountExhaustedForDelete).length;
+    const totalCount = list.length;
+
+    const specs = [
+      ["btnDeleteLockedAccs", "🗑 Xóa TK bị khoá", lockedCount],
+      ["btnDeleteExhaustedAccs", "🧹 Xóa TK hết token", exhaustedCount],
+      ["btnDeleteAllAccs", "💣 Xóa tất cả", totalCount],
+    ];
+    for (const [id, label, count] of specs) {
+      const btn = document.getElementById(id);
+      if (btn && !btn.disabled) {
+        btn.innerText = count ? `${label} (${count})` : label;
+      }
+    }
+  }
+
+  async function _bulkDeleteAccounts(mode, targets, { btnId, baseLabel, emptyMsg, confirmTitle }) {
+    const list = Array.isArray(targets) ? targets : [];
+    if (!list.length) {
+      showToast(emptyMsg, "info");
       return;
     }
-    const sample = locked.slice(0, 10).map(a => `  • ${a.label || a.id}`).join("\n");
-    const more = locked.length > 10 ? `\n  ... và ${locked.length - 10} tài khoản khác` : "";
-    if (!confirm(`Bạn có chắc muốn XÓA VĨNH VIỄN ${locked.length} tài khoản đang bị khoá (Muse is disconnected) khỏi hệ thống?\n\n${sample}${more}`)) {
+    const sample = list.slice(0, 10).map(a => `  • ${a.label || a.id}`).join("\n");
+    const more = list.length > 10 ? `\n  ... và ${list.length - 10} tài khoản khác` : "";
+    if (!confirm(`${confirmTitle}\n\n${sample}${more}`)) {
       return;
     }
-    const btn = document.getElementById("btnDeleteLockedAccs");
+
+    const btn = document.getElementById(btnId);
     if (btn) {
       btn.disabled = true;
-      btn.innerText = `⏳ Đang xóa (0/${locked.length})...`;
+      btn.innerText = "⏳ Đang xóa...";
     }
-    let deleted = 0, failed = 0;
     try {
-      for (let i = 0; i < locked.length; i++) {
-        const a = locked[i];
-        try {
-          const res = await fetch(`/admin/accounts/${a.id}`, {
-            method: "DELETE",
-            headers: getHeaders()
-          });
-          if (res.ok) deleted++;
-          else failed++;
-        } catch (_) {
-          failed++;
-        }
-        if (btn) btn.innerText = `⏳ Đang xóa (${i + 1}/${locked.length})...`;
-      }
+      const res = await fetch("/admin/accounts/bulk-delete", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ mode })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       showToast(
-        `✓ Đã xóa ${deleted}/${locked.length} tài khoản bị khoá khỏi hệ thống!${failed ? ` (${failed} lỗi)` : ""}`,
-        failed ? "warning" : "success"
+        `✓ Đã xóa ${data.deleted ?? list.length} tài khoản (còn ${data.remaining ?? 0} TK). Bản sao lưu lưu tại data/backups/.`,
+        "success"
       );
+    } catch (e) {
+      showToast(`Lỗi xóa tài khoản: ${e.message}`, "danger");
     } finally {
       if (btn) {
         btn.disabled = false;
-        btn.innerText = "🗑 Xóa TK bị khoá";
+        btn.innerText = baseLabel;
       }
       await loadAccounts();
       await checkServerStatus();
     }
+  }
+
+  async function deleteLockedAccounts() {
+    const targets = (cachedAccounts || []).filter(a => a.muse_locked);
+    return _bulkDeleteAccounts("locked", targets, {
+      btnId: "btnDeleteLockedAccs",
+      baseLabel: "🗑 Xóa TK bị khoá",
+      emptyMsg: "Hiện không có tài khoản nào đang bị khoá (Muse is disconnected)!",
+      confirmTitle: `Bạn có chắc muốn XÓA VĨNH VIỄN ${targets.length} tài khoản đang bị khoá khỏi hệ thống?`,
+    });
+  }
+
+  async function deleteExhaustedAccounts() {
+    const targets = (cachedAccounts || []).filter(_isAccountExhaustedForDelete);
+    return _bulkDeleteAccounts("exhausted", targets, {
+      btnId: "btnDeleteExhaustedAccs",
+      baseLabel: "🧹 Xóa TK hết token",
+      emptyMsg: "Hiện không có tài khoản nào đang ở trạng thái Hết token!",
+      confirmTitle: `Bạn có chắc muốn XÓA VĨNH VIỄN ${targets.length} tài khoản đã hết token (0 token phụ & 100% gói tuần) khỏi hệ thống?`,
+    });
+  }
+
+  async function deleteAllAccounts() {
+    const targets = cachedAccounts || [];
+    return _bulkDeleteAccounts("all", targets, {
+      btnId: "btnDeleteAllAccs",
+      baseLabel: "💣 Xóa tất cả",
+      emptyMsg: "Hiện chưa có tài khoản nào trong hệ thống!",
+      confirmTitle: `CẢNH BÁO: Bạn có chắc muốn XÓA VĨNH VIỄN TẤT CẢ ${targets.length} tài khoản MuseAI khỏi hệ thống?\n(Hệ thống sẽ tự sao lưu ra data/backups/ trước khi xóa.)`,
+    });
   }
 
   async function triggerKeepaliveAll() {
@@ -3828,11 +3887,12 @@
       }
       if (data.min_price !== undefined) document.getElementById("sp_min_price").value = data.min_price;
       if (data.max_price !== undefined) document.getElementById("sp_max_price").value = data.max_price || "";
-      if (data.threads) {
-        const val = String(data.threads);
+      if (data.threads !== undefined || data.threads_mode) {
+        const isAuto = data.threads_mode === "auto" || String(data.threads).toLowerCase() === "auto";
+        const val = isAuto ? "auto" : String(data.threads || "2");
         const sel = document.getElementById("sp_threads_select");
         const numInput = document.getElementById("sp_threads");
-        if (numInput) numInput.value = val;
+        if (numInput && !isAuto) numInput.value = val;
         if (sel) {
           const matchOpt = Array.from(sel.options).find(o => o.value === val);
           if (matchOpt) {
@@ -3853,7 +3913,8 @@
       }
       if (data.account_dispatch_mode !== undefined) {
         const elMode = document.getElementById("sp_account_dispatch_mode");
-        if (elMode) elMode.value = data.account_dispatch_mode === "concentrate" ? "concentrate" : "even";
+        const mVal = String(data.account_dispatch_mode || "").toLowerCase();
+        if (elMode) elMode.value = (mVal === "smart" || mVal === "concentrate") ? mVal : "even";
       }
       if (data.ffmpeg_concurrency !== undefined) {
         const elFf = document.getElementById("sp_ffmpeg_threads");
@@ -3868,12 +3929,34 @@
     }
   }
 
+  function isAutoThreadsSelected() {
+    const sel = document.getElementById("sp_threads_select");
+    return !!(sel && sel.value === "auto");
+  }
+
   function updateShopeeThreadsHint() {
     const sel = document.getElementById("sp_threads_select");
     const numInput = document.getElementById("sp_threads");
     const hintEl = document.getElementById("sp_threads_alive_hint");
     if (!hintEl) return;
-    
+
+    const autoMode = isAutoThreadsSelected();
+    const alive = getUsableAccountCount();
+    const perAcc = getShopeeJobsPerAccount();
+    const cap = alive * perAcc;
+
+    if (autoMode) {
+      const mMax = machineCapacity?.max_threads || 64;
+      const autoCap = alive > 0 ? Math.min(cap, mMax) : mMax;
+      if (alive <= 0) {
+        hintEl.innerHTML = `<span style="color:#ef4444;font-weight:700;">(🔴 0 TK sống - Cần nạp Cookie)</span>`;
+      } else {
+        hintEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;" title="AIMD tự tăng/giảm số luồng mỗi 10s dựa trên RAM, CPU, tốc độ ra video và số TK khỏe">(🤖 Tự co giãn tới ~${autoCap} luồng · ${alive} TK × ${perAcc})</span>`;
+      }
+      updateMachineThreadsHint(autoCap);
+      return;
+    }
+
     let userThreads = 2;
     if (sel && sel.value === "custom" && numInput) {
       userThreads = Math.max(1, parseInt(numInput.value) || 2);
@@ -3881,9 +3964,6 @@
       userThreads = Math.max(1, parseInt(sel.value) || 2);
     }
 
-    const alive = getUsableAccountCount();
-    const perAcc = getShopeeJobsPerAccount();
-    const cap = alive * perAcc;
     if (alive <= 0) {
       hintEl.innerHTML = `<span style="color:#ef4444;font-weight:700;">(🔴 0 TK sống - Cần nạp Cookie)</span>`;
     } else if (userThreads > cap) {
@@ -3940,7 +4020,9 @@
   }
 
   function getShopeeDispatchMode() {
-    return document.getElementById("sp_account_dispatch_mode")?.value === "concentrate" ? "concentrate" : "even";
+    const v = document.getElementById("sp_account_dispatch_mode")?.value;
+    if (v === "smart" || v === "concentrate") return v;
+    return "even";
   }
 
   function onShopeeThreadsChange() {
@@ -3950,6 +4032,8 @@
     if (sel.value === "custom") {
       numInput.style.display = "inline-block";
       numInput.focus();
+    } else if (sel.value === "auto") {
+      numInput.style.display = "none";
     } else {
       numInput.style.display = "none";
       numInput.value = sel.value;
@@ -3983,14 +4067,19 @@
   async function onDispatchModeChange() {
     const mode = getShopeeDispatchMode();
     await saveShopeeSettings();
-    showToast(mode === "concentrate"
-      ? "🎯 Đã bật chế độ Dồn TK: lấp đầy 2 slot để các TK chạm limit 24h nhanh nhất"
-      : "⚖️ Đã chuyển sang chế độ Chia đều luân phiên", "success");
+    const msg = mode === "smart"
+      ? "🤖 Đã bật chế độ Thông minh: ưu tiên TK khỏe + phiên Chrome ấm + proxy nhanh để tối đa video/phút"
+      : (mode === "concentrate"
+          ? "🎯 Đã bật chế độ Dồn TK: lấp đầy 2 slot để các TK chạm limit 24h nhanh nhất"
+          : "⚖️ Đã chuyển sang chế độ Chia đều luân phiên");
+    showToast(msg, "success");
   }
 
   function getShopeeFormData() {
+    const autoThreads = isAutoThreadsSelected();
     return {
-      threads: parseInt(document.getElementById("sp_threads")?.value) || 2,
+      threads: autoThreads ? "auto" : (parseInt(document.getElementById("sp_threads")?.value) || 2),
+      threads_mode: autoThreads ? "auto" : "manual",
       aspect: document.getElementById("sp_aspect").value,
       scene: document.getElementById("sp_scene").value,
       duration: document.getElementById("sp_duration").value,
@@ -5071,9 +5160,11 @@
 
     if (isShopeeBatchRunning) return;
 
-    // Chọn quá sức máy -> hỏi lại trước khi chạy (tránh lag/đơ cả máy)
+    const autoThreadsMode = isAutoThreadsSelected();
+
+    // Chọn quá sức máy (chế độ nhập tay) -> hỏi lại trước khi chạy (tránh lag/đơ cả máy)
     const cap = await fetchMachineCapacity();
-    if (cap) {
+    if (cap && !autoThreadsMode) {
       const wanted = Math.max(1, parseInt(document.getElementById("sp_threads").value) || 2);
       const effective = cachedAliveCount > 0 ? Math.min(wanted, cachedAliveCount * getShopeeJobsPerAccount()) : wanted;
       if (effective > cap.max_threads && !confirm(
@@ -5146,16 +5237,29 @@
       return;
     }
 
-    // NGUYÊN TẮC: Số luồng chạy luôn <= số TK còn sống × số video cùng lúc / TK (máy chủ cũng giới hạn đúng mức này)
+    // NGUYÊN TẮC: Số luồng chạy tự cân bằng giữa sức máy (RAM/CPU) và kho TK sống (slots)
     const jobsPerAcc = getShopeeJobsPerAccount();
-    await saveShopeeSettings(); // đảm bảo máy chủ dùng đúng số video / TK trước khi chạy
+    await saveShopeeSettings(); // đảm bảo máy chủ dùng đúng số video / TK và chế độ chia TK trước khi chạy
     const usableAccounts = getUsableAccountCount() || aliveAccounts;
-    const maxWorkers = Math.min(requestedWorkers, usableAccounts * jobsPerAcc);
+    const schedMode = autoThreadsMode ? "auto" : "manual";
+    let initSched = null;
+    try {
+      const rInit = await fetch(`/api/shopee/capacity?mode=${schedMode}&requested=${requestedWorkers}&reset=1`, { headers: getHeaders() });
+      if (rInit.ok) initSched = await rInit.json();
+    } catch (_) {}
+
+    const slotMax = Math.max(1, usableAccounts * jobsPerAcc);
+    const machineMax = Math.max(1, cap?.max_threads || initSched?.machine_max_threads || 64);
+    const maxWorkers = autoThreadsMode
+      ? Math.max(1, initSched?.recommended_workers || Math.min(machineMax, slotMax))
+      : Math.max(1, Math.min(requestedWorkers, initSched?.recommended_workers || slotMax));
     if (usableAccounts < aliveAccounts) {
       appendShopeeLog(`🔋 Bỏ qua ${aliveAccounts - usableAccounts} TK đã hết token (theo hạn mức đã kiểm tra) -> còn ${usableAccounts} TK dùng được.`);
     }
 
-    if (requestedWorkers > maxWorkers) {
+    if (autoThreadsMode) {
+      appendShopeeLog(`🤖 CHẾ ĐỘ TỰ ĐỘNG TỐI ƯU (AIMD): Khởi điểm ${maxWorkers} luồng (trần máy ~${machineMax} · kho TK ${usableAccounts}×${jobsPerAcc}=${slotMax} ô · chia TK: ${getShopeeDispatchMode()}). Hệ thống tự tăng/giảm mỗi 10s theo RAM, CPU & tốc độ ra video.`);
+    } else if (requestedWorkers > maxWorkers) {
       appendShopeeLog(`⚡ ĐIỀU PHỐI TỐC ĐỘ: Bạn chọn ${requestedWorkers} luồng, nhưng hiện có ${usableAccounts} tài khoản dùng được × ${jobsPerAcc} video/TK -> Hệ thống tự động giới hạn chạy ${maxWorkers} luồng song song.`);
     } else {
       appendShopeeLog(`🚀 BẮT ĐẦU CHẠY BATCH RENDER CHO ${shopeeClaimedProducts.length} SẢN PHẨM VỚI ${maxWorkers} LUỒNG SONG SONG (${aliveAccounts} TÀI KHOẢN KHẢ DỤNG × tối đa ${jobsPerAcc} video/TK)...`);
@@ -5382,32 +5486,76 @@
       }
     }
 
-    // Số luồng được chạy thật sự: tự hạ xuống khoảng (số "ô" việc của các TK đang dùng được) x 1.25 để không có hàng chục luồng
-    // ngồi chờ TK hỏng/đang nghỉ; không bao giờ vượt số luồng người dùng đặt. Tăng lại tự động khi có thêm TK tốt.
+    // Dynamic Worker Pool + AIMD Dual-Backpressure: tự tăng (sinh thêm worker) khi máy & kho TK còn dư,
+    // và tự giảm (cho worker dư nghỉ) khi RAM/CPU cao, timeout tăng hoặc số ô TK sống sụt giảm.
     let allowedWorkers = maxWorkers;
-    async function refreshAllowedWorkers() {
+    let spawnedWorkers = 0;
+    let spawningExtra = false;
+    const workerPromises = [];
+
+    function renderLiveSchedulerHint(d) {
+      const el = document.getElementById("sp_threads_machine_hint");
+      if (!el || !d) return;
+      const ramPct = Math.round(d.ram_used_pct || 0);
+      const cpuPct = Math.round(d.cpu_pct || 0);
+      const color = (ramPct >= 88 || cpuPct >= 92) ? "#f59e0b" : "#38bdf8";
+      const tag = autoThreadsMode ? "🤖 AIMD" : "⚙️ Điều phối";
+      const warmTxt = typeof d.warm_accounts === "number" ? ` · Ấm ${d.warm_accounts}` : "";
+      const ffTxt = typeof d.ffmpeg_limit === "number" ? ` · FFmpeg ${d.ffmpeg_active || 0}/${d.ffmpeg_limit}` : "";
+      el.innerHTML = `<span style="color:${color};font-weight:700;" title="${_escHtml(d.reason || '')}">${tag}: ${allowedWorkers} luồng · CPU ${cpuPct}% · RAM ${ramPct}%${warmTxt}${ffTxt} · ${_escHtml(d.reason || '')}</span>`;
+    }
+
+    async function ensureWorkersUpTo(targetCount) {
+      if (spawningExtra || shopeeStopRequested || shopeeForceStopRequested) return;
+      spawningExtra = true;
       try {
-        const r = await fetch("/api/shopee/capacity", { headers: getHeaders() });
+        while (spawnedWorkers < targetCount && !shopeeStopRequested && !shopeeForceStopRequested) {
+          spawnedWorkers += 1;
+          workerPromises.push(workerLoop(spawnedWorkers));
+          if (spawnedWorkers < targetCount) {
+            // Giãn cách khởi động 300ms giữa các luồng mới để êm CDP/Proxy
+            await new Promise(r => setTimeout(r, 300));
+          }
+        }
+      } finally {
+        spawningExtra = false;
+      }
+    }
+
+    async function refreshAllowedWorkers() {
+      if (shopeeStopRequested || shopeeForceStopRequested) return;
+      try {
+        const r = await fetch(`/api/shopee/capacity?mode=${schedMode}&requested=${requestedWorkers}`, { headers: getHeaders() });
         if (!r.ok) return;
         const d = await r.json();
-        const floor = Math.max(6, Math.ceil(maxWorkers * 0.12));
-        const target = Math.max(floor, Math.min(maxWorkers, Math.ceil((d.slots || 0) * 1.25) + 2));
+        const target = Math.max(1, parseInt(d.recommended_workers) || allowedWorkers);
         if (target !== allowedWorkers) {
-          appendShopeeLog(`⚙️ Số luồng chạy thật: ${allowedWorkers} → ${target}/${maxWorkers} (${d.accounts_usable} TK dùng được, ${d.slots} ô việc song song)`);
+          const prev = allowedWorkers;
           allowedWorkers = target;
+          appendShopeeLog(
+            `⚙️ [AIMD] Luồng chạy: ${prev} → ${target} | ${d.reason || "Điều chỉnh"} ` +
+            `(TK: ${d.accounts_usable}, ô: ${d.slots}, ấm: ${d.warm_accounts || 0}, CPU: ${Math.round(d.cpu_pct || 0)}%, RAM: ${Math.round(d.ram_used_pct || 0)}%, FFmpeg: ${d.ffmpeg_active || 0}/${d.ffmpeg_limit || 0})`
+          );
+        }
+        renderLiveSchedulerHint(d);
+        if (allowedWorkers > spawnedWorkers) {
+          ensureWorkersUpTo(allowedWorkers);
         }
       } catch (_) {}
     }
-    const capacityTimer = setInterval(refreshAllowedWorkers, 60000);
-    setTimeout(refreshAllowedWorkers, 15000);
+
+    if (initSched) renderLiveSchedulerHint(initSched);
+    const pollMs = autoThreadsMode ? 10000 : 15000;
+    const capacityTimer = setInterval(refreshAllowedWorkers, pollMs);
+    setTimeout(refreshAllowedWorkers, 8000);
 
     async function workerLoop(workerId) {
       // Mỗi luồng có tối đa 1 SP đang lưu/ghép chạy nền, song song với SP kế tiếp đang render trên Muse
       let pendingFinalize = null;
       while (!shopeeStopRequested && !shopeeForceStopRequested) {
         if (workerId > allowedWorkers && nextIndex < shopeeClaimedProducts.length) {
-          // luồng dư (ít TK tốt): nghỉ, không nhận SP mới
-          await new Promise(r => setTimeout(r, 5000));
+          // luồng dư (AIMD giảm tải hoặc ít TK tốt): tạm nghỉ, không nhận SP mới
+          await new Promise(r => setTimeout(r, 3000));
           continue;
         }
         if (nextIndex >= shopeeClaimedProducts.length) {
@@ -5467,18 +5615,16 @@
       if (pendingFinalize) await pendingFinalize;
     }
 
-    const workerPromises = [];
-    for (let w = 1; w <= maxWorkers; w++) {
-      if (shopeeStopRequested || shopeeForceStopRequested) break;
-      workerPromises.push(workerLoop(w));
-      if (w < maxWorkers) {
-        // Giãn cách khởi động 400ms giữa các luồng (nhanh gấp 3 lần mức 1.2s cũ mà vẫn êm CDP/Proxy)
-        await new Promise(r => setTimeout(r, 400));
-      }
+    await ensureWorkersUpTo(allowedWorkers);
+    let waitedWorkers = 0;
+    while (waitedWorkers < workerPromises.length) {
+      const slice = workerPromises.slice(waitedWorkers);
+      waitedWorkers = workerPromises.length;
+      await Promise.all(slice);
     }
-    await Promise.all(workerPromises);
     clearInterval(capacityTimer);
     clearShopeePrefetch();
+    fetchMachineCapacity();
 
     clearInterval(shopeeBatchTimer);
     isShopeeBatchRunning = false;

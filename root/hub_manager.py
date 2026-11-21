@@ -514,7 +514,8 @@ class AccountHubManager:
                 )
                 return False, f"Đang chờ độ trễ lệch pha máy ảo Muse ({int(soonest)}s)...", None, None
 
-            ready_pool.sort(key=lambda item: account_sort_key(item[0], item[1], now_ts=now))
+            warm_ids = self.store._get_warm_ids()
+            ready_pool.sort(key=lambda item: account_sort_key(item[0], item[1], now_ts=now, warm_ids=warm_ids))
 
             target_acc, current_slots = ready_pool[0]
 

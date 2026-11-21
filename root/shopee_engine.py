@@ -49,34 +49,76 @@ def _ffmpeg_concurrency() -> int:
 # (sẽ chặn mọi job khác tới vài phút). Giới hạn nhỏ vẫn giúp tránh nghẽn I/O ổ đĩa và quá tải CPU
 # (kết hợp với độ ưu tiên tiến trình thấp + "-threads 2" bên dưới). ffprobe (nhẹ, <1s) chạy ngoài semaphore.
 FFMPEG_CONCURRENCY = _ffmpeg_concurrency()
+FFMPEG_BASE_CONCURRENCY = FFMPEG_CONCURRENCY
 FFMPEG_SEMAPHORE = threading.BoundedSemaphore(FFMPEG_CONCURRENCY)
 FFMPEG_LOCK = FFMPEG_SEMAPHORE  # Giữ tên cũ để tương thích ngược (nếu module khác import).
 _FFMPEG_CONF_LOCK = threading.Lock()
+_FFMPEG_ACTIVE_LOCK = threading.Lock()
+_FFMPEG_ACTIVE_COUNT = 0
+
+
+def _apply_ffmpeg_limit_locked(val: int) -> int:
+    global FFMPEG_CONCURRENCY, FFMPEG_SEMAPHORE, FFMPEG_LOCK
+    old_val = FFMPEG_CONCURRENCY
+    if val == old_val:
+        return FFMPEG_CONCURRENCY
+    FFMPEG_CONCURRENCY = val
+    try:
+        with FFMPEG_SEMAPHORE._cond:
+            old_init = getattr(FFMPEG_SEMAPHORE, "_initial_value", old_val)
+            diff = val - old_init
+            FFMPEG_SEMAPHORE._initial_value = val
+            FFMPEG_SEMAPHORE._value = max(0, FFMPEG_SEMAPHORE._value + diff)
+            if diff > 0:
+                FFMPEG_SEMAPHORE._cond.notify_all()
+    except Exception:
+        FFMPEG_SEMAPHORE = threading.BoundedSemaphore(val)
+        FFMPEG_LOCK = FFMPEG_SEMAPHORE
+    return FFMPEG_CONCURRENCY
 
 
 def set_ffmpeg_concurrency(n) -> int:
     """Thay đổi động số luồng FFmpeg ghép video chạy đồng thời ngay trong RAM (đánh thức ngay các luồng đang chờ)."""
-    global FFMPEG_CONCURRENCY, FFMPEG_SEMAPHORE, FFMPEG_LOCK
+    global FFMPEG_BASE_CONCURRENCY
     try:
         val = max(1, min(int(n), 64))
     except (TypeError, ValueError):
         val = _ffmpeg_concurrency()
     with _FFMPEG_CONF_LOCK:
-        old_val = FFMPEG_CONCURRENCY
-        FFMPEG_CONCURRENCY = val
-        try:
-            with FFMPEG_SEMAPHORE._cond:
-                old_init = getattr(FFMPEG_SEMAPHORE, "_initial_value", old_val)
-                diff = val - old_init
-                FFMPEG_SEMAPHORE._initial_value = val
-                FFMPEG_SEMAPHORE._value = max(0, FFMPEG_SEMAPHORE._value + diff)
-                if diff > 0:
-                    FFMPEG_SEMAPHORE._cond.notify_all()
-        except Exception:
-            FFMPEG_SEMAPHORE = threading.BoundedSemaphore(val)
-            FFMPEG_LOCK = FFMPEG_SEMAPHORE
+        FFMPEG_BASE_CONCURRENCY = val
+        _apply_ffmpeg_limit_locked(val)
     log.info("🎞️ [FFmpeg] Đã đặt số luồng ghép video đồng thời: %d luồng", FFMPEG_CONCURRENCY)
     return FFMPEG_CONCURRENCY
+
+
+def apply_dynamic_ffmpeg_throttle(cpu_pct: float) -> int:
+    """Tự động tiết chế số luồng FFmpeg khi CPU cao để nhường CPU cho Chrome WebSocket/render, và mở lại khi CPU dịu."""
+    with _FFMPEG_CONF_LOCK:
+        base = max(1, int(FFMPEG_BASE_CONCURRENCY or FFMPEG_CONCURRENCY or 4))
+        cur = FFMPEG_CONCURRENCY
+        if cpu_pct >= 90.0:
+            target = max(2, min(base, int(base * 0.4)))
+        elif cpu_pct >= 82.0:
+            target = max(2, min(base, int(base * 0.7)))
+        elif cpu_pct <= 72.0:
+            target = base
+        else:
+            target = cur
+        if target != cur:
+            _apply_ffmpeg_limit_locked(target)
+            log.info("🎞️ [FFmpeg Auto-Throttle] CPU %.0f%% -> điều chỉnh luồng FFmpeg %d -> %d (gốc %d)",
+                     cpu_pct, cur, target, base)
+        return FFMPEG_CONCURRENCY
+
+
+def get_ffmpeg_status() -> dict:
+    with _FFMPEG_ACTIVE_LOCK:
+        active = _FFMPEG_ACTIVE_COUNT
+    return {
+        "active": active,
+        "limit": FFMPEG_CONCURRENCY,
+        "base": FFMPEG_BASE_CONCURRENCY,
+    }
 
 
 def _safe_remove(path: str | None) -> None:
@@ -94,6 +136,7 @@ def _run_ffmpeg_cmd(cmd: list[str], timeout: int = 180, check: bool = False, tex
     """Chạy FFmpeg / FFprobe với độ ưu tiên tiến trình thấp (BELOW_NORMAL_PRIORITY_CLASS trên Windows)
     và ẩn hoàn toàn cửa sổ đen con (CREATE_NO_WINDOW).
     Đảm bảo CPU luôn ưu tiên giao diện Windows, chuột, bàn phím và hệ điều hành, máy tính không bao giờ bị đơ/lag."""
+    global _FFMPEG_ACTIVE_COUNT
     kwargs = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
@@ -106,7 +149,16 @@ def _run_ffmpeg_cmd(cmd: list[str], timeout: int = 180, check: bool = False, tex
             getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000) |
             getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         )
-    return subprocess.run(cmd, **kwargs)
+    is_encode = bool(cmd) and os.path.basename(str(cmd[0])).lower().startswith("ffmpeg")
+    if is_encode:
+        with _FFMPEG_ACTIVE_LOCK:
+            _FFMPEG_ACTIVE_COUNT += 1
+    try:
+        return subprocess.run(cmd, **kwargs)
+    finally:
+        if is_encode:
+            with _FFMPEG_ACTIVE_LOCK:
+                _FFMPEG_ACTIVE_COUNT = max(0, _FFMPEG_ACTIVE_COUNT - 1)
 
 
 _NVENC_AVAILABLE: bool | None = None

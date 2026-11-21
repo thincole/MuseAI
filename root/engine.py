@@ -1874,9 +1874,11 @@ class MuseEngine:
                 raise early_err
             raise MuseVMUnavailableError("Khởi tạo trang muse.ai cho worker thất bại hoặc timeout")
 
-        return MuseWorkerSession(self, bc_id, target_id, page, account_id,
+        sess = MuseWorkerSession(self, bc_id, target_id, page, account_id,
                                  proxy_str=proxy_str, forwarder_port=forwarder_port,
                                  ttl_seconds=ttl_seconds, max_tasks=max_tasks)
+        sess.open_seconds = round(max(0.0, time.time() - t_start_nav), 2)
+        return sess
 
     def _pool_condition(self) -> threading.Condition:
         """与 _pool_lock 绑定的 Condition（懒创建，兼容未走 __init__ 的测试替身）。"""
@@ -2100,6 +2102,28 @@ class MuseEngine:
                 s.close()
             except Exception:
                 pass
+
+    def get_warm_idle_account_ids(self) -> set[str]:
+        """Trả về nhanh tập account_id đang có Browser Context rảnh còn hạn TTL trong pool (không chạm CDP)."""
+        now = time.time()
+        warm: set[str] = set()
+        with self._pool_lock:
+            for slot_key, s in self._session_pool.items():
+                if getattr(s, "in_use", False) or getattr(s, "is_closed", False):
+                    continue
+                if (now - s.created_at) >= s.ttl_seconds or s.task_count >= s.max_tasks:
+                    continue
+                aid = s.account_id or slot_key.split("#", 1)[0]
+                if aid:
+                    warm.add(aid)
+        return warm
+
+    def active_session_counts(self) -> tuple[int, int]:
+        """Trả về (tổng số Browser Context trong pool, số phiên đang in_use)."""
+        with self._pool_lock:
+            total = len(self._session_pool)
+            in_use = sum(1 for s in self._session_pool.values() if getattr(s, "in_use", False))
+        return total, in_use
 
     def get_pool_status(self) -> list[dict]:
         """Trả về thông tin chi tiết các session và thời gian TTL còn lại."""
