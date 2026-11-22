@@ -1026,8 +1026,8 @@ def _record_gen_event(ok: bool, category: str = "", duration_s: float = 0.0) -> 
         _GEN_EVENTS.append((time.time(), ok, category, float(duration_s or 0.0)))
 
 
-def gen_stats(window_s: float = 3600.0) -> dict:
-    cut = time.time() - window_s
+def gen_stats(window_s: float = 3600.0, since_ts: float = 0.0) -> dict:
+    cut = max(time.time() - window_s, float(since_ts or 0.0))
     with _GEN_EVENTS_LOCK:
         ev = [e for e in _GEN_EVENTS if e[0] >= cut]
     ok = sum(1 for e in ev if e[1])
@@ -3716,10 +3716,14 @@ AUTO_START_MAX = max(8, int(os.environ.get("MUSE2API_AUTO_START_MAX", "40") or 4
 
 
 class SmartThreadController:
-    """Bộ điều khiển luồng động theo AIMD + Goodput Hill-Climbing + Dual-Backpressure
-    (RAM, CPU, trần 1 Chrome CDP, tỷ lệ lỗi nghẽn, tác vụ treo >150s và tốc độ video/phút thật)."""
+    """Bộ điều khiển luồng động theo AIMD + Goodput Hill-Climbing + Dual-Backpressure.
+    - Chế độ Tự động (auto/AIMD): tự tìm điểm đỉnh trong trần 1 Chrome (<=64), có cắt tải khi RAM/CPU/lỗi nghẽn
+      tăng (tối đa 1 lần/60s trên dữ liệu MỚI sau lần cắt trước, tránh vòng xoáy giảm tụt về 6 luồng).
+    - Chế độ Nhập tay (manual): tôn trọng số luồng người dùng chọn (chỉ giới hạn theo số ô TK đang rảnh và phanh
+      khẩn cấp chống tràn RAM >=94% / trống <1.5GB), tự phục hồi ngay khi TK hết nghỉ hoặc RAM dịu."""
 
-    DOWN_INTERVAL_S = 12.0
+    DOWN_INTERVAL_S = 15.0
+    BACKOFF_COOLDOWN_S = 60.0
     UP_INTERVAL_S = 25.0
     SLOW_IN_FLIGHT_S = 150.0
 
@@ -3728,6 +3732,8 @@ class SmartThreadController:
         self._current = 0
         self._last_adjust_ts = 0.0
         self._last_up_ts = 0.0
+        self._last_backoff_ts = 0.0
+        self._eval_since_wall = 0.0
         self._started_at = 0.0
         self._level_since = 0.0
         self._high_cpu_streak = 0
@@ -3736,6 +3742,26 @@ class SmartThreadController:
         self._soft_cap = 0
         self._soft_cap_until = 0.0
         self._reason = "Khởi tạo"
+
+    @staticmethod
+    def _slot_limit_reason(snap: dict, slots: int, target: int) -> str:
+        parts = []
+        cd = int(snap.get("accounts_cooldown") or 0)
+        exh = int(snap.get("accounts_exhausted") or 0)
+        low_q = int(snap.get("accounts_low_quality") or 0)
+        no_vml = int(snap.get("accounts_no_vml") or 0)
+        if cd:
+            parts.append(f"{cd} đang nghỉ")
+        if exh:
+            parts.append(f"{exh} hết token")
+        if low_q:
+            parts.append(f"{low_q} tỷ lệ thấp")
+        if no_vml:
+            parts.append(f"{no_vml} thiếu hatch_vml")
+        detail = f" ({', '.join(parts)})" if parts else ""
+        if slots <= 0:
+            return f"Tạm hết TK rảnh{detail} — giữ tối thiểu chờ TK mở lại"
+        return f"Giới hạn theo {slots} ô TK rảnh/{target}{detail}"
 
     def evaluate(self, mode: str = "manual", requested: int = 0, reset: bool = False) -> dict:
         auto_mode = str(mode or "").strip().lower() in ("auto", "smart", "aimd")
@@ -3755,151 +3781,187 @@ class SmartThreadController:
         pool_total, pool_in_use = engine.active_session_counts()
         creating_cnt = engine.creating_session_count() if hasattr(engine, "creating_session_count") else 0
 
-        st5 = gen_stats(300.0)
-        st3 = gen_stats(180.0)
-        total_5m = int(st5.get("total") or 0)
-        ok_5m = int(st5.get("ok") or 0)
-        ok_3m = int(st3.get("ok") or 0)
-        timeout_5m = int((st5.get("fail_reasons") or {}).get("Hết giờ chờ", 0))
-        timeout_rate = (timeout_5m / total_5m) if total_5m >= 6 else 0.0
-        congestion_rate = float(st5.get("congestion_rate") or 0.0)
-        congestion_denom = int(st5.get("congestion_denom") or 0)
-        avg_duration_s = float(st5.get("avg_duration_s") or 0.0)
-
-        in_flight, slow_in_flight, avg_in_flight_s = _active_gen_stats(self.SLOW_IN_FLIGHT_S)
-        slow_ratio = (slow_in_flight / in_flight) if in_flight >= 10 else 0.0
-
-        if auto_mode:
-            auto_ceiling = max(1, min(machine_max, chrome_cap))
-            slot_cap = slots if slots > 0 else min(4, auto_ceiling)
-            hard_cap = max(1, min(auto_ceiling, slot_cap))
-        else:
-            req_cap = max(1, int(requested or 0)) if int(requested or 0) > 0 else machine_max
-            slot_cap = slots if slots > 0 else min(4, machine_max, req_cap)
-            hard_cap = max(1, min(req_cap, machine_max, slot_cap))
-        floor = min(hard_cap, max(2, min(8, int(hard_cap * 0.25))))
-
         now = time.monotonic()
+        now_wall = time.time()
         with self._lock:
             if reset or self._current <= 0:
                 self._started_at = now
                 self._level_since = now
+                self._last_adjust_ts = now
+                self._last_up_ts = now
+                self._last_backoff_ts = 0.0
+                self._eval_since_wall = now_wall
                 self._high_cpu_streak = 0
                 self._best_vpm = 0.0
                 self._best_workers = 0
                 self._soft_cap = 0
                 self._soft_cap_until = 0.0
-                if auto_mode:
+
+            eval_since = self._eval_since_wall
+            started_at = self._started_at or now
+
+        # Chỉ đọc sự kiện MỚI sau khi reset batch hoặc sau lần cắt tải gần nhất (tránh cắt lặp trên dữ liệu cũ!)
+        st5 = gen_stats(300.0, since_ts=eval_since)
+        st3 = gen_stats(180.0, since_ts=max(0.0, now_wall - max(1.0, now - started_at)))
+        st5_disp = gen_stats(300.0)
+        total_5m = int(st5.get("total") or 0)
+        ok_5m = int(st5.get("ok") or 0)
+        ok_3m = int(st3.get("ok") or 0)
+        timeout_5m = int((st5.get("fail_reasons") or {}).get("Hết giờ chờ", 0))
+        timeout_rate = (timeout_5m / total_5m) if total_5m >= 8 else 0.0
+        congestion_rate = float(st5.get("congestion_rate") or 0.0)
+        congestion_denom = int(st5.get("congestion_denom") or 0)
+        avg_duration_s = float(st5_disp.get("avg_duration_s") or 0.0)
+
+        in_flight, slow_in_flight, avg_in_flight_s = _active_gen_stats(self.SLOW_IN_FLIGHT_S)
+        slow_ratio = (slow_in_flight / in_flight) if in_flight >= 10 else 0.0
+
+        run_elapsed = max(1.0, now - started_at)
+        if run_elapsed >= 180.0:
+            goodput_vpm = round(ok_3m / 3.0, 2)
+        else:
+            goodput_vpm = round(ok_3m / max(1.0, run_elapsed / 60.0), 2)
+
+        if auto_mode:
+            auto_ceiling = max(1, min(machine_max, chrome_cap))
+            slot_cap = slots if slots > 0 else min(6, auto_ceiling)
+            hard_cap = max(1, min(auto_ceiling, slot_cap))
+            # Sàn AIMD tối thiểu ~40% hard_cap (tối đa 24 trên máy lớn) để không bao giờ tụt xuống 6-8 luồng khi máy còn nhàn
+            floor = min(hard_cap, max(4, min(24, int(round(hard_cap * 0.40)))))
+            oom_floor = min(hard_cap, max(2, min(8, floor)))
+        else:
+            # Chế độ nhập tay: tôn trọng số luồng người dùng chọn, chỉ chặn bởi số ô TK đang rảnh (không ép giảm theo AIMD)
+            req_cap = max(1, int(requested or 0)) if int(requested or 0) > 0 else machine_max
+            slot_cap = slots if slots > 0 else min(6, req_cap)
+            hard_cap = max(1, min(req_cap, slot_cap))
+            floor = min(hard_cap, max(4, min(16, int(round(hard_cap * 0.50)))))
+            oom_floor = min(hard_cap, max(2, min(8, floor)))
+
+        with self._lock:
+            if not auto_mode:
+                # Chế độ thủ công: giữ đúng hard_cap, chỉ phanh khẩn cấp khi RAM sắp tràn (>=94% hoặc trống <1.5GB)
+                oom_now = ram_used_pct >= 94.0 or ram_avail_gb < 1.5
+                if oom_now:
+                    if reset or self._current <= 0:
+                        self._current = max(oom_floor, int(hard_cap * 0.75))
+                    elif (now - self._last_adjust_ts) >= 20.0:
+                        self._last_adjust_ts = now
+                        self._current = max(oom_floor, int(min(self._current, hard_cap) * 0.80))
+                    self._reason = f"Phanh khẩn cấp RAM ({ram_used_pct:.0f}%, trống {ram_avail_gb:.1f}GB)"
+                else:
+                    self._current = hard_cap
+                    if hard_cap < req_cap:
+                        self._reason = self._slot_limit_reason(snap, slots, req_cap)
+                    else:
+                        self._reason = "Đúng mức đã chọn"
+                rec = max(1, min(self._current, hard_cap))
+                reason = self._reason
+                best_vpm = round(self._best_vpm, 2)
+                best_workers = self._best_workers
+            else:
+                if reset or self._current <= 0:
                     warm = int(round(hard_cap * 0.65))
                     self._current = max(floor, min(hard_cap, AUTO_START_MAX, warm))
-                else:
-                    self._current = hard_cap
-                self._last_adjust_ts = now
-                self._last_up_ts = now
-                self._reason = "Khởi động êm (AIMD)" if auto_mode else "Mức cấu hình"
-            run_elapsed = max(1.0, now - (self._started_at or now))
-            if run_elapsed >= 180.0:
-                goodput_vpm = round(ok_3m / 3.0, 2)
-            else:
-                goodput_vpm = round(ok_5m / max(1.0, run_elapsed / 60.0), 2)
+                    self._reason = "Khởi động êm (AIMD)"
+                elif (now - self._last_adjust_ts) >= self.DOWN_INTERVAL_S:
+                    self._last_adjust_ts = now
+                    if self._soft_cap and now >= self._soft_cap_until:
+                        self._soft_cap = 0
+                    if cpu_pct >= 90.0:
+                        self._high_cpu_streak += 1
+                    else:
+                        self._high_cpu_streak = 0
 
-            if not (reset or self._current <= 0) and (now - self._last_adjust_ts) >= self.DOWN_INTERVAL_S:
-                self._last_adjust_ts = now
-                if self._soft_cap and now >= self._soft_cap_until:
-                    self._soft_cap = 0
-                if cpu_pct >= 90.0:
-                    self._high_cpu_streak += 1
-                else:
-                    self._high_cpu_streak = 0
+                    # Cập nhật mốc năng suất đỉnh (video/phút) khi mức luồng hiện tại đã chạy ổn định >= 45s
+                    if run_elapsed >= 120.0 and ok_3m >= 6 and (now - self._level_since) >= 45.0:
+                        if self._best_vpm <= 0.0 or goodput_vpm > self._best_vpm * 1.03:
+                            self._best_vpm = goodput_vpm
+                            self._best_workers = min(self._current, hard_cap)
 
-                # Cập nhật mốc năng suất đỉnh (video/phút) khi mức luồng hiện tại đã chạy ổn định >= 45s
-                if auto_mode and run_elapsed >= 120.0 and ok_3m >= 6 and (now - self._level_since) >= 45.0:
-                    if self._best_vpm <= 0.0 or goodput_vpm > self._best_vpm * 1.03:
-                        self._best_vpm = goodput_vpm
-                        self._best_workers = self._current
+                    effective_cap = min(hard_cap, self._soft_cap) if self._soft_cap > 0 else hard_cap
+                    prev_cur = self._current
+                    can_rate_backoff = (self._last_backoff_ts <= 0.0) or ((now - self._last_backoff_ts) >= self.BACKOFF_COOLDOWN_S)
 
-                effective_cap = min(hard_cap, self._soft_cap) if (auto_mode and self._soft_cap > 0) else hard_cap
-                prev_cur = self._current
-
-                if ram_used_pct >= 88.0 or ram_avail_gb < 3.0:
-                    self._current = max(floor, int(self._current * 0.75))
-                    self._reason = f"Giảm tải RAM ({ram_used_pct:.0f}%, trống {ram_avail_gb:.1f}GB)"
-                elif self._high_cpu_streak >= 2:
-                    self._current = max(floor, int(self._current * 0.80))
-                    self._reason = f"Giảm tải CPU ({cpu_pct:.0f}%)"
-                elif timeout_rate >= 0.20:
-                    self._current = max(floor, int(self._current * 0.80))
-                    if auto_mode:
+                    if ram_used_pct >= 88.0 or ram_avail_gb < 3.0:
+                        self._current = max(oom_floor, int(min(self._current, hard_cap) * 0.75))
+                        self._reason = f"Giảm tải RAM ({ram_used_pct:.0f}%, trống {ram_avail_gb:.1f}GB)"
+                    elif self._high_cpu_streak >= 2:
+                        self._current = max(floor, int(min(self._current, hard_cap) * 0.80))
+                        self._reason = f"Giảm tải CPU ({cpu_pct:.0f}%)"
+                    elif can_rate_backoff and timeout_rate >= 0.25:
+                        self._current = max(floor, int(min(self._current, hard_cap) * 0.82))
                         self._soft_cap = self._current
                         self._soft_cap_until = now + 180.0
-                    self._reason = f"Giảm do timeout cao ({timeout_rate*100:.0f}%)"
-                elif congestion_denom >= 8 and congestion_rate >= 0.25:
-                    self._current = max(floor, int(self._current * 0.80))
-                    if auto_mode:
+                        self._last_backoff_ts = now
+                        self._eval_since_wall = now_wall
+                        self._reason = f"Giảm do timeout cao ({timeout_rate*100:.0f}%)"
+                    elif can_rate_backoff and congestion_denom >= 10 and congestion_rate >= 0.30:
+                        self._current = max(floor, int(min(self._current, hard_cap) * 0.82))
                         self._soft_cap = self._current
                         self._soft_cap_until = now + 180.0
-                    self._reason = f"Giảm do nghẽn Chrome/lỗi ({congestion_rate*100:.0f}%)"
-                elif auto_mode and slow_ratio >= 0.45:
-                    self._current = max(floor, int(self._current * 0.82))
-                    self._soft_cap = self._current
-                    self._soft_cap_until = now + 150.0
-                    self._reason = f"Giảm do render chậm ({slow_in_flight}/{in_flight} tab >{int(self.SLOW_IN_FLIGHT_S)}s)"
-                elif (
-                    auto_mode
-                    and self._best_vpm >= 4.0
-                    and self._best_workers > 0
-                    and self._current >= self._best_workers + 4
-                    and (now - self._level_since) >= 75.0
-                    and goodput_vpm < self._best_vpm * 0.85
-                ):
-                    self._current = max(floor, self._best_workers)
-                    self._soft_cap = self._current
-                    self._soft_cap_until = now + 240.0
-                    self._reason = f"Lùi về điểm đỉnh {self._current} luồng ({goodput_vpm:.1f} < đỉnh {self._best_vpm:.1f} vid/p)"
-                elif self._current > hard_cap:
-                    self._current = hard_cap
-                    self._reason = "Khớp giới hạn TK sống / Chrome"
-                elif (now - self._last_up_ts) >= self.UP_INTERVAL_S and self._current < effective_cap:
-                    waiting_feedback = auto_mode and self._current >= 36 and ok_5m < 5
-                    if waiting_feedback:
-                        self._reason = f"Chờ video đầu hoàn tất để đo tốc độ ({ok_5m}/5)"
-                    elif creating_cnt > 4:
-                        self._reason = f"Giữ nhịp khi đang mở {creating_cnt} tab mới"
-                    elif avg_duration_s > 135.0 and ok_5m >= 5:
-                        self._reason = f"Giữ nhịp vì thời gian render cao (~{avg_duration_s:.0f}s/vid)"
+                        self._last_backoff_ts = now
+                        self._eval_since_wall = now_wall
+                        self._reason = f"Giảm do nghẽn Chrome/lỗi ({congestion_rate*100:.0f}%)"
+                    elif can_rate_backoff and slow_ratio >= 0.45:
+                        self._current = max(floor, int(min(self._current, hard_cap) * 0.85))
+                        self._soft_cap = self._current
+                        self._soft_cap_until = now + 150.0
+                        self._last_backoff_ts = now
+                        self._reason = f"Giảm do render chậm ({slow_in_flight}/{in_flight} tab >{int(self.SLOW_IN_FLIGHT_S)}s)"
                     elif (
-                        ram_used_pct < 78.0
-                        and ram_avail_gb >= 5.0
-                        and cpu_pct < 78.0
-                        and timeout_rate < 0.10
-                        and congestion_rate < 0.12
-                        and slow_ratio < 0.25
+                        can_rate_backoff
+                        and self._best_vpm >= 4.0
+                        and self._best_workers > 0
+                        and self._current >= self._best_workers + 4
+                        and (now - self._level_since) >= 75.0
+                        and goodput_vpm < self._best_vpm * 0.85
                     ):
-                        gap = effective_cap - self._current
-                        if auto_mode:
+                        self._current = max(floor, self._best_workers)
+                        self._soft_cap = self._current
+                        self._soft_cap_until = now + 240.0
+                        self._last_backoff_ts = now
+                        self._reason = f"Lùi về điểm đỉnh {self._current} luồng ({goodput_vpm:.1f} < đỉnh {self._best_vpm:.1f} vid/p)"
+                    elif self._current > hard_cap:
+                        # Không ghi đè làm tụt vĩnh viễn self._current nếu chỉ tạm thiếu TK; chỉ báo lý do giới hạn tạm
+                        self._reason = self._slot_limit_reason(snap, slots, self._current)
+                    elif (now - self._last_up_ts) >= self.UP_INTERVAL_S and self._current < effective_cap:
+                        waiting_feedback = self._current >= 36 and ok_5m < 5
+                        if waiting_feedback:
+                            self._reason = f"Chờ video đầu hoàn tất để đo tốc độ ({ok_5m}/5)"
+                        elif creating_cnt > 4:
+                            self._reason = f"Giữ nhịp khi đang mở {creating_cnt} tab mới"
+                        elif avg_duration_s > 135.0 and ok_5m >= 5:
+                            self._reason = f"Giữ nhịp vì thời gian render cao (~{avg_duration_s:.0f}s/vid)"
+                        elif (
+                            ram_used_pct < 78.0
+                            and ram_avail_gb >= 5.0
+                            and cpu_pct < 78.0
+                            and timeout_rate < 0.12
+                            and congestion_rate < 0.15
+                            and slow_ratio < 0.25
+                        ):
+                            gap = effective_cap - self._current
                             step = 2 if gap >= 4 else 1
+                            self._current = min(effective_cap, self._current + step)
+                            self._last_up_ts = now
+                            self._reason = f"Tăng êm +{step} (AIMD)"
                         else:
-                            step = 4 if gap >= 16 else (2 if gap >= 4 else 1)
-                        self._current = min(effective_cap, self._current + step)
-                        self._last_up_ts = now
-                        self._reason = f"Tăng êm +{step} (AIMD)"
+                            self._reason = "Giữ ổn định (chờ tải dịu)"
                     else:
-                        self._reason = "Giữ ổn định (chờ tải dịu)"
-                else:
-                    if auto_mode and self._soft_cap > 0 and self._current >= effective_cap:
-                        self._reason = f"Khóa ở điểm ngọt ~{self._current} luồng"
-                    else:
-                        self._reason = "Ổn định tối ưu"
+                        if self._soft_cap > 0 and self._current >= effective_cap:
+                            self._reason = f"Khóa ở điểm ngọt ~{min(self._current, hard_cap)} luồng"
+                        else:
+                            self._reason = "Ổn định tối ưu"
 
-                if self._current != prev_cur:
-                    self._level_since = now
-                    if self._current < prev_cur:
-                        self._last_up_ts = now
+                    if self._current != prev_cur:
+                        self._level_since = now
+                        if self._current < prev_cur:
+                            self._last_up_ts = now
 
-            rec = max(1, min(self._current, hard_cap))
-            reason = self._reason
-            best_vpm = round(self._best_vpm, 2)
-            best_workers = self._best_workers
+                rec = max(1, min(self._current, hard_cap))
+                reason = self._slot_limit_reason(snap, slots, self._current) if rec < self._current and slots < self._current else self._reason
+                best_vpm = round(self._best_vpm, 2)
+                best_workers = self._best_workers
 
         snap.update({
             "threads_hint": rec if auto_mode else snap.get("slots", 0),

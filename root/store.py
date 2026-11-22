@@ -857,17 +857,30 @@ class Store:
                 "is_hub_client": True,
             }
         with self._COND:
+            self._sync_from_disk()
             base = Store.MAX_JOBS_PER_ACCOUNT
-            live = [a for a in self.accounts if a.get("enabled", True) and (a.get("cookies") or {}).get("hatch_vml")]
-            usable = [a for a in live if not a.get("muse_locked") and not self.in_cooldown(a["id"])]
+            enabled_all = [a for a in self.accounts if a.get("enabled", True)]
+            no_vml = sum(1 for a in enabled_all if not (a.get("cookies") or {}).get("hatch_vml"))
+            live = [a for a in enabled_all if (a.get("cookies") or {}).get("hatch_vml")]
+            unlocked = [a for a in live if not a.get("muse_locked")]
+            in_cd = sum(1 for a in unlocked if self.in_cooldown(a["id"]))
+            usable = [a for a in unlocked if not self.in_cooldown(a["id"])]
+            exh_skipped = 0
             if Store.SKIP_EXHAUSTED and live and not all(account_exhausted(a) for a in live):
+                before_n = len(usable)
                 usable = [a for a in usable if not account_exhausted(a)]
+                exh_skipped = before_n - len(usable)
+            low_q = sum(1 for a in usable if self.effective_limit(a["id"], base) <= 0)
             slots = sum(self.effective_limit(a["id"], base) for a in usable)
             usable_ids = {a["id"] for a in usable if self.effective_limit(a["id"], base) > 0}
             warm_ids = Store._get_warm_ids() & usable_ids
             return {
                 "accounts_total": len(self.accounts),
                 "accounts_usable": len(usable_ids),
+                "accounts_cooldown": in_cd,
+                "accounts_exhausted": exh_skipped,
+                "accounts_low_quality": low_q,
+                "accounts_no_vml": no_vml,
                 "slots": slots,
                 "jobs_per_account": base,
                 "warm_accounts": len(warm_ids),
