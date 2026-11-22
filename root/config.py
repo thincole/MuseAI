@@ -122,9 +122,22 @@ class Config:
     media_retention_days: int = field(default_factory=lambda: int(_env("MUSE2API_MEDIA_RETENTION_DAYS", "0")))
     media_max_files: int = field(default_factory=lambda: int(_env("MUSE2API_MEDIA_MAX_FILES", "0")))
 
+    # Dọn file tạm định kỳ cho máy cắm 24/7 (chỉ xóa file/thư mục rỗi quá ngưỡng tuổi & không bị khóa,
+    # tuyệt đối bỏ qua file đang dùng bởi luồng render/FFmpeg/Chrome/tool khác và KHÔNG đụng out_dir/temp).
+    temp_cleanup_interval_minutes: int = field(
+        default_factory=lambda: int(_env("MUSE2API_TEMP_CLEANUP_INTERVAL_MIN", "60")))
+    temp_cleanup_min_age_minutes: int = field(
+        default_factory=lambda: int(_env("MUSE2API_TEMP_CLEANUP_AGE_MIN", "60")))
+    temp_cleanup_include_system_temp: bool = field(
+        default_factory=lambda: _env("MUSE2API_TEMP_CLEANUP_SYSTEM", "1").strip() != "0")
+    temp_cleanup_orphan_media_hours: int = field(
+        default_factory=lambda: int(_env("MUSE2API_TEMP_CLEANUP_MEDIA_HOURS", "6")))
+
     # Trình duyệt Anti-Detect & TTL (Tránh phát hiện bot & rò rỉ IP)
     browser_ttl_seconds: int = field(default_factory=lambda: int(_env("MUSE2API_BROWSER_TTL", "1800")))
     browser_max_tasks: int = field(default_factory=lambda: int(_env("MUSE2API_BROWSER_MAX_TASKS", "6")))
+    browser_max_idle_sessions: int = field(default_factory=lambda: int(_env("MUSE2API_MAX_IDLE_SESSIONS", "16")))
+    browser_idle_timeout_seconds: int = field(default_factory=lambda: int(_env("MUSE2API_IDLE_SESSION_TTL", "300")))
     browser_process_ttl_seconds: int = field(default_factory=lambda: int(_env("MUSE2API_PROCESS_TTL", "7200")))
     anti_detect: bool = field(default_factory=lambda: _env("MUSE2API_ANTI_DETECT", "1").strip() != "0")
 

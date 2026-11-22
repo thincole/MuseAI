@@ -396,6 +396,8 @@ class MuseEngine:
         self.proc_started_at = time.time()
         self.browser_ttl_seconds = int(getattr(cfg, "browser_ttl_seconds", 1800))
         self.browser_max_tasks = int(getattr(cfg, "browser_max_tasks", 5))
+        self.browser_max_idle_sessions = max(0, int(getattr(cfg, "browser_max_idle_sessions", 16)))
+        self.browser_idle_timeout_seconds = max(30, int(getattr(cfg, "browser_idle_timeout_seconds", 300)))
         os.makedirs(cfg.profile_dir, exist_ok=True)
 
     # ---------------- 浏览器生命周期 ----------------
@@ -1992,6 +1994,11 @@ class MuseEngine:
             return session
 
         # mode == "create"：本线程持有该账号的创建权
+        # Dọn bớt tab rảnh vượt ngưỡng trước khi mở tab mới để không phình hàng trăm tab zombie khi chạy Chia đều
+        try:
+            self.evict_idle_sessions()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             session = self.create_worker_session(
                 cookies=cookies,
@@ -2053,6 +2060,7 @@ class MuseEngine:
             session.pre_navigate_new_thread()
         with cond:
             session.in_use = False
+            session.last_used_at = time.time()
             cur = self._session_pool.get(key)
             if not close_it and getattr(session, "close_requested", False):
                 close_it = True  # 检查期间被要求关闭
@@ -2069,6 +2077,65 @@ class MuseEngine:
                     "♻️ [TTL/Release] Giải phóng phiên của TK %s (Lỗi: %s, Hết hạn: %s, Tasks: %d)",
                     session.account_id, error, expired, session.task_count)
             session.close()
+        else:
+            try:
+                self.evict_idle_sessions()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def evict_idle_sessions(
+        self,
+        max_idle: int | None = None,
+        idle_ttl_s: float | None = None,
+        async_close: bool = True,
+    ) -> int:
+        """Đóng bớt các tab Chrome đang rảnh (LRU + quá hạn rảnh) để chống tràn RAM/CPU khi chạy nhiều TK
+        ở chế độ Chia đều luân phiên. Tuyệt đối không động vào phiên đang in_use."""
+        limit = max(0, int(self.browser_max_idle_sessions if max_idle is None else max_idle))
+        idle_ttl = max(0.0, float(self.browser_idle_timeout_seconds if idle_ttl_s is None else idle_ttl_s))
+        now = time.time()
+        cond = self._pool_condition()
+        evicted: list["MuseWorkerSession"] = []
+        with cond:
+            keep_idle: list[tuple[str, "MuseWorkerSession"]] = []
+            for k, s in list(self._session_pool.items()):
+                if getattr(s, "in_use", False):
+                    continue
+                expired_idle = (
+                    getattr(s, "is_closed", False)
+                    or (now - s.created_at) >= s.ttl_seconds
+                    or s.task_count >= s.max_tasks
+                    or (idle_ttl > 0 and (now - s.last_used_at) >= idle_ttl)
+                )
+                if expired_idle:
+                    self._session_pool.pop(k, None)
+                    evicted.append(s)
+                else:
+                    keep_idle.append((k, s))
+            if len(keep_idle) > limit:
+                keep_idle.sort(key=lambda item: getattr(item[1], "last_used_at", 0.0))
+                overflow = len(keep_idle) - limit
+                for k, s in keep_idle[:overflow]:
+                    self._session_pool.pop(k, None)
+                    evicted.append(s)
+            if evicted:
+                cond.notify_all()
+
+        if evicted:
+            def _close_batch(batch):
+                for s in batch:
+                    try:
+                        s.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            log.info("🧹 [Pool LRU] Đóng %d tab Chrome rảnh để giải phóng RAM/CPU (giữ tối đa %d tab ấm)",
+                     len(evicted), limit)
+            if async_close and len(evicted) > 2:
+                threading.Thread(target=_close_batch, args=(evicted,), daemon=True, name="pool-evict").start()
+            else:
+                _close_batch(evicted)
+        return len(evicted)
 
     def close_session_for_account(self, account_id: str):
         """Hủy phiên trình duyệt đang chạy của tài khoản (dùng khi xoay proxy hoặc đổi cookie).

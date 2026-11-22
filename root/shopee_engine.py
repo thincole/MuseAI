@@ -48,9 +48,64 @@ def _ffmpeg_concurrency() -> int:
 # re-encode / ghép Outro có thể mất hàng chục giây (timeout tới 240s), nên KHÔNG dùng 1 khóa toàn cục
 # (sẽ chặn mọi job khác tới vài phút). Giới hạn nhỏ vẫn giúp tránh nghẽn I/O ổ đĩa và quá tải CPU
 # (kết hợp với độ ưu tiên tiến trình thấp + "-threads 2" bên dưới). ffprobe (nhẹ, <1s) chạy ngoài semaphore.
+class _DynamicLimiter:
+    """Bộ giới hạn số luồng FFmpeg đồng thời hỗ trợ co giãn giới hạn động an toàn
+    (không lỗi BoundedSemaphore 'released too many times' khi hạ giới hạn lúc đang có nhiều job chạy)."""
+
+    def __init__(self, limit: int):
+        self._cond = threading.Condition(threading.Lock())
+        self._limit = max(1, int(limit))
+        self._active = 0
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    def set_limit(self, new_limit: int) -> int:
+        val = max(1, int(new_limit))
+        with self._cond:
+            self._limit = val
+            self._cond.notify_all()
+        return val
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        with self._cond:
+            if not blocking:
+                if self._active < self._limit:
+                    self._active += 1
+                    return True
+                return False
+            deadline = None if timeout is None else (time.monotonic() + timeout)
+            while self._active >= self._limit:
+                rem = None if deadline is None else (deadline - time.monotonic())
+                if rem is not None and rem <= 0:
+                    return False
+                self._cond.wait(rem)
+            self._active += 1
+            return True
+
+    def release(self) -> None:
+        with self._cond:
+            if self._active > 0:
+                self._active -= 1
+            self._cond.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+
 FFMPEG_CONCURRENCY = _ffmpeg_concurrency()
 FFMPEG_BASE_CONCURRENCY = FFMPEG_CONCURRENCY
-FFMPEG_SEMAPHORE = threading.BoundedSemaphore(FFMPEG_CONCURRENCY)
+FFMPEG_SEMAPHORE = _DynamicLimiter(FFMPEG_CONCURRENCY)
 FFMPEG_LOCK = FFMPEG_SEMAPHORE  # Giữ tên cũ để tương thích ngược (nếu module khác import).
 _FFMPEG_CONF_LOCK = threading.Lock()
 _FFMPEG_ACTIVE_LOCK = threading.Lock()
@@ -58,22 +113,10 @@ _FFMPEG_ACTIVE_COUNT = 0
 
 
 def _apply_ffmpeg_limit_locked(val: int) -> int:
-    global FFMPEG_CONCURRENCY, FFMPEG_SEMAPHORE, FFMPEG_LOCK
-    old_val = FFMPEG_CONCURRENCY
-    if val == old_val:
+    global FFMPEG_CONCURRENCY
+    if val == FFMPEG_CONCURRENCY:
         return FFMPEG_CONCURRENCY
-    FFMPEG_CONCURRENCY = val
-    try:
-        with FFMPEG_SEMAPHORE._cond:
-            old_init = getattr(FFMPEG_SEMAPHORE, "_initial_value", old_val)
-            diff = val - old_init
-            FFMPEG_SEMAPHORE._initial_value = val
-            FFMPEG_SEMAPHORE._value = max(0, FFMPEG_SEMAPHORE._value + diff)
-            if diff > 0:
-                FFMPEG_SEMAPHORE._cond.notify_all()
-    except Exception:
-        FFMPEG_SEMAPHORE = threading.BoundedSemaphore(val)
-        FFMPEG_LOCK = FFMPEG_SEMAPHORE
+    FFMPEG_CONCURRENCY = FFMPEG_SEMAPHORE.set_limit(val)
     return FFMPEG_CONCURRENCY
 
 

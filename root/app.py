@@ -3079,6 +3079,286 @@ def admin_media_cleanup(payload: dict = Body(default={}), _=Depends(admin_auth))
     )
 
 
+# ------------------------- Dọn temp định kỳ an toàn cho máy cắm 24/7 -------------------------
+_TEMP_CLEANUP_LOCK = threading.Lock()
+_TEMP_CLEANUP_LAST: dict[str, Any] = {"ran_at": 0, "summary": None}
+_PROFILE_MARKERS = frozenset({"Local State", "Preferences", "DevToolsActivePort", "LOCK", "SingletonLock", "lockfile", "parent.lock"})
+_SKIP_TEMP_TOP_PREFIXES = ("_mei", "pyinstaller")
+
+
+def _active_media_filenames() -> set[str]:
+    """Tập tên file trong data/media đang gắn với task chưa hoàn tất (queued/processing) để tuyệt đối không xóa."""
+    names: set[str] = set()
+    try:
+        for t in store.list_tasks(500):
+            if t.get("status") not in ("queued", "processing", "pending"):
+                continue
+            res = t.get("result") or {}
+            for cand in (t.get("filename"), res.get("filename") if isinstance(res, dict) else None):
+                if cand:
+                    names.add(os.path.basename(str(cand)))
+    except Exception:  # noqa: BLE001
+        pass
+    return names
+
+
+def _tree_has_recent_activity(root_dir: str, cutoff_ts: float, deadline: float) -> bool:
+    """Trả về True nếu thư mục (vd profile Chrome/DrissionPage) có bất kỳ file nào sửa đổi sau cutoff_ts -> đang chạy."""
+    stack = [root_dir]
+    visited = 0
+    while stack:
+        if time.monotonic() >= deadline:
+            return True  # hết ngân sách thời gian -> giả định đang hoạt động để đảm bảo an toàn tuyệt đối
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    visited += 1
+                    if visited % 400 == 0 and time.monotonic() >= deadline:
+                        return True
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                        if entry.is_file(follow_symlinks=False):
+                            if st.st_mtime >= cutoff_ts:
+                                return True
+                        elif entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                    except OSError:
+                        return True  # không đọc được stat -> coi như đang bị khóa, bỏ qua an toàn
+        except OSError:
+            return True
+    return False
+
+
+def _clean_directory_safe(
+    root_dir: str,
+    cutoff_ts: float,
+    deadline: float,
+    dry_run: bool = False,
+    skip_names: set[str] | None = None,
+    protect_profiles: bool = False,
+    stats: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """Dọn đệ quy an toàn theo tuổi file:
+    - Không bao giờ đi theo symlink/junction.
+    - Bỏ qua file mới hơn cutoff_ts, file nằm trong skip_names, file đang bị tiến trình khác khóa (OSError).
+    - Khi protect_profiles=True: nếu gặp thư mục profile trình duyệt còn bất kỳ file nào sửa sau cutoff_ts -> bỏ qua cả cây profile.
+    - Tự nhả CPU/I/O mỗi 100 file và dừng ngay khi quá deadline để không làm lag Chrome/FFmpeg."""
+    st_out = stats if stats is not None else {
+        "removed_files": 0, "removed_dirs": 0, "freed_bytes": 0,
+        "skipped_recent": 0, "skipped_in_use": 0, "skipped_protected": 0, "budget_hit": 0,
+    }
+    if not root_dir or not os.path.isdir(root_dir):
+        return st_out
+    skip_set = skip_names or set()
+
+    def _walk(cur_dir: str, is_root: bool) -> bool:
+        """Trả về True nếu cur_dir trở nên rỗng (hoặc sẽ rỗng khi dry_run)."""
+        if time.monotonic() >= deadline:
+            st_out["budget_hit"] = 1
+            return False
+        try:
+            entries = list(os.scandir(cur_dir))
+        except OSError:
+            st_out["skipped_in_use"] += 1
+            return False
+
+        if not is_root and protect_profiles:
+            names_here = {e.name for e in entries}
+            if names_here & _PROFILE_MARKERS:
+                if _tree_has_recent_activity(cur_dir, cutoff_ts, deadline):
+                    st_out["skipped_protected"] += 1
+                    return False
+
+        all_cleared = True
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                st_out["budget_hit"] = 1
+                return False
+            name = entry.name
+            if name in (".gitkeep", "desktop.ini") or name in skip_set:
+                all_cleared = False
+                continue
+            if is_root and protect_profiles and name.lower().startswith(_SKIP_TEMP_TOP_PREFIXES):
+                st_out["skipped_protected"] += 1
+                all_cleared = False
+                continue
+            try:
+                if entry.is_symlink():
+                    all_cleared = False
+                    continue
+                est = entry.stat(follow_symlinks=False)
+            except OSError:
+                st_out["skipped_in_use"] += 1
+                all_cleared = False
+                continue
+
+            if entry.is_file(follow_symlinks=False):
+                if est.st_mtime >= cutoff_ts:
+                    st_out["skipped_recent"] += 1
+                    all_cleared = False
+                    continue
+                if dry_run:
+                    st_out["removed_files"] += 1
+                    st_out["freed_bytes"] += est.st_size
+                else:
+                    try:
+                        os.remove(entry.path)
+                        st_out["removed_files"] += 1
+                        st_out["freed_bytes"] += est.st_size
+                        if st_out["removed_files"] % 100 == 0:
+                            time.sleep(0.005)
+                    except OSError:
+                        st_out["skipped_in_use"] += 1
+                        all_cleared = False
+            elif entry.is_dir(follow_symlinks=False):
+                sub_empty = _walk(entry.path, False)
+                if sub_empty and est.st_mtime < cutoff_ts:
+                    if dry_run:
+                        st_out["removed_dirs"] += 1
+                    else:
+                        try:
+                            os.rmdir(entry.path)
+                            st_out["removed_dirs"] += 1
+                        except OSError:
+                            st_out["skipped_in_use"] += 1
+                            all_cleared = False
+                else:
+                    all_cleared = False
+            else:
+                all_cleared = False
+        return all_cleared
+
+    _walk(root_dir, True)
+    return st_out
+
+
+def cleanup_temp_files(
+    min_age_minutes: int | None = None,
+    include_system_temp: bool | None = None,
+    orphan_media_hours: int | None = None,
+    dry_run: bool = False,
+    max_runtime_s: float = 25.0,
+) -> dict:
+    """Dọn file tạm định kỳ an toàn (không ảnh hưởng luồng đang chạy) cho máy cắm 24/7:
+    1. %TEMP% của Windows (chỉ xóa file/profile cũ hơn min_age_minutes, bỏ qua _MEI*, profile đang hoạt động & file đang mở).
+    2. data/shopee_images_cache & data/downloads (chỉ xóa file cũ hơn >=30 phút).
+    3. File rác mồ côi trong data/media cũ hơn orphan_media_hours và không thuộc task đang chạy.
+    TUYỆT ĐỐI KHÔNG đụng thư mục out_dir/temp chứa clip chờ ghép của người dùng."""
+    if not _TEMP_CLEANUP_LOCK.acquire(blocking=False):
+        return {"skipped": True, "reason": "Đang có tiến trình dọn temp khác chạy"}
+    t0 = time.monotonic()
+    try:
+        import tempfile as _tempfile
+        age_min = max(10, int(CFG.temp_cleanup_min_age_minutes if min_age_minutes is None else min_age_minutes))
+        inc_sys = CFG.temp_cleanup_include_system_temp if include_system_temp is None else bool(include_system_temp)
+        media_hrs = max(0, int(CFG.temp_cleanup_orphan_media_hours if orphan_media_hours is None else orphan_media_hours))
+        now = time.time()
+        deadline = t0 + max(5.0, float(max_runtime_s or 25.0))
+        app_cutoff = now - max(1800, age_min * 60)  # cache/downloads của app giữ tối thiểu 30 phút
+        sys_cutoff = now - age_min * 60
+
+        targets: list[tuple[str, str, float, bool, set[str]]] = [
+            ("shopee_images_cache", os.path.join(BASE_DIR, "data", "shopee_images_cache"), app_cutoff, False, set()),
+            ("downloads", CFG.download_dir, app_cutoff, False, set()),
+        ]
+        if media_hrs > 0:
+            media_cutoff = now - media_hrs * 3600
+            targets.append(("orphan_media", CFG.media_dir, media_cutoff, False, _active_media_filenames()))
+        if inc_sys:
+            sys_tmp = _tempfile.gettempdir()
+            if sys_tmp and os.path.isdir(sys_tmp):
+                targets.append(("system_temp", sys_tmp, sys_cutoff, True, set()))
+
+        breakdown: dict[str, dict[str, int]] = {}
+        total_files = total_dirs = total_freed = total_in_use = 0
+        for label, path, cutoff, prot_prof, skip_set in targets:
+            if time.monotonic() >= deadline:
+                break
+            st = _clean_directory_safe(
+                path,
+                cutoff_ts=cutoff,
+                deadline=deadline,
+                dry_run=dry_run,
+                skip_names=skip_set,
+                protect_profiles=prot_prof,
+            )
+            breakdown[label] = st
+            total_files += st["removed_files"]
+            total_dirs += st["removed_dirs"]
+            total_freed += st["freed_bytes"]
+            total_in_use += st["skipped_in_use"]
+
+        disk_free_gb = {}
+        for dlabel, dpath in (("system_temp", _tempfile.gettempdir()), ("app_data", CFG.data_dir)):
+            try:
+                if dpath and os.path.exists(dpath):
+                    disk_free_gb[dlabel] = round(shutil.disk_usage(dpath).free / (1024 ** 3), 2)
+            except OSError:
+                pass
+
+        result = {
+            "dry_run": dry_run,
+            "elapsed_s": round(time.monotonic() - t0, 2),
+            "removed_files": total_files,
+            "removed_dirs": total_dirs,
+            "freed_bytes": total_freed,
+            "freed_mb": round(total_freed / (1024 ** 2), 1),
+            "skipped_in_use": total_in_use,
+            "min_age_minutes": age_min,
+            "disk_free_gb": disk_free_gb,
+            "breakdown": breakdown,
+        }
+        if not dry_run:
+            _TEMP_CLEANUP_LAST["ran_at"] = int(time.time())
+            _TEMP_CLEANUP_LAST["summary"] = result
+        if total_files > 0 or total_dirs > 0:
+            log.info(
+                "🧹 [Dọn Temp định kỳ] %s %d file + %d thư mục (giải phóng %.1f MB, bỏ qua %d đang khóa, %.1fs) | Trống đĩa: %s",
+                "Sẽ xóa" if dry_run else "Đã xóa",
+                total_files, total_dirs, result["freed_mb"], total_in_use, result["elapsed_s"],
+                ", ".join(f"{k}={v}GB" for k, v in disk_free_gb.items()) or "n/a",
+            )
+        return result
+    finally:
+        _TEMP_CLEANUP_LOCK.release()
+
+
+@app.post("/admin/temp/cleanup")
+def admin_temp_cleanup(payload: dict = Body(default={}), _=Depends(admin_auth)):
+    """Dọn temp thủ công an toàn (bỏ qua mọi file đang dùng). Body tùy chọn: min_age_minutes, include_system_temp, orphan_media_hours, dry_run."""
+    p = payload if isinstance(payload, dict) else {}
+    return cleanup_temp_files(
+        min_age_minutes=p.get("min_age_minutes"),
+        include_system_temp=p.get("include_system_temp"),
+        orphan_media_hours=p.get("orphan_media_hours"),
+        dry_run=bool(p.get("dry_run", False)),
+    )
+
+
+@app.get("/admin/temp/status")
+def admin_temp_status(_=Depends(admin_auth)):
+    """Trạng thái lịch dọn temp định kỳ và dung lượng trống ổ đĩa."""
+    import tempfile as _tempfile
+    disk_free_gb = {}
+    for dlabel, dpath in (("system_temp", _tempfile.gettempdir()), ("app_data", CFG.data_dir)):
+        try:
+            if dpath and os.path.exists(dpath):
+                disk_free_gb[dlabel] = round(shutil.disk_usage(dpath).free / (1024 ** 3), 2)
+        except OSError:
+            pass
+    return {
+        "interval_minutes": CFG.temp_cleanup_interval_minutes,
+        "min_age_minutes": CFG.temp_cleanup_min_age_minutes,
+        "include_system_temp": CFG.temp_cleanup_include_system_temp,
+        "orphan_media_hours": CFG.temp_cleanup_orphan_media_hours,
+        "disk_free_gb": disk_free_gb,
+        "last_run": _TEMP_CLEANUP_LAST,
+    }
+
+
 # ------------------------- 前端页面 -------------------------
 def _admin_html() -> str:
     p = os.path.join(BASE_DIR, "admin.html")
@@ -3775,6 +4055,16 @@ class SmartThreadController:
         # Điều tiết FFmpeg tự động theo tải CPU để không làm nghẽn Chrome WebSocket
         shopee_engine.apply_dynamic_ffmpeg_throttle(cpu_pct)
         ff_st = shopee_engine.get_ffmpeg_status()
+
+        # Tự dọn tab Chrome rảnh khi RAM cao (>=80% hoặc trống <6GB) hoặc vượt hạn rảnh để chống phình 200+ tab
+        if hasattr(engine, "evict_idle_sessions"):
+            try:
+                if ram_used_pct >= 80.0 or ram_avail_gb < 6.0:
+                    engine.evict_idle_sessions(max_idle=0)
+                else:
+                    engine.evict_idle_sessions()
+            except Exception:  # noqa: BLE001
+                pass
 
         snap = dict(store.capacity_snapshot() or {})
         slots = max(0, int(snap.get("slots") or 0))
@@ -6094,10 +6384,13 @@ async def _startup():
 
 
 async def _maintenance_loop():
-    """Việc nền định kỳ: làm mới danh sách proxy Webshare (10 phút) và trả về hàng chờ các SP kẹt `processing` quá lâu (30 phút)."""
+    """Việc nền định kỳ: làm mới danh sách proxy Webshare (10 phút), trả về hàng chờ SP kẹt `processing` (30 phút),
+    và tự dọn file tạm an toàn (mặc định 60 phút/lần) cho máy cắm 24/7."""
     await asyncio.sleep(60)
     last_reclaim = 0.0
     last_proxy_sweep = 0.0
+    # Lần dọn temp đầu tiên chạy sau khi khởi động ~5 phút (không làm chậm lúc mở app)
+    last_temp_cleanup = time.time() - max(0, CFG.temp_cleanup_interval_minutes * 60 - 240) if CFG.temp_cleanup_interval_minutes > 0 else 0.0
     while True:
         try:
             await asyncio.to_thread(_webshare_refresh_now, False)
@@ -6131,6 +6424,13 @@ async def _maintenance_loop():
             _check_success_rate_alert()
         except Exception as exc:  # noqa: BLE001
             log.warning("Kiểm tra cảnh báo tỷ lệ thành công lỗi: %s", exc)
+        try:
+            temp_iv = int(CFG.temp_cleanup_interval_minutes or 0) * 60
+            if temp_iv > 0 and (time.time() - last_temp_cleanup) >= temp_iv:
+                last_temp_cleanup = time.time()
+                await asyncio.to_thread(cleanup_temp_files)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("🧹 Dọn temp định kỳ lỗi (bỏ qua): %s", exc)
         await asyncio.sleep(600)
 
 
