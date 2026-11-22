@@ -967,9 +967,39 @@ _TEXT_ONLY_STREAK: dict[str, int] = {}
 _TEXT_ONLY_LEVEL: dict[str, int] = {}   # cấp cooldown tăng dần cho TK hay chỉ trả lời bằng chữ
 
 # ---- Thống kê lý do thất bại / thành công (cửa sổ trượt 1 giờ) + cảnh báo Telegram khi tỷ lệ thành công thấp ----
-_GEN_EVENTS: "collections.deque" = collections.deque(maxlen=20000)   # (ts, ok, category)
+_GEN_EVENTS: "collections.deque" = collections.deque(maxlen=20000)   # (ts, ok, category, duration_s)
 _GEN_EVENTS_LOCK = threading.Lock()
 _LAST_ALERT_TS = 0.0
+_CONGESTION_FAIL_CATS = frozenset({"Hết giờ chờ", "TK chỉ trả lời bằng chữ", "Proxy/khởi tạo trang", "Khác"})
+_ACTIVE_GENS_LOCK = threading.Lock()
+_ACTIVE_GENS: dict[int, float] = {}   # token -> monotonic start ts
+
+
+def _register_active_gen(start_mono: float) -> int:
+    tok = id(threading.current_thread()) ^ int(start_mono * 1000)
+    with _ACTIVE_GENS_LOCK:
+        while tok in _ACTIVE_GENS:
+            tok += 1
+        _ACTIVE_GENS[tok] = start_mono
+    return tok
+
+
+def _unregister_active_gen(tok: int | None) -> None:
+    if tok is None:
+        return
+    with _ACTIVE_GENS_LOCK:
+        _ACTIVE_GENS.pop(tok, None)
+
+
+def _active_gen_stats(slow_threshold_s: float = 150.0) -> tuple[int, int, float]:
+    """Trả về (số tác vụ đang render, số tác vụ kẹt quá ngưỡng giây, tuổi trung bình giây)."""
+    now = time.monotonic()
+    with _ACTIVE_GENS_LOCK:
+        ages = [max(0.0, now - t0) for t0 in _ACTIVE_GENS.values()]
+    if not ages:
+        return 0, 0, 0.0
+    slow = sum(1 for a in ages if a >= slow_threshold_s)
+    return len(ages), slow, round(sum(ages) / len(ages), 1)
 
 
 def _classify_fail(err_str: str, refusal: bool = False) -> str:
@@ -991,9 +1021,9 @@ def _classify_fail(err_str: str, refusal: bool = False) -> str:
     return "Khác"
 
 
-def _record_gen_event(ok: bool, category: str = "") -> None:
+def _record_gen_event(ok: bool, category: str = "", duration_s: float = 0.0) -> None:
     with _GEN_EVENTS_LOCK:
-        _GEN_EVENTS.append((time.time(), ok, category))
+        _GEN_EVENTS.append((time.time(), ok, category, float(duration_s or 0.0)))
 
 
 def gen_stats(window_s: float = 3600.0) -> dict:
@@ -1002,9 +1032,22 @@ def gen_stats(window_s: float = 3600.0) -> dict:
         ev = [e for e in _GEN_EVENTS if e[0] >= cut]
     ok = sum(1 for e in ev if e[1])
     fails = collections.Counter(e[2] for e in ev if not e[1])
+    durs = [e[3] for e in ev if e[1] and len(e) >= 4 and e[3] > 0]
+    cong_fail = sum(v for k, v in fails.items() if k in _CONGESTION_FAIL_CATS)
+    cong_denom = ok + cong_fail
     total = len(ev)
-    return {"window_s": window_s, "ok": ok, "fail": total - ok, "total": total,
-            "success_rate": round(ok / total, 3) if total else None, "fail_reasons": dict(fails.most_common())}
+    return {
+        "window_s": window_s,
+        "ok": ok,
+        "fail": total - ok,
+        "total": total,
+        "success_rate": round(ok / total, 3) if total else None,
+        "fail_reasons": dict(fails.most_common()),
+        "avg_duration_s": round(sum(durs) / len(durs), 1) if durs else 0.0,
+        "congestion_fail": cong_fail,
+        "congestion_denom": cong_denom,
+        "congestion_rate": round(cong_fail / cong_denom, 3) if cong_denom >= 6 else 0.0,
+    }
 
 
 def _send_telegram_alert(text: str) -> bool:
@@ -1054,13 +1097,17 @@ _NEUTRAL_PROMPT_SUFFIX = (
 _SLOW_PROXY_LOCK = threading.Lock()
 _SLOW_PROXY_STREAK: dict[str, int] = {}
 _SLOW_PROXY_ROTATE_TS: dict[str, float] = {}
-_SLOW_PROXY_THRESHOLD_SEC = float(os.environ.get("MUSE2API_SLOW_PROXY_SEC", "28") or 28)
+_SLOW_PROXY_THRESHOLD_SEC = float(os.environ.get("MUSE2API_SLOW_PROXY_SEC", "35") or 35)
 _SLOW_PROXY_STREAK_LIMIT = 3
 
 
-def _track_proxy_open_speed(aid: str, open_seconds: float):
-    """Phát hiện proxy quá chậm (>28s mở trang muse.ai 3 lần liên tiếp) -> tự xoay sang proxy nhanh hơn ngoài nền."""
+def _track_proxy_open_speed(aid: str, open_seconds: float, creating_cnt: int = 0):
+    """Phát hiện proxy quá chậm (>35s mở trang muse.ai 3 lần tạo phiên mới liên tiếp, khi Chrome không đang mở ồ ạt)
+    -> tự xoay sang proxy nhanh hơn ngoài nền."""
     if not aid or not open_seconds or open_seconds <= 0 or store.is_hub_client():
+        return
+    # Nếu Chrome đang mở đồng thời nhiều tab mới (>3), độ trễ là do tranh chấp Chrome chứ không phải do proxy -> bỏ qua
+    if creating_cnt > 3:
         return
     should_rotate = False
     now = time.time()
@@ -1072,7 +1119,7 @@ def _track_proxy_open_speed(aid: str, open_seconds: float):
                 _SLOW_PROXY_STREAK[aid] = 0
                 _SLOW_PROXY_ROTATE_TS[aid] = now
                 should_rotate = True
-        elif open_seconds <= 20.0:
+        elif open_seconds <= 22.0:
             _SLOW_PROXY_STREAK.pop(aid, None)
 
     if should_rotate:
@@ -1188,19 +1235,26 @@ def _run_generation(prompt: str, kind: str, timeout: int,
             refusal_stop = False
 
             session = None
+            active_tok = None
             try:
                 remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
                 if remaining <= 0:
                     raise MuseGenerationError("Đã hết thời gian chờ tác vụ")
 
                 t_gen_start = time.monotonic()
+                active_tok = _register_active_gen(t_gen_start)
                 session = engine.acquire_session(
                     account_id=cur_acc["id"],
                     cookies=cur_acc["cookies"],
                     expires=cur_acc.get("cookies_exp"),
                     timeout=75
                 )
-                _track_proxy_open_speed(cur_acc["id"], getattr(session, "open_seconds", 0.0))
+                # Chỉ chấm tốc độ mở trang 1 lần duy nhất cho phiên vừa tạo mới (tránh cộng dồn khi tái sử dụng)
+                fresh_open_s = float(getattr(session, "open_seconds", 0.0) or 0.0)
+                if fresh_open_s > 0:
+                    session.open_seconds = 0.0
+                    creating_now = engine.creating_session_count() if hasattr(engine, "creating_session_count") else 0
+                    _track_proxy_open_speed(cur_acc["id"], fresh_open_s, creating_cnt=creating_now)
                 res = session.generate(
                     prompt=prompt,
                     expect=kind,
@@ -1213,7 +1267,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 store.record_vm_ok(cur_acc["id"], duration_s=gen_duration_s)
                 _TEXT_ONLY_STREAK.pop(cur_acc["id"], None)
                 _TEXT_ONLY_LEVEL.pop(cur_acc["id"], None)
-                _record_gen_event(True)
+                _record_gen_event(True, duration_s=gen_duration_s)
                 engine.release_session(session, error=False)
                 session = None
                 return res, cur_acc["id"]
@@ -1414,6 +1468,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                         pass
                     session = None
             finally:
+                _unregister_active_gen(active_tok)
                 if session:
                     try:
                         engine.release_session(session, error=True)
@@ -3655,14 +3710,31 @@ def _sample_cpu_pct() -> float:
         return round(_CPU_EWMA_PCT, 1)
 
 
+# Trần an toàn cho 1 tiến trình Chrome CDP (dù máy có 128 GB RAM / 72 CPU, 1 Chrome nghẽn mạng/IPC quá ~60-64 tab)
+CHROME_MAX_THREADS = max(8, int(os.environ.get("MUSE2API_CHROME_MAX_THREADS", "64") or 64))
+AUTO_START_MAX = max(8, int(os.environ.get("MUSE2API_AUTO_START_MAX", "40") or 40))
+
+
 class SmartThreadController:
-    """Bộ điều khiển luồng động theo thuật toán AIMD + Dual-Backpressure (RAM, CPU, timeout và số ô TK Muse)."""
+    """Bộ điều khiển luồng động theo AIMD + Goodput Hill-Climbing + Dual-Backpressure
+    (RAM, CPU, trần 1 Chrome CDP, tỷ lệ lỗi nghẽn, tác vụ treo >150s và tốc độ video/phút thật)."""
+
+    DOWN_INTERVAL_S = 12.0
+    UP_INTERVAL_S = 25.0
+    SLOW_IN_FLIGHT_S = 150.0
 
     def __init__(self):
         self._lock = threading.Lock()
         self._current = 0
         self._last_adjust_ts = 0.0
+        self._last_up_ts = 0.0
+        self._started_at = 0.0
+        self._level_since = 0.0
         self._high_cpu_streak = 0
+        self._best_vpm = 0.0
+        self._best_workers = 0
+        self._soft_cap = 0
+        self._soft_cap_until = 0.0
         self._reason = "Khởi tạo"
 
     def evaluate(self, mode: str = "manual", requested: int = 0, reset: bool = False) -> dict:
@@ -3672,6 +3744,7 @@ class SmartThreadController:
         ram_used_pct = float(sys_cap.get("ram_used_pct") or 0)
         ram_avail_gb = float(sys_cap.get("ram_available_gb") or 0)
         machine_max = max(1, int(sys_cap.get("max_threads") or 8))
+        chrome_cap = max(8, int(sys_cap.get("chrome_max_threads") or CHROME_MAX_THREADS))
 
         # Điều tiết FFmpeg tự động theo tải CPU để không làm nghẽn Chrome WebSocket
         shopee_engine.apply_dynamic_ffmpeg_throttle(cpu_pct)
@@ -3680,36 +3753,73 @@ class SmartThreadController:
         snap = dict(store.capacity_snapshot() or {})
         slots = max(0, int(snap.get("slots") or 0))
         pool_total, pool_in_use = engine.active_session_counts()
+        creating_cnt = engine.creating_session_count() if hasattr(engine, "creating_session_count") else 0
 
         st5 = gen_stats(300.0)
+        st3 = gen_stats(180.0)
         total_5m = int(st5.get("total") or 0)
         ok_5m = int(st5.get("ok") or 0)
+        ok_3m = int(st3.get("ok") or 0)
         timeout_5m = int((st5.get("fail_reasons") or {}).get("Hết giờ chờ", 0))
-        timeout_rate = (timeout_5m / total_5m) if total_5m >= 8 else 0.0
-        goodput_vpm = round(ok_5m / 5.0, 2)
+        timeout_rate = (timeout_5m / total_5m) if total_5m >= 6 else 0.0
+        congestion_rate = float(st5.get("congestion_rate") or 0.0)
+        congestion_denom = int(st5.get("congestion_denom") or 0)
+        avg_duration_s = float(st5.get("avg_duration_s") or 0.0)
 
-        req_cap = max(1, int(requested or 0)) if not auto_mode and int(requested or 0) > 0 else machine_max
-        # Nếu tạm thời mọi TK đều cooldown (slots == 0), giữ tối thiểu vài luồng để chờ TK mở lại
-        slot_cap = slots if slots > 0 else min(4, machine_max, req_cap)
-        hard_cap = max(1, min(req_cap, machine_max, slot_cap))
-        floor = min(hard_cap, max(2, min(6, int(hard_cap * 0.2))))
+        in_flight, slow_in_flight, avg_in_flight_s = _active_gen_stats(self.SLOW_IN_FLIGHT_S)
+        slow_ratio = (slow_in_flight / in_flight) if in_flight >= 10 else 0.0
+
+        if auto_mode:
+            auto_ceiling = max(1, min(machine_max, chrome_cap))
+            slot_cap = slots if slots > 0 else min(4, auto_ceiling)
+            hard_cap = max(1, min(auto_ceiling, slot_cap))
+        else:
+            req_cap = max(1, int(requested or 0)) if int(requested or 0) > 0 else machine_max
+            slot_cap = slots if slots > 0 else min(4, machine_max, req_cap)
+            hard_cap = max(1, min(req_cap, machine_max, slot_cap))
+        floor = min(hard_cap, max(2, min(8, int(hard_cap * 0.25))))
 
         now = time.monotonic()
         with self._lock:
             if reset or self._current <= 0:
+                self._started_at = now
+                self._level_since = now
+                self._high_cpu_streak = 0
+                self._best_vpm = 0.0
+                self._best_workers = 0
+                self._soft_cap = 0
+                self._soft_cap_until = 0.0
                 if auto_mode:
-                    self._current = max(floor, min(hard_cap, int(round(hard_cap * 0.65))))
+                    warm = int(round(hard_cap * 0.65))
+                    self._current = max(floor, min(hard_cap, AUTO_START_MAX, warm))
                 else:
                     self._current = hard_cap
-                self._high_cpu_streak = 0
                 self._last_adjust_ts = now
-                self._reason = "Khởi động thông minh (AIMD)" if auto_mode else "Mức cấu hình"
-            elif now - self._last_adjust_ts >= 8.0:
+                self._last_up_ts = now
+                self._reason = "Khởi động êm (AIMD)" if auto_mode else "Mức cấu hình"
+            run_elapsed = max(1.0, now - (self._started_at or now))
+            if run_elapsed >= 180.0:
+                goodput_vpm = round(ok_3m / 3.0, 2)
+            else:
+                goodput_vpm = round(ok_5m / max(1.0, run_elapsed / 60.0), 2)
+
+            if not (reset or self._current <= 0) and (now - self._last_adjust_ts) >= self.DOWN_INTERVAL_S:
                 self._last_adjust_ts = now
-                if cpu_pct >= 92.0:
+                if self._soft_cap and now >= self._soft_cap_until:
+                    self._soft_cap = 0
+                if cpu_pct >= 90.0:
                     self._high_cpu_streak += 1
                 else:
                     self._high_cpu_streak = 0
+
+                # Cập nhật mốc năng suất đỉnh (video/phút) khi mức luồng hiện tại đã chạy ổn định >= 45s
+                if auto_mode and run_elapsed >= 120.0 and ok_3m >= 6 and (now - self._level_since) >= 45.0:
+                    if self._best_vpm <= 0.0 or goodput_vpm > self._best_vpm * 1.03:
+                        self._best_vpm = goodput_vpm
+                        self._best_workers = self._current
+
+                effective_cap = min(hard_cap, self._soft_cap) if (auto_mode and self._soft_cap > 0) else hard_cap
+                prev_cur = self._current
 
                 if ram_used_pct >= 88.0 or ram_avail_gb < 3.0:
                     self._current = max(floor, int(self._current * 0.75))
@@ -3717,28 +3827,79 @@ class SmartThreadController:
                 elif self._high_cpu_streak >= 2:
                     self._current = max(floor, int(self._current * 0.80))
                     self._reason = f"Giảm tải CPU ({cpu_pct:.0f}%)"
-                elif timeout_rate >= 0.30:
+                elif timeout_rate >= 0.20:
                     self._current = max(floor, int(self._current * 0.80))
+                    if auto_mode:
+                        self._soft_cap = self._current
+                        self._soft_cap_until = now + 180.0
                     self._reason = f"Giảm do timeout cao ({timeout_rate*100:.0f}%)"
+                elif congestion_denom >= 8 and congestion_rate >= 0.25:
+                    self._current = max(floor, int(self._current * 0.80))
+                    if auto_mode:
+                        self._soft_cap = self._current
+                        self._soft_cap_until = now + 180.0
+                    self._reason = f"Giảm do nghẽn Chrome/lỗi ({congestion_rate*100:.0f}%)"
+                elif auto_mode and slow_ratio >= 0.45:
+                    self._current = max(floor, int(self._current * 0.82))
+                    self._soft_cap = self._current
+                    self._soft_cap_until = now + 150.0
+                    self._reason = f"Giảm do render chậm ({slow_in_flight}/{in_flight} tab >{int(self.SLOW_IN_FLIGHT_S)}s)"
+                elif (
+                    auto_mode
+                    and self._best_vpm >= 4.0
+                    and self._best_workers > 0
+                    and self._current >= self._best_workers + 4
+                    and (now - self._level_since) >= 75.0
+                    and goodput_vpm < self._best_vpm * 0.85
+                ):
+                    self._current = max(floor, self._best_workers)
+                    self._soft_cap = self._current
+                    self._soft_cap_until = now + 240.0
+                    self._reason = f"Lùi về điểm đỉnh {self._current} luồng ({goodput_vpm:.1f} < đỉnh {self._best_vpm:.1f} vid/p)"
                 elif self._current > hard_cap:
                     self._current = hard_cap
-                    self._reason = "Khớp giới hạn TK sống / sức máy"
-                elif (
-                    self._current < hard_cap
-                    and ram_used_pct < 80.0
-                    and ram_avail_gb >= 4.0
-                    and cpu_pct < 80.0
-                    and timeout_rate < 0.15
-                ):
-                    gap = hard_cap - self._current
-                    step = 4 if gap >= 16 else (2 if gap >= 4 else 1)
-                    self._current = min(hard_cap, self._current + step)
-                    self._reason = f"Tăng tốc +{step} (AIMD)"
+                    self._reason = "Khớp giới hạn TK sống / Chrome"
+                elif (now - self._last_up_ts) >= self.UP_INTERVAL_S and self._current < effective_cap:
+                    waiting_feedback = auto_mode and self._current >= 36 and ok_5m < 5
+                    if waiting_feedback:
+                        self._reason = f"Chờ video đầu hoàn tất để đo tốc độ ({ok_5m}/5)"
+                    elif creating_cnt > 4:
+                        self._reason = f"Giữ nhịp khi đang mở {creating_cnt} tab mới"
+                    elif avg_duration_s > 135.0 and ok_5m >= 5:
+                        self._reason = f"Giữ nhịp vì thời gian render cao (~{avg_duration_s:.0f}s/vid)"
+                    elif (
+                        ram_used_pct < 78.0
+                        and ram_avail_gb >= 5.0
+                        and cpu_pct < 78.0
+                        and timeout_rate < 0.10
+                        and congestion_rate < 0.12
+                        and slow_ratio < 0.25
+                    ):
+                        gap = effective_cap - self._current
+                        if auto_mode:
+                            step = 2 if gap >= 4 else 1
+                        else:
+                            step = 4 if gap >= 16 else (2 if gap >= 4 else 1)
+                        self._current = min(effective_cap, self._current + step)
+                        self._last_up_ts = now
+                        self._reason = f"Tăng êm +{step} (AIMD)"
+                    else:
+                        self._reason = "Giữ ổn định (chờ tải dịu)"
                 else:
-                    self._reason = "Ổn định tối ưu"
+                    if auto_mode and self._soft_cap > 0 and self._current >= effective_cap:
+                        self._reason = f"Khóa ở điểm ngọt ~{self._current} luồng"
+                    else:
+                        self._reason = "Ổn định tối ưu"
+
+                if self._current != prev_cur:
+                    self._level_since = now
+                    if self._current < prev_cur:
+                        self._last_up_ts = now
 
             rec = max(1, min(self._current, hard_cap))
             reason = self._reason
+            best_vpm = round(self._best_vpm, 2)
+            best_workers = self._best_workers
 
         snap.update({
             "threads_hint": rec if auto_mode else snap.get("slots", 0),
@@ -3750,13 +3911,23 @@ class SmartThreadController:
             "ram_used_pct": ram_used_pct,
             "ram_available_gb": ram_avail_gb,
             "machine_max_threads": machine_max,
+            "chrome_max_threads": chrome_cap,
+            "auto_max_threads": min(machine_max, chrome_cap),
             "active_sessions": pool_total,
             "sessions_in_use": pool_in_use,
+            "creating_sessions": creating_cnt,
             "ffmpeg_active": ff_st["active"],
             "ffmpeg_limit": ff_st["limit"],
             "ffmpeg_base": ff_st["base"],
             "goodput_vpm": goodput_vpm,
+            "best_goodput_vpm": best_vpm,
+            "best_workers": best_workers,
+            "avg_duration_s": avg_duration_s,
             "timeout_rate_5m": round(timeout_rate, 3),
+            "congestion_rate_5m": round(congestion_rate, 3),
+            "in_flight": in_flight,
+            "slow_in_flight": slow_in_flight,
+            "avg_in_flight_s": avg_in_flight_s,
         })
         return snap
 
@@ -4850,6 +5021,7 @@ def system_capacity():
     reserve = max(RAM_RESERVE_GB_MIN, total_gb * 0.1)
     ram_cap = max(1, int((total_gb - reserve) / RAM_PER_THREAD_GB))
     cpu_cap = max(1, cpu * THREADS_PER_CPU)
+    hw_max = min(ram_cap, cpu_cap)
     return {
         "ram_total_gb": round(total_gb, 1),
         "ram_available_gb": round(avail_gb, 1),
@@ -4858,7 +5030,9 @@ def system_capacity():
         "cpu_threads": cpu,
         "ram_cap": ram_cap,
         "cpu_cap": cpu_cap,
-        "max_threads": min(ram_cap, cpu_cap),
+        "max_threads": hw_max,
+        "chrome_max_threads": CHROME_MAX_THREADS,
+        "auto_max_threads": min(hw_max, CHROME_MAX_THREADS),
         "limited_by": "RAM" if ram_cap <= cpu_cap else "CPU",
         "ram_per_thread_gb": RAM_PER_THREAD_GB,
     }

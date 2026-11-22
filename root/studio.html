@@ -3946,12 +3946,12 @@
     const cap = alive * perAcc;
 
     if (autoMode) {
-      const mMax = machineCapacity?.max_threads || 64;
-      const autoCap = alive > 0 ? Math.min(cap, mMax) : mMax;
+      const autoMax = machineCapacity?.auto_max_threads || Math.min(machineCapacity?.max_threads || 64, 64);
+      const autoCap = alive > 0 ? Math.min(cap, autoMax) : autoMax;
       if (alive <= 0) {
         hintEl.innerHTML = `<span style="color:#ef4444;font-weight:700;">(🔴 0 TK sống - Cần nạp Cookie)</span>`;
       } else {
-        hintEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;" title="AIMD tự tăng/giảm số luồng mỗi 10s dựa trên RAM, CPU, tốc độ ra video và số TK khỏe">(🤖 Tự co giãn tới ~${autoCap} luồng · ${alive} TK × ${perAcc})</span>`;
+        hintEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;" title="AIMD + Hill-Climbing tự co giãn theo RAM, CPU, tốc độ video/phút thật và tỷ lệ lỗi nghẽn Chrome (trần an toàn 1 trình duyệt Chrome: ${autoMax} luồng)">(🤖 Tự tối ưu tới ~${autoCap} luồng · 1 Chrome · ${alive} TK × ${perAcc})</span>`;
       }
       updateMachineThreadsHint(autoCap);
       return;
@@ -5250,15 +5250,16 @@
 
     const slotMax = Math.max(1, usableAccounts * jobsPerAcc);
     const machineMax = Math.max(1, cap?.max_threads || initSched?.machine_max_threads || 64);
+    const autoMax = Math.max(1, cap?.auto_max_threads || initSched?.auto_max_threads || Math.min(machineMax, 64));
     const maxWorkers = autoThreadsMode
-      ? Math.max(1, initSched?.recommended_workers || Math.min(machineMax, slotMax))
+      ? Math.max(1, initSched?.recommended_workers || Math.min(autoMax, slotMax))
       : Math.max(1, Math.min(requestedWorkers, initSched?.recommended_workers || slotMax));
     if (usableAccounts < aliveAccounts) {
       appendShopeeLog(`🔋 Bỏ qua ${aliveAccounts - usableAccounts} TK đã hết token (theo hạn mức đã kiểm tra) -> còn ${usableAccounts} TK dùng được.`);
     }
 
     if (autoThreadsMode) {
-      appendShopeeLog(`🤖 CHẾ ĐỘ TỰ ĐỘNG TỐI ƯU (AIMD): Khởi điểm ${maxWorkers} luồng (trần máy ~${machineMax} · kho TK ${usableAccounts}×${jobsPerAcc}=${slotMax} ô · chia TK: ${getShopeeDispatchMode()}). Hệ thống tự tăng/giảm mỗi 10s theo RAM, CPU & tốc độ ra video.`);
+      appendShopeeLog(`🤖 CHẾ ĐỘ TỰ ĐỘNG TỐI ƯU (AIMD): Khởi điểm êm ${maxWorkers} luồng (trần 1 Chrome ~${autoMax} · sức máy ~${machineMax} · kho TK ${usableAccounts}×${jobsPerAcc}=${slotMax} ô · chia TK: ${getShopeeDispatchMode()}). Tự đo tốc độ video/phút thật & độ trễ để tìm điểm đỉnh, không gây nghẽn Chrome.`);
     } else if (requestedWorkers > maxWorkers) {
       appendShopeeLog(`⚡ ĐIỀU PHỐI TỐC ĐỘ: Bạn chọn ${requestedWorkers} luồng, nhưng hiện có ${usableAccounts} tài khoản dùng được × ${jobsPerAcc} video/TK -> Hệ thống tự động giới hạn chạy ${maxWorkers} luồng song song.`);
     } else {
@@ -5498,11 +5499,14 @@
       if (!el || !d) return;
       const ramPct = Math.round(d.ram_used_pct || 0);
       const cpuPct = Math.round(d.cpu_pct || 0);
-      const color = (ramPct >= 88 || cpuPct >= 92) ? "#f59e0b" : "#38bdf8";
+      const congPct = Math.round((d.congestion_rate_5m || 0) * 100);
+      const color = (ramPct >= 88 || cpuPct >= 90 || congPct >= 25) ? "#f59e0b" : "#38bdf8";
       const tag = autoThreadsMode ? "🤖 AIMD" : "⚙️ Điều phối";
-      const warmTxt = typeof d.warm_accounts === "number" ? ` · Ấm ${d.warm_accounts}` : "";
+      const vpmTxt = d.goodput_vpm > 0 ? ` · ${Number(d.goodput_vpm).toFixed(1)} vid/p` : "";
+      const durTxt = d.avg_duration_s > 0 ? ` · ~${Math.round(d.avg_duration_s)}s/vid` : "";
+      const errTxt = congPct > 0 ? ` · nghẽn ${congPct}%` : "";
       const ffTxt = typeof d.ffmpeg_limit === "number" ? ` · FFmpeg ${d.ffmpeg_active || 0}/${d.ffmpeg_limit}` : "";
-      el.innerHTML = `<span style="color:${color};font-weight:700;" title="${_escHtml(d.reason || '')}">${tag}: ${allowedWorkers} luồng · CPU ${cpuPct}% · RAM ${ramPct}%${warmTxt}${ffTxt} · ${_escHtml(d.reason || '')}</span>`;
+      el.innerHTML = `<span style="color:${color};font-weight:700;" title="${_escHtml(d.reason || '')}">${tag}: ${allowedWorkers} luồng${vpmTxt}${durTxt}${errTxt} · CPU ${cpuPct}% · RAM ${ramPct}%${ffTxt} · ${_escHtml(d.reason || '')}</span>`;
     }
 
     async function ensureWorkersUpTo(targetCount) {
@@ -5513,8 +5517,8 @@
           spawnedWorkers += 1;
           workerPromises.push(workerLoop(spawnedWorkers));
           if (spawnedWorkers < targetCount) {
-            // Giãn cách khởi động 300ms giữa các luồng mới để êm CDP/Proxy
-            await new Promise(r => setTimeout(r, 300));
+            // Giãn cách khởi động 400ms giữa các luồng mới để êm CDP/Proxy
+            await new Promise(r => setTimeout(r, 400));
           }
         }
       } finally {
@@ -5532,9 +5536,10 @@
         if (target !== allowedWorkers) {
           const prev = allowedWorkers;
           allowedWorkers = target;
+          const congPct = Math.round((d.congestion_rate_5m || 0) * 100);
           appendShopeeLog(
             `⚙️ [AIMD] Luồng chạy: ${prev} → ${target} | ${d.reason || "Điều chỉnh"} ` +
-            `(TK: ${d.accounts_usable}, ô: ${d.slots}, ấm: ${d.warm_accounts || 0}, CPU: ${Math.round(d.cpu_pct || 0)}%, RAM: ${Math.round(d.ram_used_pct || 0)}%, FFmpeg: ${d.ffmpeg_active || 0}/${d.ffmpeg_limit || 0})`
+            `(${Number(d.goodput_vpm || 0).toFixed(1)} vid/p, ~${Math.round(d.avg_duration_s || 0)}s/vid, nghẽn ${congPct}%, TK: ${d.accounts_usable}, ấm: ${d.warm_accounts || 0}, CPU: ${Math.round(d.cpu_pct || 0)}%, RAM: ${Math.round(d.ram_used_pct || 0)}%, FFmpeg: ${d.ffmpeg_active || 0}/${d.ffmpeg_limit || 0})`
           );
         }
         renderLiveSchedulerHint(d);

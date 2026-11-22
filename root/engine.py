@@ -962,7 +962,9 @@ class MuseEngine:
         "  var img = el.querySelector('img') || (el.tagName === 'IMG' ? el : null);"
         "  var isVid = (tid || '').includes('video') || !!v;"
         "  var primary = isVid ? (v || img) : (img || v);"
-        "  var src = primary ? (primary.currentSrc || primary.src || '') : '';"
+        "  var vSrc = v ? (v.currentSrc || v.src || (v.querySelector('source') && v.querySelector('source').src) || '') : '';"
+        "  var iSrc = img ? (img.currentSrc || img.src || '') : '';"
+        "  var src = isVid ? (vSrc || iSrc) : (iSrc || vSrc);"
         "  if(src && !seen.has(src)){"
         "    seen.add(src);"
         "    list.push({"
@@ -970,8 +972,8 @@ class MuseEngine:
         "      hasVideo: !!v,"
         "      hasImg: !!img,"
         "      src: src,"
-        "      vSrc: v ? (v.currentSrc || v.src || '') : '',"
-        "      iSrc: img ? (img.currentSrc || img.src || '') : '',"
+        "      vSrc: vSrc,"
+        "      iSrc: iSrc,"
         "      w: primary ? (primary.videoWidth || primary.naturalWidth || 0) : 0,"
         "      h: primary ? (primary.videoHeight || primary.naturalHeight || 0) : 0"
         "    });"
@@ -979,7 +981,7 @@ class MuseEngine:
         "}"
         "document.querySelectorAll('[data-testid^=\"hatch-chat-attachment-presentation-\"]').forEach(function(a){ addEl(a, a.getAttribute('data-testid')); });"
         "document.querySelectorAll('div[class*=\"hatch-agent-bubble-bg\"] img, div[class*=\"hatch-agent-bubble-bg\"] video').forEach(function(m){"
-        "  var s = m.currentSrc || m.src || '';"
+        "  var s = m.currentSrc || m.src || (m.querySelector && m.querySelector('source') && m.querySelector('source').src) || '';"
         "  if(s && !s.includes('avatar') && !s.includes('emoji')) addEl(m.parentElement || m, 'agent-media');"
         "});"
         "return JSON.stringify(list);"
@@ -1108,7 +1110,7 @@ class MuseEngine:
         deadline = time.time() + timeout
         t_start = time.time()
         stable_src, stable_n = "", 0
-        last_txt, txt_stable = "", 0
+        last_txt, txt_stable_since = "", 0.0
         fallback_since = 0.0
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -1184,8 +1186,10 @@ class MuseEngine:
                         .map(function(g){return (g.innerText||'').trim();}).join('\\n');
                     var alertTxt = [].slice.call(document.querySelectorAll('[role="alert"],[data-sonner-toast]'))
                         .map(function(el){return (el.innerText||'').trim();}).join('\\n');
+                    var attNodes = [].slice.call(document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]'))
+                        .filter(function(a){return !a.closest('form, [class*=chat-user-bubble], [class*="group/msg"]');}).length;
                     var tail = (afterUserTxt + '\\n' + alertTxt).trim().slice(-700);
-                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail});
+                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail, att_nodes: attNodes});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
             except Exception:
@@ -1194,6 +1198,7 @@ class MuseEngine:
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
+            has_pending_att = (st.get("att_nodes") or 0) > base_att_cnt
             active_agent_txt = cur_txt if cur_cnt > base_agent_cnt else ""
             combined_txt = f"{active_agent_txt}\n{tail}".strip()
             if combined_txt and re.search(r"đã\s*hết\s*mức\s*sử\s*dụng|out\s*of\s*usage|out\s*of\s*credits|token\s*limit|0\s*tokens?\s*left", combined_txt, re.I):
@@ -1207,17 +1212,19 @@ class MuseEngine:
             # Sidebar/stale connection text does not prove this generation failed.
             # The caller's generation deadline remains the bounded timeout.
             # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件）
-            if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
-                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact|\bdone\b|is\s+ready|delivered|passed\s+QC|đã\s+xong|xong\s+rồi|hoàn\s+(?:tất|thiện)|đính\s+kèm\s+bên\s+dưới", cur_txt, re.I))
+            if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt and not has_pending_att:
+                is_media_report = _is_media_report_text(cur_txt)
+                now_ts = time.time()
                 if cur_txt == last_txt:
-                    txt_stable += 1
+                    if txt_stable_since == 0.0:
+                        txt_stable_since = now_ts
                 else:
-                    last_txt, txt_stable = cur_txt, 0
-                need_stable = 35 if is_media_report else 8
-                if txt_stable >= need_stable and elapsed > 6.0:
+                    last_txt, txt_stable_since = cur_txt, now_ts
+                need_stable_s = 45.0 if is_media_report else 12.0
+                if txt_stable_since > 0.0 and (now_ts - txt_stable_since) >= need_stable_s and elapsed > 8.0:
                     raise MuseGenerationError(f"Mô hình không sinh video, chỉ phản hồi văn bản: {cur_txt[:120]}")
             else:
-                txt_stable = 0
+                txt_stable_since = 0.0
         return None
 
     # ---------------- 取字节 ----------------
@@ -2125,6 +2132,11 @@ class MuseEngine:
             in_use = sum(1 for s in self._session_pool.values() if getattr(s, "in_use", False))
         return total, in_use
 
+    def creating_session_count(self) -> int:
+        """Số phiên trình duyệt đang đồng thời khởi tạo (mở trang mới)."""
+        with self._pool_lock:
+            return len(getattr(self, "_creating", None) or ())
+
     def get_pool_status(self) -> list[dict]:
         """Trả về thông tin chi tiết các session và thời gian TTL còn lại."""
         now = time.time()
@@ -2225,6 +2237,31 @@ _VM_IMAGE_PATH_ERR_RE = re.compile(
     r"reference\s*image\s*(?:path\s*)?(?:not\s*found|does\s*not\s*exist)",
     re.I,
 )
+
+# Nhận diện phản hồi văn bản kiểu "video đã tạo xong / đính kèm bên dưới" để chờ thẻ <video> kịp dựng trên Chrome
+# khi chạy nhiều luồng (tránh cắt nhầm video vừa render xong thành lỗi "chỉ phản hồi văn bản").
+_MEDIA_REPORT_RE = re.compile(
+    r"\.(?:webp|png|jpe?g|mp4|webm|mov)|imagine_media|deliverable|generated\s+.*(?:image|video)|"
+    r"verified\s+generated|artifact|\bdone\b|is\s+ready|delivered|passed\s+QC|"
+    r"created\s+(?:your|the)\s+video|video\s+(?:is\s+ready|has\s+been\s+(?:created|generated))|"
+    r"đã\s+(?:tạo\s+|làm\s+|xuất\s+|render\s+)?xong|tạo\s+xong\s+video|xong\s+rồi|"
+    r"hoàn\s+(?:tất|thiện|thành)|đã\s+sẵn\s+sàng|đính\s+kèm\s+bên\s+dưới|"
+    r"video\s+(?:\d+\s*(?:s|giây)|dọc|ngang|quảng\s+cáo|review|sản\s+phẩm|của\s+bạn)|"
+    r"已生成|已完成|视频已|已为您生成",
+    re.I,
+)
+_MEDIA_NEG_RE = re.compile(
+    r"không\s*(?:thể|làm|tạo|nhận\s*được)|từ\s*chối|vi\s*phạm|xin\s*lỗi|"
+    r"can'?t|cannot|unable\s+to|declined|against\s+(?:our|the)\s+polic|sorry|"
+    r"无法|不能|做不了|抱歉",
+    re.I,
+)
+
+
+def _is_media_report_text(txt: str) -> bool:
+    if not txt:
+        return False
+    return bool(_MEDIA_REPORT_RE.search(txt)) and not bool(_MEDIA_NEG_RE.search(txt))
 
 
 class MuseWorkerSession:
@@ -2718,6 +2755,18 @@ class MuseWorkerSession:
             pass
         log.warning("🔎 [Stuck Debug] TK %s (%s) state=%s screenshot=%s", self.account_id, reason, raw, shot or "n/a")
 
+    def _wait_poll_interval(self) -> float:
+        """Tự giãn nhịp kiểm tra DOM nhẹ khi có nhiều tab Chrome chạy song song để giảm nghẽn CDP/GIL."""
+        try:
+            _total, in_use = self.engine.active_session_counts()
+        except Exception:
+            return 0.6
+        if in_use > 45:
+            return 1.3
+        if in_use > 20:
+            return 0.95
+        return 0.6
+
     def _wait_attachment(self, baseline_src: str, timeout: int, expect: str,
                          on_progress=None, base_agent_cnt: int = 0,
                          base_att_cnt: int = 0, stop_event=None, baseline_sources=None) -> dict | None:
@@ -2725,17 +2774,18 @@ class MuseWorkerSession:
         deadline = time.time() + timeout
         t_start = time.time()
         stable_src, stable_n = "", 0
-        last_txt, txt_stable = "", 0
+        last_txt, txt_stable_since = "", 0.0
         fallback_since = 0.0
         undelivered_since = 0.0
         last_active_ts = time.time()
         last_seen_cnt = base_agent_cnt
         last_seen_txt = ""
+        last_seen_att_nodes = base_att_cnt
         resent_once = False
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("Máy khách đã ngắt kết nối, dừng tác vụ tạo")
-            time.sleep(0.6)
+            time.sleep(self._wait_poll_interval())
             self._scroll_bottom()
             atts = self.attachments()
             att = None
@@ -2809,6 +2859,8 @@ class MuseWorkerSession:
                         .map(function(g){return (g.innerText||'').trim();}).join('\\n');
                     var alertTxt = [].slice.call(document.querySelectorAll('[role="alert"],[data-sonner-toast]'))
                         .map(function(el){return (el.innerText||'').trim();}).join('\\n');
+                    var attNodes = [].slice.call(document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]'))
+                        .filter(function(a){return !a.closest('form, [class*=chat-user-bubble], [class*="group/msg"]');}).length;
                     var tail = (afterUserTxt + '\\n' + alertTxt).trim().slice(-700);
                     var undelivered = !!(lastUser && /Delivery not confirmed/i.test(lastUser.innerText||''));
                     var ta = document.querySelector('textarea');
@@ -2816,7 +2868,7 @@ class MuseWorkerSession:
                     return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail,
                                            out_of_usage: outOfUsage, undelivered: undelivered,
                                            new_thread: location.pathname === '/thread/new',
-                                           user_cnt: groups.length, ta_len: taLen});
+                                           user_cnt: groups.length, ta_len: taLen, att_nodes: attNodes});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
             except Exception:
@@ -2825,6 +2877,8 @@ class MuseWorkerSession:
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
+            cur_att_nodes = int(st.get("att_nodes") or 0)
+            has_pending_att = cur_att_nodes > base_att_cnt
 
             active_agent_txt = cur_txt if cur_cnt > base_agent_cnt else ""
             combined_txt = f"{active_agent_txt}\n{tail}".strip()
@@ -2837,10 +2891,11 @@ class MuseWorkerSession:
             if combined_txt and _VM_IMAGE_PATH_ERR_RE.search(combined_txt):
                 raise MuseGenerationError("Máy ảo Muse đọc sai đường dẫn ảnh tham chiếu — đổi sang tài khoản khác")
 
-            if has_stop or cur_cnt != last_seen_cnt or cur_txt != last_seen_txt or len(atts) > base_att_cnt:
+            if has_stop or cur_cnt != last_seen_cnt or cur_txt != last_seen_txt or len(atts) > base_att_cnt or cur_att_nodes > last_seen_att_nodes:
                 last_active_ts = time.time()
                 last_seen_cnt = cur_cnt
                 last_seen_txt = cur_txt
+                last_seen_att_nodes = max(last_seen_att_nodes, cur_att_nodes)
 
             # Prompt kẹt "Delivery not confirmed / Connecting...": VM của tài khoản chưa kết nối được nên tin nhắn
             # chưa hề tới Muse. Trước đây phải chờ mù hết timeout (10 phút); giờ quá ngưỡng thì báo lỗi để
@@ -2890,18 +2945,20 @@ class MuseWorkerSession:
                         f"Máy ảo Muse ngừng phản hồi quá {STUCK_INACTIVE_SECONDS}s trên thread "
                         f"(không còn nút Stop và chưa sinh video) — đổi sang tài khoản khác")
 
-            # Phát hiện sớm khi mô hình chỉ trả lời bằng văn bản (không có Stop button và không có video sinh ra)
-            if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
-                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact|\bdone\b|is\s+ready|delivered|passed\s+QC|đã\s+xong|xong\s+rồi|hoàn\s+(?:tất|thiện)|đính\s+kèm\s+bên\s+dưới", cur_txt, re.I))
+            # Phát hiện sớm khi mô hình chỉ trả lời bằng văn bản (không có Stop button và không có video/thẻ đính kèm sinh ra)
+            if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt and not has_pending_att:
+                is_media_report = _is_media_report_text(cur_txt)
+                now_ts = time.time()
                 if cur_txt == last_txt:
-                    txt_stable += 1
+                    if txt_stable_since == 0.0:
+                        txt_stable_since = now_ts
                 else:
-                    last_txt, txt_stable = cur_txt, 0
-                need_stable = 35 if is_media_report else 8
-                if txt_stable >= need_stable and elapsed > 6.0:
+                    last_txt, txt_stable_since = cur_txt, now_ts
+                need_stable_s = 45.0 if is_media_report else 12.0
+                if txt_stable_since > 0.0 and (now_ts - txt_stable_since) >= need_stable_s and elapsed > 8.0:
                     raise MuseGenerationError(f"Mô hình không sinh video, chỉ phản hồi văn bản: {cur_txt[:120]}")
             else:
-                txt_stable = 0
+                txt_stable_since = 0.0
         return None
 
     def extract_bytes(self, src: str, expect: str = "image", retries: int = 4):
