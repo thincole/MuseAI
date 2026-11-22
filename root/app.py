@@ -3497,9 +3497,9 @@ def _claim_shopee_jobs_pg(
     where_sql = " AND ".join(where_parts)
     ret_cols = ", ".join("p." + c.strip() for c in cols.split(","))
     if sort_by == "commission":
-        order_sql = "commission_rate DESC NULLS LAST, monthly_sold DESC NULLS LAST, sold DESC NULLS LAST"
+        order_sql = "commission_rate DESC, sold DESC"
     else:
-        order_sql = "monthly_sold DESC NULLS LAST, sold DESC NULLS LAST"
+        order_sql = "monthly_sold DESC NULLS LAST, sold DESC"
 
     conn = _shopee_db_connect(server_url)
     try:

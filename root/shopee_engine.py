@@ -1326,7 +1326,7 @@ def _build_video_prompts_16s_base(product_name: str, scene_choice: str = "🎲 R
 
 # ==================== DATABASE SERVER API CALLS ====================
 
-def call_seed_api(server_url: str, api_key: str, method: str, path: str, data: dict = None, timeout: int = 30):
+def call_seed_api(server_url: str, api_key: str, method: str, path: str, data: dict = None, timeout: int = 90):
     """Gọi API Server PostgreSQL trung tâm từ Novagate."""
     url = server_url.rstrip("/") + path
     headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
