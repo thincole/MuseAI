@@ -3955,7 +3955,7 @@
       } else {
         hintEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;" title="AIMD + Hill-Climbing + Multi-Chrome Pool (${shardsMax} Chrome × ~${tabsPer} tab/Chrome, tự mở thêm Chrome khi tải cao)">(🤖 Tự tối ưu tới ~${autoCap} luồng · ${shardsMax} Chrome × ${tabsPer} · ${alive} TK × ${perAcc})</span>`;
       }
-      updateMachineThreadsHint(autoCap);
+      if (!isShopeeBatchRunning) updateMachineThreadsHint(autoCap);
       return;
     }
 
@@ -3973,7 +3973,7 @@
     } else {
       hintEl.innerHTML = `<span style="color:#34d399;font-weight:600;">(🟢 ${userThreads} luồng / ${alive} TK sống × ${perAcc} video)</span>`;
     }
-    updateMachineThreadsHint(alive > 0 ? Math.min(userThreads, cap) : userThreads);
+    if (!isShopeeBatchRunning) updateMachineThreadsHint(alive > 0 ? Math.min(userThreads, cap) : userThreads);
   }
 
   // ---- Sức máy: mỗi luồng = 1 tab Chrome ~0,5 GB RAM -> cảnh báo khi chọn quá số luồng máy chịu được ----
@@ -4149,8 +4149,8 @@
 
   function updateShopeeSpeedLabel() {
     const now = Date.now();
-    // 10 phút gần nhất = 600.000 ms
-    const windowMs = 600000;
+    // Cửa sổ trượt 3 phút gần nhất (180.000 ms) để phản ánh đúng tốc độ tức thời, không bị kéo chậm bởi khoảng dừng cũ
+    const windowMs = 180000;
     shopeeCompletionTimes = shopeeCompletionTimes.filter(t => (now - t) <= windowMs);
     const speedEl = document.getElementById("shopeeSpeedText");
     if (!speedEl) return;
@@ -4159,11 +4159,11 @@
       return;
     }
 
-    // Thời gian trôi qua thực tế trong cửa sổ 10 phút (tối đa 10 phút, tối thiểu 0.2 phút)
+    // Thời gian trôi qua thực tế trong cửa sổ 3 phút (tối đa 3 phút, tối thiểu 0.2 phút)
     const elapsedSinceStartMin = Math.max((now - shopeeBatchStartTime) / 60000, 0.2);
-    const effectiveWindowMin = Math.min(elapsedSinceStartMin, 10.0);
+    const effectiveWindowMin = Math.min(elapsedSinceStartMin, 3.0);
 
-    // Trung bình số video tạo ra trong 1 phút của 10 phút gần nhất
+    // Trung bình số video tạo ra trong 1 phút của 3 phút gần nhất
     const rate = (shopeeCompletionTimes.length / effectiveWindowMin).toFixed(1);
     speedEl.innerText = `⚡ ${rate} video/phút`;
   }
@@ -4539,6 +4539,42 @@
     openMediaFolder();
   }
 
+  // --- Bộ hẹn giờ chạy bằng Web Worker (KHÔNG BAO GIỜ bị Edge WebView2 / Chrome đóng băng khi thu nhỏ hoặc che cửa sổ!) ---
+  const _bgTimerCallbacks = new Map();
+  let _bgTimerSeq = 1;
+  let _bgTimerWorker = null;
+  try {
+    const _wBlob = new Blob([
+      "const t=new Map();self.onmessage=function(e){const d=e.data||{};" +
+      "if(d.op==='set'){const id=d.id;t.set(id,setTimeout(()=>{t.delete(id);self.postMessage(id);},d.ms));}" +
+      "else if(d.op==='clear'){const h=t.get(d.id);if(h){clearTimeout(h);t.delete(d.id);}}};"
+    ], { type: "application/javascript" });
+    _bgTimerWorker = new Worker(URL.createObjectURL(_wBlob));
+    _bgTimerWorker.onmessage = (e) => {
+      const cb = _bgTimerCallbacks.get(e.data);
+      if (cb) {
+        _bgTimerCallbacks.delete(e.data);
+        try { cb(); } catch (_) {}
+      }
+    };
+  } catch (_) {
+    _bgTimerWorker = null;
+  }
+
+  function bgSleep(ms) {
+    if (!_bgTimerWorker) return new Promise(r => setTimeout(r, ms));
+    return new Promise((resolve) => {
+      const id = _bgTimerSeq++;
+      _bgTimerCallbacks.set(id, resolve);
+      try {
+        _bgTimerWorker.postMessage({ op: "set", id, ms: Math.max(0, ms | 0) });
+      } catch (_) {
+        _bgTimerCallbacks.delete(id);
+        setTimeout(resolve, ms);
+      }
+    });
+  }
+
   async function renderSingleVideoClip(promptText, refImageDataUrl, ar, durationSec, workerId, label) {
     const videoPayload = {
       prompt: promptText,
@@ -4570,7 +4606,7 @@
     let lastProgressLogSec = 0;
     while (Date.now() - startPoll < maxPollMs) {
       if (shopeeForceStopRequested) break;
-      await new Promise(r => setTimeout(r, 3000));
+      await bgSleep(3000);
       // Lỗi mạng khi hỏi trạng thái (WebView/máy chủ chập chờn vài giây) không có nghĩa là render hỏng:
       // task vẫn chạy trên máy chủ -> hỏi lại lần sau thay vì báo lỗi SP.
       let pData;
@@ -4633,51 +4669,47 @@
   }
 
   const _pendingSaveVideoJobs = new Map();
-  let _saveJobsPollTimer = null;
-  let _saveJobsPolling = false;
+  let _saveJobsPollRunning = false;
 
-  function _ensureSaveJobsPoller() {
-    if (_saveJobsPollTimer) return;
-    _saveJobsPollTimer = setInterval(async () => {
-      if (_saveJobsPolling) return;
-      if (_pendingSaveVideoJobs.size === 0) {
-        clearInterval(_saveJobsPollTimer);
-        _saveJobsPollTimer = null;
-        return;
-      }
-      _saveJobsPolling = true;
-      try {
-        const allIds = Array.from(_pendingSaveVideoJobs.keys());
-        for (let i = 0; i < allIds.length; i += 40) {
-          const chunk = allIds.slice(i, i + 40);
-          const res = await fetch(shopeeBgUrl(`/api/shopee/save-jobs-status?ids=${encodeURIComponent(chunk.join(","))}`), {
-            headers: getHeaders()
-          });
-          if (!res.ok) continue;
-          const data = await res.json();
-          const jobs = (data && data.jobs) || {};
-          for (const jid of chunk) {
-            const info = jobs[jid];
-            if (!info || info.status === "running") continue;
-            const entry = _pendingSaveVideoJobs.get(jid);
-            if (!entry) continue;
-            _pendingSaveVideoJobs.delete(jid);
-            if (info.status === "done") {
-              entry.resolve({ ok: true, status: 200, data: info.result || {} });
-            } else {
-              entry.resolve({
-                ok: false,
-                status: info.status_code || 500,
-                errorText: info.error || "Lỗi lưu/ghép video"
-              });
+  async function _ensureSaveJobsPoller() {
+    if (_saveJobsPollRunning) return;
+    _saveJobsPollRunning = true;
+    try {
+      while (_pendingSaveVideoJobs.size > 0) {
+        await bgSleep(450);
+        if (_pendingSaveVideoJobs.size === 0) break;
+        try {
+          const allIds = Array.from(_pendingSaveVideoJobs.keys());
+          for (let i = 0; i < allIds.length; i += 40) {
+            const chunk = allIds.slice(i, i + 40);
+            const res = await fetch(shopeeBgUrl(`/api/shopee/save-jobs-status?ids=${encodeURIComponent(chunk.join(","))}`), {
+              headers: getHeaders()
+            });
+            if (!res.ok) continue;
+            const data = await res.json();
+            const jobs = (data && data.jobs) || {};
+            for (const jid of chunk) {
+              const info = jobs[jid];
+              if (!info || info.status === "running") continue;
+              const entry = _pendingSaveVideoJobs.get(jid);
+              if (!entry) continue;
+              _pendingSaveVideoJobs.delete(jid);
+              if (info.status === "done") {
+                entry.resolve({ ok: true, status: 200, data: info.result || {} });
+              } else {
+                entry.resolve({
+                  ok: false,
+                  status: info.status_code || 500,
+                  errorText: info.error || "Lỗi lưu/ghép video"
+                });
+              }
             }
           }
-        }
-      } catch (_) {
-      } finally {
-        _saveJobsPolling = false;
+        } catch (_) {}
       }
-    }, 450);
+    } finally {
+      _saveJobsPollRunning = false;
+    }
   }
 
   async function saveRenderedVideoAsync(payload) {
@@ -5526,7 +5558,7 @@
           workerPromises.push(workerLoop(spawnedWorkers));
           if (spawnedWorkers < targetCount) {
             // Giãn cách khởi động 400ms giữa các luồng mới để êm CDP/Proxy
-            await new Promise(r => setTimeout(r, 400));
+            await bgSleep(400);
           }
         }
       } finally {
@@ -5568,7 +5600,7 @@
       while (!shopeeStopRequested && !shopeeForceStopRequested) {
         if (workerId > allowedWorkers && nextIndex < shopeeClaimedProducts.length) {
           // luồng dư (AIMD giảm tải hoặc ít TK tốt): tạm nghỉ, không nhận SP mới
-          await new Promise(r => setTimeout(r, 3000));
+          await bgSleep(3000);
           continue;
         }
         if (nextIndex >= shopeeClaimedProducts.length) {

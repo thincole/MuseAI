@@ -4007,7 +4007,7 @@ class SmartThreadController:
 
     DOWN_INTERVAL_S = 15.0
     BACKOFF_COOLDOWN_S = 60.0
-    UP_INTERVAL_S = 25.0
+    UP_INTERVAL_S = 18.0
     SLOW_IN_FLIGHT_S = 150.0
 
     def __init__(self):
@@ -4153,8 +4153,11 @@ class SmartThreadController:
                 best_workers = self._best_workers
             else:
                 if reset or self._current <= 0:
+                    shards_max = max(1, int(sys_cap.get("chrome_shards_max") or 1))
+                    # Khởi điểm tương xứng số Chrome Shard (1 Chrome <=40, 2 Chrome <=56, 3 Chrome <=64, 4 Chrome <=72)
+                    start_cap = max(AUTO_START_MAX, min(72, shards_max * 22)) if shards_max > 1 else AUTO_START_MAX
                     warm = int(round(hard_cap * 0.65))
-                    self._current = max(floor, min(hard_cap, AUTO_START_MAX, warm))
+                    self._current = max(floor, min(hard_cap, start_cap, warm))
                     self._reason = "Khởi động êm (AIMD)"
                 elif (now - self._last_adjust_ts) >= self.DOWN_INTERVAL_S:
                     self._last_adjust_ts = now
@@ -4182,23 +4185,23 @@ class SmartThreadController:
                         self._current = max(floor, int(min(self._current, hard_cap) * 0.80))
                         self._reason = f"Giảm tải CPU ({cpu_pct:.0f}%)"
                     elif can_rate_backoff and timeout_rate >= 0.25:
-                        self._current = max(floor, int(min(self._current, hard_cap) * 0.82))
+                        self._current = max(floor, int(min(self._current, hard_cap) * 0.85))
                         self._soft_cap = self._current
-                        self._soft_cap_until = now + 180.0
+                        self._soft_cap_until = now + 90.0
                         self._last_backoff_ts = now
                         self._eval_since_wall = now_wall
                         self._reason = f"Giảm do timeout cao ({timeout_rate*100:.0f}%)"
-                    elif can_rate_backoff and congestion_denom >= 10 and congestion_rate >= 0.30:
-                        self._current = max(floor, int(min(self._current, hard_cap) * 0.82))
+                    elif can_rate_backoff and congestion_denom >= 10 and congestion_rate >= 0.32:
+                        self._current = max(floor, int(min(self._current, hard_cap) * 0.85))
                         self._soft_cap = self._current
-                        self._soft_cap_until = now + 180.0
+                        self._soft_cap_until = now + 90.0
                         self._last_backoff_ts = now
                         self._eval_since_wall = now_wall
                         self._reason = f"Giảm do nghẽn Chrome/lỗi ({congestion_rate*100:.0f}%)"
                     elif can_rate_backoff and slow_ratio >= 0.45:
                         self._current = max(floor, int(min(self._current, hard_cap) * 0.85))
                         self._soft_cap = self._current
-                        self._soft_cap_until = now + 150.0
+                        self._soft_cap_until = now + 90.0
                         self._last_backoff_ts = now
                         self._reason = f"Giảm do render chậm ({slow_in_flight}/{in_flight} tab >{int(self.SLOW_IN_FLIGHT_S)}s)"
                     elif (
@@ -4211,33 +4214,33 @@ class SmartThreadController:
                     ):
                         self._current = max(floor, self._best_workers)
                         self._soft_cap = self._current
-                        self._soft_cap_until = now + 240.0
+                        self._soft_cap_until = now + 150.0
                         self._last_backoff_ts = now
                         self._reason = f"Lùi về điểm đỉnh {self._current} luồng ({goodput_vpm:.1f} < đỉnh {self._best_vpm:.1f} vid/p)"
                     elif self._current > hard_cap:
                         # Không ghi đè làm tụt vĩnh viễn self._current nếu chỉ tạm thiếu TK; chỉ báo lý do giới hạn tạm
                         self._reason = self._slot_limit_reason(snap, slots, self._current)
                     elif (now - self._last_up_ts) >= self.UP_INTERVAL_S and self._current < effective_cap:
-                        waiting_feedback = self._current >= 36 and ok_5m < 5
+                        waiting_feedback = self._current >= 36 and ok_5m < 3 and run_elapsed < 120.0
                         if waiting_feedback:
-                            self._reason = f"Chờ video đầu hoàn tất để đo tốc độ ({ok_5m}/5)"
-                        elif creating_cnt > 4:
+                            self._reason = f"Chờ video đầu hoàn tất để đo tốc độ ({ok_5m}/3)"
+                        elif creating_cnt > 6:
                             self._reason = f"Giữ nhịp khi đang mở {creating_cnt} tab mới"
-                        elif avg_duration_s > 135.0 and ok_5m >= 5:
+                        elif avg_duration_s > 145.0 and ok_5m >= 5:
                             self._reason = f"Giữ nhịp vì thời gian render cao (~{avg_duration_s:.0f}s/vid)"
                         elif (
-                            ram_used_pct < 78.0
-                            and ram_avail_gb >= 5.0
-                            and cpu_pct < 78.0
-                            and timeout_rate < 0.12
-                            and congestion_rate < 0.15
-                            and slow_ratio < 0.25
+                            ram_used_pct < 84.0
+                            and ram_avail_gb >= 4.0
+                            and cpu_pct < 84.0
+                            and timeout_rate < 0.15
+                            and congestion_rate < 0.22
+                            and slow_ratio < 0.30
                         ):
                             gap = effective_cap - self._current
-                            step = 2 if gap >= 4 else 1
+                            step = 4 if gap >= 12 else (2 if gap >= 4 else 1)
                             self._current = min(effective_cap, self._current + step)
                             self._last_up_ts = now
-                            self._reason = f"Tăng êm +{step} (AIMD)"
+                            self._reason = f"Tăng tốc +{step} (AIMD)"
                         else:
                             self._reason = "Giữ ổn định (chờ tải dịu)"
                     else:

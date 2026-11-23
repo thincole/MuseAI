@@ -145,10 +145,12 @@ def account_sort_key(
         lat = Store._LATENCY_EWMA.get(aid, 75.0)
         speed_bonus = 60.0 / max(20.0, min(lat, 240.0))
         is_warm = bool(warm_ids and aid in warm_ids)
-        warm_bonus = 1.6 if (is_warm and busy_slots == 0) else (0.5 if is_warm else 0.0)
+        # Ưu tiên tái sử dụng phiên Chrome ấm (khỏi mất 10-15s mở trang lạnh) hơn điểm công bằng,
+        # nhưng nếu TK ấm tụt tỷ lệ thành công (<50%) thì điểm eff_rate giảm mạnh sẽ tự nhường TK mới.
+        warm_bonus = 2.6 if (is_warm and busy_slots == 0) else (0.6 if is_warm else 0.0)
         lu = acc.get("last_used") or 0.0
         idle_min = max(0.0, (t - lu) / 60.0) if lu else 120.0
-        fairness_bonus = min(2.4, idle_min / 25.0)
+        fairness_bonus = min(1.5, idle_min / 40.0)
         tok = parse_token_count((acc.get("quota") or {}).get("extra_left"))
         token_bonus = 0.4 if (tok is not None and tok >= 200e6) else (-0.25 if (tok is not None and tok < 50e6) else 0.0)
         slot_penalty = 0.9 * busy_slots

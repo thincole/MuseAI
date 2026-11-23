@@ -273,6 +273,20 @@ def main():
     else:
         print(f"[+] Máy chủ đã sẵn sàng từ trước: {server_url}")
 
+    # Chống Edge WebView2 tự đóng băng/bóp nhịp JS setTimeout khi người dùng thu nhỏ hoặc che cửa sổ app
+    # (nếu không tắt, 70 luồng JS poll /v1/videos sẽ ngủ đông nhiều phút cho tới khi bấm mở lại cửa sổ!)
+    _wv2_flags = (
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-ipc-flooding-protection",
+        "--disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion",
+    )
+    _cur_wv2 = os.environ.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "").strip()
+    _missing = [f for f in _wv2_flags if f not in _cur_wv2]
+    if _missing:
+        os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (_cur_wv2 + " " + " ".join(_missing)).strip()
+
     # Khởi tạo giao diện Desktop
     api = DesktopAPI()
     window = webview.create_window(
