@@ -3947,11 +3947,13 @@
 
     if (autoMode) {
       const autoMax = machineCapacity?.auto_max_threads || Math.min(machineCapacity?.max_threads || 64, 64);
+      const shardsMax = machineCapacity?.chrome_shards_max || 1;
+      const tabsPer = machineCapacity?.tabs_per_chrome || 40;
       const autoCap = alive > 0 ? Math.min(cap, autoMax) : autoMax;
       if (alive <= 0) {
         hintEl.innerHTML = `<span style="color:#ef4444;font-weight:700;">(🔴 0 TK sống - Cần nạp Cookie)</span>`;
       } else {
-        hintEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;" title="AIMD + Hill-Climbing tự co giãn theo RAM, CPU, tốc độ video/phút thật và tỷ lệ lỗi nghẽn Chrome (trần an toàn 1 trình duyệt Chrome: ${autoMax} luồng)">(🤖 Tự tối ưu tới ~${autoCap} luồng · 1 Chrome · ${alive} TK × ${perAcc})</span>`;
+        hintEl.innerHTML = `<span style="color:#38bdf8;font-weight:700;" title="AIMD + Hill-Climbing + Multi-Chrome Pool (${shardsMax} Chrome × ~${tabsPer} tab/Chrome, tự mở thêm Chrome khi tải cao)">(🤖 Tự tối ưu tới ~${autoCap} luồng · ${shardsMax} Chrome × ${tabsPer} · ${alive} TK × ${perAcc})</span>`;
       }
       updateMachineThreadsHint(autoCap);
       return;
@@ -4550,7 +4552,7 @@
       videoPayload.reference_image = refImageDataUrl;
     }
     appendShopeeLog(`> [Luồng ${workerId}] Gửi yêu cầu render (${label || 'Clip'}, ${durationSec}s) tới Muse.ai...`);
-    const vRes = await fetch("/v1/videos", {
+    const vRes = await fetch(shopeeBgUrl("/v1/videos"), {
       method: "POST",
       headers: getHeaders(),
       body: JSON.stringify(videoPayload)
@@ -4573,7 +4575,7 @@
       // task vẫn chạy trên máy chủ -> hỏi lại lần sau thay vì báo lỗi SP.
       let pData;
       try {
-        const pollRes = await fetch(`/v1/videos/${taskId}`, { headers: getHeaders() });
+        const pollRes = await fetch(shopeeBgUrl(`/v1/videos/${taskId}`), { headers: getHeaders() });
         if (!pollRes.ok) continue;
         pData = await pollRes.json();
       } catch (_) {
@@ -5251,6 +5253,8 @@
     const slotMax = Math.max(1, usableAccounts * jobsPerAcc);
     const machineMax = Math.max(1, cap?.max_threads || initSched?.machine_max_threads || 64);
     const autoMax = Math.max(1, cap?.auto_max_threads || initSched?.auto_max_threads || Math.min(machineMax, 64));
+    const shardsMax = cap?.chrome_shards_max || initSched?.chrome_shards_max || 1;
+    const tabsPer = cap?.tabs_per_chrome || initSched?.chrome_shards?.tabs_per_chrome || 40;
     const maxWorkers = autoThreadsMode
       ? Math.max(1, initSched?.recommended_workers || Math.min(autoMax, slotMax))
       : Math.max(1, Math.min(requestedWorkers, initSched?.recommended_workers || slotMax));
@@ -5259,7 +5263,7 @@
     }
 
     if (autoThreadsMode) {
-      appendShopeeLog(`🤖 CHẾ ĐỘ TỰ ĐỘNG TỐI ƯU (AIMD): Khởi điểm êm ${maxWorkers} luồng (trần 1 Chrome ~${autoMax} · sức máy ~${machineMax} · kho TK ${usableAccounts}×${jobsPerAcc}=${slotMax} ô · chia TK: ${getShopeeDispatchMode()}). Tự đo tốc độ video/phút thật & độ trễ để tìm điểm đỉnh, không gây nghẽn Chrome.`);
+      appendShopeeLog(`🤖 CHẾ ĐỘ TỰ ĐỘNG TỐI ƯU (AIMD): Khởi điểm êm ${maxWorkers} luồng (Multi-Chrome ${shardsMax}×${tabsPer} · trần ~${autoMax} · kho TK ${usableAccounts}×${jobsPerAcc}=${slotMax} ô · chia TK: ${getShopeeDispatchMode()}). Tự tách Chrome khi tải cao & dò điểm đỉnh video/phút.`);
     } else if (requestedWorkers > maxWorkers) {
       appendShopeeLog(`⚡ ĐIỀU PHỐI TỐC ĐỘ: Bạn chọn ${requestedWorkers} luồng -> hiện chạy ${maxWorkers} luồng song song${initSched?.reason ? ` (${initSched.reason})` : ` (${usableAccounts} TK dùng được × ${jobsPerAcc} video/TK)`}.`);
     } else {
@@ -5508,8 +5512,9 @@
       const vpmTxt = d.goodput_vpm > 0 ? ` · ${Number(d.goodput_vpm).toFixed(1)} vid/p` : "";
       const durTxt = d.avg_duration_s > 0 ? ` · ~${Math.round(d.avg_duration_s)}s/vid` : "";
       const errTxt = congPct > 0 ? ` · nghẽn ${congPct}%` : "";
+      const chTxt = (d.chrome_shards_max || 1) > 1 ? ` · Chrome ${d.chrome_shards_running || 1}/${d.chrome_shards_max}` : "";
       const ffTxt = typeof d.ffmpeg_limit === "number" ? ` · FFmpeg ${d.ffmpeg_active || 0}/${d.ffmpeg_limit}` : "";
-      el.innerHTML = `<span style="color:${color};font-weight:700;" title="${_escHtml(d.reason || '')}">${tag}: ${targetTxt}${reasonTxt}${vpmTxt}${durTxt}${errTxt} · CPU ${cpuPct}% · RAM ${ramPct}%${ffTxt}</span>`;
+      el.innerHTML = `<span style="color:${color};font-weight:700;" title="${_escHtml(d.reason || '')}">${tag}: ${targetTxt}${reasonTxt}${vpmTxt}${durTxt}${errTxt}${chTxt} · CPU ${cpuPct}% · RAM ${ramPct}%${ffTxt}</span>`;
     }
 
     async function ensureWorkersUpTo(targetCount) {

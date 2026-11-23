@@ -379,16 +379,267 @@ BROWSER_MANAGES_VM = os.environ.get("MUSE2API_BROWSER_MANAGES_VM", "1").strip() 
 _BROWSER_SKIP_COOKIES = ("hatch_gw",)
 
 
+def _detect_total_ram_gb() -> float:
+    """Đọc tổng RAM máy (GB) để tự quyết định số tiến trình Chrome tối đa trong Multi-Chrome Pool."""
+    try:
+        import psutil
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = _MemStatus()
+            st.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return st.ullTotalPhys / (1024 ** 3)
+        except Exception:
+            pass
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024 ** 3)
+    except Exception:
+        return 16.0
+
+
+def _auto_chrome_instances(tabs_per_chrome: int = 40) -> int:
+    """Tính số tiến trình Chrome tối ưu theo cấu hình máy (mỗi Chrome gánh ~40 tab, lazy-start khi tải vượt ngưỡng)."""
+    total_gb = _detect_total_ram_gb()
+    cpu = os.cpu_count() or 4
+    reserve = max(6.0, total_gb * 0.1)
+    hw_max = max(1, min(int((total_gb - reserve) / 0.5), cpu * 2))
+    # Giới hạn cứng theo RAM vật lý để máy RAM nhỏ không bao giờ sinh thêm Chrome thừa
+    if total_gb < 24.0:
+        ram_shard_cap = 1
+    elif total_gb < 48.0:
+        ram_shard_cap = 2
+    elif total_gb < 96.0:
+        ram_shard_cap = 3
+    else:
+        ram_shard_cap = 4
+    needed = max(1, (hw_max + max(12, tabs_per_chrome) - 1) // max(12, tabs_per_chrome))
+    return max(1, min(4, ram_shard_cap, needed))
+
+
+def _find_free_cdp_port(preferred: int) -> int:
+    """Ưu tiên cổng preferred; nếu cổng bị ứng dụng khác chiếm thì lấy cổng trống kế tiếp."""
+    import socket
+    for p in range(preferred, preferred + 40):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class _ChromeShard:
+    """Một tiến trình Chrome CDP độc lập trong Multi-Chrome Pool (profile riêng, cổng CDP riêng, khóa riêng)."""
+
+    def __init__(self, index: int, cdp_port: int, profile_dir: str):
+        self.index = index
+        self.cdp_port = cdp_port
+        self.profile_dir = profile_dir
+        self.proc: subprocess.Popen | None = None
+        self.browser: CDP | None = None
+        self.lock = threading.Lock()
+        self.start_lock = threading.Lock()
+        self.active_contexts = 0
+        self.last_active_at = time.time()
+        self._log = None
+
+    def debug_url(self) -> str:
+        return f"http://127.0.0.1:{self.cdp_port}/json/version"
+
+    def is_running(self) -> bool:
+        return bool(self.browser is not None and (self.proc is None or self.proc.poll() is None))
+
+    def start(self, cfg, allow_orphan_kill: bool = False, kill_fn=None):
+        with self.start_lock:
+            if self.is_running():
+                return
+            # Đóng kết nối cũ nếu tiến trình trước vừa chết
+            if self.browser is not None:
+                try:
+                    self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
+                self.active_contexts = 0
+
+            # Thử tái sử dụng CDP đang khỏe sẵn trên đúng cổng của shard này
+            if not self.proc:
+                try:
+                    v = http_json(self.debug_url(), timeout=1)
+                    if v and "webSocketDebuggerUrl" in v:
+                        self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+                        self.last_active_at = time.time()
+                        return
+                except Exception:
+                    pass
+                if allow_orphan_kill and callable(kill_fn):
+                    kill_fn()
+                elif self.index > 0:
+                    # Shard phụ: nếu cổng mặc định bị tiến trình khác giữ thì chuyển sang cổng trống
+                    self.cdp_port = _find_free_cdp_port(self.cdp_port)
+
+            os.makedirs(self.profile_dir, exist_ok=True)
+            for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                lp = os.path.join(self.profile_dir, lock_name)
+                if os.path.exists(lp) or os.path.islink(lp):
+                    try:
+                        os.unlink(lp)
+                    except Exception:
+                        pass
+
+            env = dict(os.environ)
+            env.setdefault("HOME", cfg.home_dir)
+            env["PATH"] = (cfg.extra_path + os.pathsep + env.get("PATH", "")) if cfg.extra_path else env.get("PATH", "")
+            args = [
+                cfg.chromium,
+                "--headless=new", "--no-sandbox", "--disable-gpu",
+                "--disable-dev-shm-usage", "--disable-background-networking",
+                "--no-first-run", "--no-default-browser-check",
+                "--disable-extensions",
+                "--disable-component-extensions-with-background-pages",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--autoplay-policy=no-user-gesture-required",
+                "--mute-audio",
+                "--disable-smooth-scrolling",
+                "--window-size=1440,900",
+                f"--remote-debugging-port={self.cdp_port}",
+                f"--remote-allow-origins=http://127.0.0.1:{self.cdp_port},"
+                f"http://localhost:{self.cdp_port}",
+                f"--user-data-dir={self.profile_dir}",
+                "--disable-blink-features=AutomationControlled",
+                "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--force-webrtc-ip-handling-policy",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--lang=en-US,en",
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "about:blank",
+            ]
+
+            os.makedirs(cfg.data_dir, exist_ok=True)
+            log_name = "chromium.log" if self.index == 0 else f"chromium_shard{self.index}.log"
+            try:
+                if self._log:
+                    self._log.close()
+            except Exception:
+                pass
+            self._log = open(os.path.join(cfg.data_dir, log_name), "ab", buffering=0)
+            cwd_dir = cfg.home_dir if (cfg.home_dir and os.path.isdir(cfg.home_dir)) else None
+            popen_kw = {}
+            if os.name == "nt":
+                popen_kw["creationflags"] = (getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+                                             | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+            self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
+                                         env=env, cwd=cwd_dir, **popen_kw)
+            last = None
+            for _ in range(90):
+                try:
+                    v = http_json(self.debug_url(), timeout=2)
+                    self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+                    self.active_contexts = 0
+                    self.last_active_at = time.time()
+                    log.info("🚀 [Multi-Chrome] Đã khởi động Chrome Shard #%d trên CDP :%d (profile: %s)",
+                             self.index, self.cdp_port, os.path.basename(self.profile_dir))
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    time.sleep(0.5 if self.index > 0 else 1.0)
+            raise MuseGenerationError(f"Chromium Shard #{self.index} khởi động thất bại: {last}")
+
+    def create_context_and_target(self, bc_params: dict) -> tuple[str, str]:
+        with self.lock:
+            if not self.browser:
+                raise CDPError(f"Chrome Shard #{self.index} chưa kết nối CDP")
+            res_bc = self.browser.send("Target.createBrowserContext", bc_params)
+            bc_id = res_bc["result"]["browserContextId"]
+            try:
+                res_tgt = self.browser.send("Target.createTarget", {"url": "about:blank", "browserContextId": bc_id})
+                target_id = res_tgt["result"]["targetId"]
+            except Exception:
+                try:
+                    self.browser.send("Target.disposeBrowserContext", {"browserContextId": bc_id})
+                except Exception:
+                    pass
+                raise
+            self.active_contexts += 1
+            self.last_active_at = time.time()
+            return bc_id, target_id
+
+    def dispose_context(self, bc_id: str) -> None:
+        with self.lock:
+            self.active_contexts = max(0, self.active_contexts - 1)
+            self.last_active_at = time.time()
+            if self.browser and bc_id:
+                try:
+                    self.browser.send("Target.disposeBrowserContext", {"browserContextId": bc_id})
+                except Exception:
+                    pass
+
+    def stop(self) -> None:
+        import sys
+        with self.start_lock:
+            if self.browser is not None:
+                try:
+                    self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
+            if self.proc is not None:
+                pid = self.proc.pid
+                try:
+                    if sys.platform == "win32":
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                       capture_output=True, timeout=5)
+                    else:
+                        self.proc.terminate()
+                        self.proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+                self.proc = None
+            if self._log is not None:
+                try:
+                    self._log.close()
+                except Exception:
+                    pass
+                self._log = None
+            self.active_contexts = 0
+
+
 class MuseEngine:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.tabs_per_chrome = max(12, min(60, int(getattr(cfg, "tabs_per_chrome", 40) or 40)))
+        cfg_shards = int(getattr(cfg, "chrome_instances", 0) or 0)
+        self.max_chrome_instances = (
+            max(1, min(6, cfg_shards)) if cfg_shards > 0 else _auto_chrome_instances(self.tabs_per_chrome)
+        )
+        self._shards_lock = threading.Lock()
+        primary = _ChromeShard(0, int(cfg.cdp_port), cfg.profile_dir)
+        self._shards: list[_ChromeShard] = [primary]
         self.proc: subprocess.Popen | None = None
         self.browser: CDP | None = None
         self.page: CDP | None = None
         self.current_acc_id: str | None = None
         self._last_http_renew: dict[str, float] = {}
         self._log = None
-        self._browser_lock = threading.Lock()
+        # Giữ tương thích ngược với caller/test cũ: _browser_lock trỏ vào khóa của Shard #0
+        self._browser_lock = primary.lock
         # Khóa: mã TK (ô 0) hoặc "mãTK#i" (ô i) khi 1 TK chạy nhiều video cùng lúc — xem _slot_keys
         self._session_pool: dict[str, "MuseWorkerSession"] = {}
         self.max_jobs_per_account = 1
@@ -400,85 +651,86 @@ class MuseEngine:
         self.browser_idle_timeout_seconds = max(30, int(getattr(cfg, "browser_idle_timeout_seconds", 300)))
         os.makedirs(cfg.profile_dir, exist_ok=True)
 
-    # ---------------- 浏览器生命周期 ----------------
+    # ---------------- 浏览器生命周期 (Multi-Chrome Pool) ----------------
     def _debug_url(self):
-        return f"http://127.0.0.1:{self.cfg.cdp_port}/json/version"
+        return self._shards[0].debug_url()
+
+    def _sync_primary_refs(self):
+        s0 = self._shards[0]
+        self.proc = s0.proc
+        self.browser = s0.browser
+        self._log = s0._log
 
     def start(self):
-        if self.proc and self.proc.poll() is None and self.browser:
+        s0 = self._shards[0]
+        if s0.is_running():
+            self._sync_primary_refs()
             return
-        env = dict(os.environ)
-        env.setdefault("HOME", self.cfg.home_dir)
-        env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
-        args = [
-            self.cfg.chromium,
-            "--headless=new", "--no-sandbox", "--disable-gpu",
-            "--disable-dev-shm-usage", "--disable-background-networking",
-            "--no-first-run", "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-component-extensions-with-background-pages",
-            "--disable-default-apps",
-            "--disable-sync",
-            "--autoplay-policy=no-user-gesture-required",
-            "--mute-audio",
-            "--disable-smooth-scrolling",
-            "--window-size=1440,900",
-            f"--remote-debugging-port={self.cfg.cdp_port}",
-            # 仅允许本机 DevTools 客户端（cdp.py 会显式发送匹配的 Origin），
-            # 不再用 "*"：否则任意网页都可借浏览器连上 CDP。
-            f"--remote-allow-origins=http://127.0.0.1:{self.cfg.cdp_port},"
-            f"http://localhost:{self.cfg.cdp_port}",
-            f"--user-data-dir={self.cfg.profile_dir}",
-            "--disable-blink-features=AutomationControlled",
-            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-            "--force-webrtc-ip-handling-policy",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--lang=en-US,en",
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "about:blank",
-        ]
-        # 尝试复用已有健康 CDP
-        if not self.proc:
-            try:
-                v = http_json(self._debug_url(), timeout=1)
-                if v and "webSocketDebuggerUrl" in v:
-                    self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
-                    return
-            except Exception:
-                pass
-            # Quét và dọn dẹp chrome mồ côi nếu không thể kết nối tới CDP cũ
-            self.kill_orphaned_chromes()
+        # Chỉ dọn Chrome mồ côi khi chưa có shard nào khác đang chạy
+        any_other_running = any(s.is_running() for s in self._shards[1:])
+        s0.start(self.cfg, allow_orphan_kill=not any_other_running, kill_fn=self.kill_orphaned_chromes)
+        self._sync_primary_refs()
 
-        # 清理残留锁
-        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-            lp = os.path.join(self.cfg.profile_dir, lock_name)
-            if os.path.exists(lp) or os.path.islink(lp):
-                try:
-                    os.unlink(lp)
-                except Exception:
-                    pass
+    def _acquire_shard_for_new_session(self) -> _ChromeShard:
+        """Chọn tiến trình Chrome ít tải nhất; tự mở thêm Chrome Shard mới (lazy-start) khi các Chrome hiện tại
+        đã đạt ~80% sức chứa (~32 tab/Chrome) để tránh nghẽn IPC/CPU trên 1 Chrome duy nhất."""
+        self.start()
+        scale_at = max(10, int(self.tabs_per_chrome * 0.80))
+        shard_to_start: _ChromeShard | None = None
+        with self._shards_lock:
+            running = [s for s in self._shards if s.is_running()]
+            best = min(running, key=lambda s: (s.active_contexts, s.index)) if running else self._shards[0]
+            if best.active_contexts >= scale_at and len(self._shards) < self.max_chrome_instances:
+                # Ưu tiên khởi động lại shard đã khai báo nhưng đang dừng trước, rồi mới tạo shard mới
+                stopped = next((s for s in self._shards if not s.is_running()), None)
+                if stopped is not None:
+                    shard_to_start = stopped
+                else:
+                    idx = len(self._shards)
+                    port = int(self.cfg.cdp_port) + idx
+                    prof = os.path.join(self.cfg.profile_root, f"generate_shard{idx}")
+                    shard_to_start = _ChromeShard(idx, port, prof)
+                    self._shards.append(shard_to_start)
+            elif best.active_contexts >= scale_at:
+                stopped = next((s for s in self._shards if not s.is_running()), None)
+                if stopped is not None:
+                    shard_to_start = stopped
 
-        os.makedirs(self.cfg.data_dir, exist_ok=True)
-        self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
-        cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
-        popen_kw = {}
-        if os.name == "nt":
-            # Ưu tiên thấp: Windows nhường CPU cho chuột/bàn phím/giao diện trước, máy không bị đơ khi render
-            # nhiều luồng. Các tiến trình con của Chrome (renderer, GPU, utility) kế thừa mức ưu tiên này.
-            popen_kw["creationflags"] = (getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
-                                         | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
-        self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
-                                     env=env, cwd=cwd_dir, **popen_kw)
-        last = None
-        for _ in range(90):
+        if shard_to_start is not None:
             try:
-                v = http_json(self._debug_url(), timeout=2)
-                self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
-                return
+                shard_to_start.start(self.cfg, allow_orphan_kill=False)
+                if shard_to_start.index == 0:
+                    self._sync_primary_refs()
             except Exception as exc:  # noqa: BLE001
-                last = exc
-                time.sleep(1)
-        raise MuseGenerationError(f"Chromium khởi động thất bại: {last}")
+                log.warning("⚠️ [Multi-Chrome] Không mở thêm được Chrome Shard #%d (%s) -> dùng tạm shard hiện có",
+                            shard_to_start.index, exc)
+
+        with self._shards_lock:
+            running = [s for s in self._shards if s.is_running()]
+            if not running:
+                running = [self._shards[0]]
+            return min(running, key=lambda s: (s.active_contexts, s.index))
+
+    def shard_stats(self) -> dict:
+        """Thống kê toàn bộ các tiến trình Chrome trong Multi-Chrome Pool."""
+        with self._shards_lock:
+            items = [
+                {
+                    "index": s.index,
+                    "port": s.cdp_port,
+                    "running": s.is_running(),
+                    "contexts": s.active_contexts,
+                }
+                for s in self._shards
+            ]
+        running_n = sum(1 for x in items if x["running"])
+        return {
+            "max_shards": self.max_chrome_instances,
+            "running_shards": running_n,
+            "tabs_per_chrome": self.tabs_per_chrome,
+            "total_capacity": self.max_chrome_instances * self.tabs_per_chrome,
+            "shards": items,
+        }
 
     def kill_orphaned_chromes(self):
         """Quét và tiêu diệt triệt để tất cả tiến trình Chrome mồ côi (zombie) thuộc về MuseAI để không chiếm RAM."""
@@ -496,31 +748,24 @@ class MuseEngine:
                 log.warning("Dọn dẹp chrome mồ côi thất bại: %s", e)
 
     def stop(self):
-        """Dừng toàn bộ phiên làm việc và đóng sạch sẽ toàn bộ cây tiến trình Chromium."""
-        import sys
+        """Dừng toàn bộ phiên làm việc và đóng sạch sẽ toàn bộ cây tiến trình Chromium của mọi Shard."""
         self.close_all_sessions()
-        for c in (self.page, self.browser):
-            if c:
-                try:
-                    c.close()
-                except Exception:
-                    pass
-        self.page = self.browser = None
-        if self.proc:
-            pid = self.proc.pid
+        if self.page:
             try:
-                if sys.platform == "win32":
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                                   capture_output=True, timeout=5)
-                else:
-                    self.proc.terminate()
-                    self.proc.wait(timeout=5)
+                self.page.close()
             except Exception:
-                try:
-                    self.proc.kill()
-                except Exception:
-                    pass
-            self.proc = None
+                pass
+            self.page = None
+        with self._shards_lock:
+            shards = list(self._shards)
+        for s in shards:
+            try:
+                s.stop()
+            except Exception:
+                pass
+        self.browser = None
+        self.proc = None
+        self._log = None
         # Dọn dẹp dứt điểm các tiến trình con còn sót lại
         self.kill_orphaned_chromes()
 
@@ -1794,28 +2039,40 @@ class MuseEngine:
                 if not cookies.get("hatch_vml"):
                     raise MuseAuthError("Thiếu cookie máy ảo (hatch_vml) và không lấy được phiên từ /api/session — cần lấy lại cookie mới") from e
 
-        with self._browser_lock:
-            bc_params = {}
-            if forwarder_port:
-                bc_params = {
-                    "proxyServer": f"http://127.0.0.1:{forwarder_port}",
-                    "proxyBypassList": "localhost;127.0.0.1"
-                }
-            res_bc = self.browser.send('Target.createBrowserContext', bc_params)
-            bc_id = res_bc['result']['browserContextId']
-            res_tgt = self.browser.send('Target.createTarget', {'url': 'about:blank', 'browserContextId': bc_id})
-            target_id = res_tgt['result']['targetId']
-            log.info("🛡️ [Worker/Session] Đã tạo Browser Context #%s cho TK %s (Proxy: %s, Forwarder: %s, TTL: %ds, Max Tasks: %d)",
-                     bc_id, account_id, proxy_str or "Direct", forwarder_port or "None", ttl_seconds, max_tasks)
+        shard = self._acquire_shard_for_new_session()
+        bc_params = {}
+        if forwarder_port:
+            bc_params = {
+                "proxyServer": f"http://127.0.0.1:{forwarder_port}",
+                "proxyBypassList": "localhost;127.0.0.1"
+            }
+        try:
+            bc_id, target_id = shard.create_context_and_target(bc_params)
+        except Exception as cdp_exc:
+            # Nếu 1 tiến trình Chrome Shard bị rớt kết nối CDP, tự khởi động lại đúng shard đó 1 lần
+            log.warning("♻️ [Multi-Chrome] Chrome Shard #%d mất kết nối CDP (%s) -> khởi động lại shard",
+                        shard.index, cdp_exc)
+            shard.stop()
+            shard.start(self.cfg, allow_orphan_kill=False)
+            if shard.index == 0:
+                self._sync_primary_refs()
+            bc_id, target_id = shard.create_context_and_target(bc_params)
 
-        ws_url = f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}"
-        page = CDP(ws_url, timeout=180)
-        # Chỉ bật Page (cần cho script chống phát hiện). KHÔNG bật Network/Runtime: code không dùng sự kiện của chúng,
-        # mà trang Muse đẩy về liên tục (khung websocket, request...) -> mỗi lệnh CDP phải giải mã cả đống sự kiện
-        # tồn đọng, làm app ngốn CPU khi chạy nhiều luồng. Cookie / evaluate / screenshot không cần các domain này.
-        page.send("Page.enable")
-        page.send("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
-        page.send("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.cfg.download_dir})
+        log.info("🛡️ [Worker/Session] Đã tạo Browser Context #%s trên Chrome #%d (:%d) cho TK %s (Proxy: %s, Forwarder: %s, TTL: %ds, Max Tasks: %d)",
+                 bc_id, shard.index, shard.cdp_port, account_id, proxy_str or "Direct", forwarder_port or "None", ttl_seconds, max_tasks)
+
+        ws_url = f"ws://127.0.0.1:{shard.cdp_port}/devtools/page/{target_id}"
+        try:
+            page = CDP(ws_url, timeout=180)
+            # Chỉ bật Page (cần cho script chống phát hiện). KHÔNG bật Network/Runtime: code không dùng sự kiện của chúng,
+            # mà trang Muse đẩy về liên tục (khung websocket, request...) -> mỗi lệnh CDP phải giải mã cả đống sự kiện
+            # tồn đọng, làm app ngốn CPU khi chạy nhiều luồng. Cookie / evaluate / screenshot không cần các domain này.
+            page.send("Page.enable")
+            page.send("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
+            page.send("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.cfg.download_dir})
+        except Exception:
+            shard.dispose_context(bc_id)
+            raise
 
         if BROWSER_MANAGES_VM:
             browser_cookies = {k: v for k, v in cookies.items() if k not in _BROWSER_SKIP_COOKIES}
@@ -1875,17 +2132,16 @@ class MuseEngine:
         if not ready:
             try:
                 page.close()
-                with self._browser_lock:
-                    self.browser.send('Target.disposeBrowserContext', {'browserContextId': bc_id})
             except Exception:
                 pass
+            shard.dispose_context(bc_id)
             if early_err is not None:
                 raise early_err
             raise MuseVMUnavailableError("Khởi tạo trang muse.ai cho worker thất bại hoặc timeout")
 
         sess = MuseWorkerSession(self, bc_id, target_id, page, account_id,
                                  proxy_str=proxy_str, forwarder_port=forwarder_port,
-                                 ttl_seconds=ttl_seconds, max_tasks=max_tasks)
+                                 ttl_seconds=ttl_seconds, max_tasks=max_tasks, shard=shard)
         sess.open_seconds = round(max(0.0, time.time() - t_start_nav), 2)
         return sess
 
@@ -2135,6 +2391,21 @@ class MuseEngine:
                 threading.Thread(target=_close_batch, args=(evicted,), daemon=True, name="pool-evict").start()
             else:
                 _close_batch(evicted)
+
+        # Tự tắt các Chrome Shard phụ (#1, #2...) nếu rảnh trắng quá 10 phút để trả lại RAM nền cho hệ thống
+        idle_shards: list[_ChromeShard] = []
+        with self._pool_lock:
+            referenced_shards = {getattr(s, "shard", None) for s in self._session_pool.values()}
+        with self._shards_lock:
+            for sh in self._shards[1:]:
+                if sh.is_running() and sh.active_contexts <= 0 and sh not in referenced_shards and (now - sh.last_active_at) >= 600.0:
+                    idle_shards.append(sh)
+        for sh in idle_shards:
+            try:
+                log.info("🧹 [Multi-Chrome] Tắt Chrome Shard #%d (rảnh quá 10 phút) để giải phóng RAM", sh.index)
+                sh.stop()
+            except Exception:  # noqa: BLE001
+                pass
         return len(evicted)
 
     def close_session_for_account(self, account_id: str):
@@ -2336,9 +2607,10 @@ class MuseWorkerSession:
     hỗ trợ quản lý vòng đời TTL (Time-To-Live) và số lượng task tối đa để tránh bị phát hiện."""
     def __init__(self, engine: MuseEngine, bc_id: str, target_id: str, page: CDP,
                  account_id: str | None, proxy_str: str | None = None, forwarder_port: int | None = None,
-                 ttl_seconds: int = 1800, max_tasks: int = 5):
+                 ttl_seconds: int = 1800, max_tasks: int = 5, shard: _ChromeShard | None = None):
         self.engine = engine
         self.cfg = engine.cfg
+        self.shard = shard
         self.bc_id = bc_id
         self.target_id = target_id
         self.page = page
@@ -2442,7 +2714,7 @@ class MuseWorkerSession:
             pass
 
     def close(self):
-        """Đóng trang và hủy hoàn toàn Browser Context để giải phóng bộ nhớ RAM triệt để."""
+        """Đóng trang và hủy hoàn toàn Browser Context trên đúng Chrome Shard để giải phóng RAM triệt để."""
         if self.is_closed:
             return
         self.is_closed = True
@@ -2450,9 +2722,13 @@ class MuseWorkerSession:
             self.page.close()
         except Exception:
             pass
+        shard = getattr(self, "shard", None)
         try:
-            with self.engine._browser_lock:
-                self.engine.browser.send('Target.disposeBrowserContext', {'browserContextId': self.bc_id})
+            if shard is not None:
+                shard.dispose_context(self.bc_id)
+            else:
+                with self.engine._browser_lock:
+                    self.engine.browser.send('Target.disposeBrowserContext', {'browserContextId': self.bc_id})
         except Exception:
             pass
 
@@ -2823,14 +3099,18 @@ class MuseWorkerSession:
         log.warning("🔎 [Stuck Debug] TK %s (%s) state=%s screenshot=%s", self.account_id, reason, raw, shot or "n/a")
 
     def _wait_poll_interval(self) -> float:
-        """Tự giãn nhịp kiểm tra DOM nhẹ khi có nhiều tab Chrome chạy song song để giảm nghẽn CDP/GIL."""
-        try:
-            _total, in_use = self.engine.active_session_counts()
-        except Exception:
-            return 0.6
-        if in_use > 45:
+        """Tự giãn nhịp kiểm tra DOM nhẹ theo tải của CHÍNH Chrome Shard chứa tab này để giảm nghẽn CDP/GIL."""
+        shard = getattr(self, "shard", None)
+        if shard is not None:
+            load = int(getattr(shard, "active_contexts", 0) or 0)
+        else:
+            try:
+                _total, load = self.engine.active_session_counts()
+            except Exception:
+                return 0.6
+        if load > 45:
             return 1.3
-        if in_use > 20:
+        if load > 20:
             return 0.95
         return 0.6
 

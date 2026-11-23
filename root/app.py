@@ -3990,8 +3990,11 @@ def _sample_cpu_pct() -> float:
         return round(_CPU_EWMA_PCT, 1)
 
 
-# Trần an toàn cho 1 tiến trình Chrome CDP (dù máy có 128 GB RAM / 72 CPU, 1 Chrome nghẽn mạng/IPC quá ~60-64 tab)
-CHROME_MAX_THREADS = max(8, int(os.environ.get("MUSE2API_CHROME_MAX_THREADS", "64") or 64))
+# Trần luồng Chrome CDP: nếu không ép cứng qua MUSE2API_CHROME_MAX_THREADS thì tự nhân theo Multi-Chrome Pool (số Chrome × tabs/Chrome)
+_ENV_CHROME_MAX = int(os.environ.get("MUSE2API_CHROME_MAX_THREADS", "0") or 0)
+CHROME_MAX_THREADS = max(8, _ENV_CHROME_MAX) if _ENV_CHROME_MAX > 0 else max(
+    40, int(getattr(engine, "max_chrome_instances", 1)) * int(getattr(engine, "tabs_per_chrome", 40))
+)
 AUTO_START_MAX = max(8, int(os.environ.get("MUSE2API_AUTO_START_MAX", "40") or 40))
 
 
@@ -4253,6 +4256,9 @@ class SmartThreadController:
                 best_vpm = round(self._best_vpm, 2)
                 best_workers = self._best_workers
 
+        shard_info = engine.shard_stats() if hasattr(engine, "shard_stats") else {
+            "max_shards": 1, "running_shards": 1, "tabs_per_chrome": 40, "total_capacity": chrome_cap, "shards": []
+        }
         snap.update({
             "threads_hint": rec if auto_mode else snap.get("slots", 0),
             "recommended_workers": rec,
@@ -4265,8 +4271,12 @@ class SmartThreadController:
             "machine_max_threads": machine_max,
             "chrome_max_threads": chrome_cap,
             "auto_max_threads": min(machine_max, chrome_cap),
+            "chrome_shards": shard_info,
+            "chrome_shards_running": shard_info.get("running_shards", 1),
+            "chrome_shards_max": shard_info.get("max_shards", 1),
             "active_sessions": pool_total,
             "sessions_in_use": pool_in_use,
+            "idle_sessions": max(0, pool_total - pool_in_use),
             "creating_sessions": creating_cnt,
             "ffmpeg_active": ff_st["active"],
             "ffmpeg_limit": ff_st["limit"],
@@ -5374,6 +5384,9 @@ def system_capacity():
     ram_cap = max(1, int((total_gb - reserve) / RAM_PER_THREAD_GB))
     cpu_cap = max(1, cpu * THREADS_PER_CPU)
     hw_max = min(ram_cap, cpu_cap)
+    max_shards = max(1, int(getattr(engine, "max_chrome_instances", 1) or 1))
+    tabs_per = max(12, int(getattr(engine, "tabs_per_chrome", 40) or 40))
+    chrome_cap = max(8, _ENV_CHROME_MAX) if _ENV_CHROME_MAX > 0 else (max_shards * tabs_per)
     return {
         "ram_total_gb": round(total_gb, 1),
         "ram_available_gb": round(avail_gb, 1),
@@ -5383,8 +5396,10 @@ def system_capacity():
         "ram_cap": ram_cap,
         "cpu_cap": cpu_cap,
         "max_threads": hw_max,
-        "chrome_max_threads": CHROME_MAX_THREADS,
-        "auto_max_threads": min(hw_max, CHROME_MAX_THREADS),
+        "chrome_shards_max": max_shards,
+        "tabs_per_chrome": tabs_per,
+        "chrome_max_threads": chrome_cap,
+        "auto_max_threads": min(hw_max, chrome_cap),
         "limited_by": "RAM" if ram_cap <= cpu_cap else "CPU",
         "ram_per_thread_gb": RAM_PER_THREAD_GB,
     }
@@ -5400,6 +5415,7 @@ def get_browser_ttl():
         "anti_detect": getattr(CFG, "anti_detect", True),
         "active_sessions": engine.get_pool_status(),
         "total_active_sessions": len(engine._session_pool),
+        "chrome_shards": engine.shard_stats() if hasattr(engine, "shard_stats") else None,
     }
 
 
@@ -6355,9 +6371,11 @@ async def _startup():
     try:
         import anyio.to_thread
         anyio.to_thread.current_default_thread_limiter().total_tokens = max(
-            200, anyio.to_thread.current_default_thread_limiter().total_tokens)
+            300, anyio.to_thread.current_default_thread_limiter().total_tokens)
     except Exception as exc:
         log.warning("Không nới được threadpool anyio: %s", exc)
+    log.info("🌐 Multi-Chrome Pool: tối đa %d tiến trình Chrome × ~%d tab/Chrome (trần %d tab, tự mở thêm khi tải tăng)",
+             engine.max_chrome_instances, engine.tabs_per_chrome, engine.max_chrome_instances * engine.tabs_per_chrome)
     sp_init = _get_shopee_settings()
     n_jobs = _apply_jobs_per_account(sp_init.get("jobs_per_account", 1))
     disp_mode = _apply_dispatch_mode(sp_init.get("account_dispatch_mode", "even"))

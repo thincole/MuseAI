@@ -139,6 +139,9 @@ class Config:
     browser_max_idle_sessions: int = field(default_factory=lambda: int(_env("MUSE2API_MAX_IDLE_SESSIONS", "16")))
     browser_idle_timeout_seconds: int = field(default_factory=lambda: int(_env("MUSE2API_IDLE_SESSION_TTL", "300")))
     browser_process_ttl_seconds: int = field(default_factory=lambda: int(_env("MUSE2API_PROCESS_TTL", "7200")))
+    # Multi-Chrome Pool: 0 = tự động chọn số tiến trình Chrome theo RAM/CPU (tối đa 4 Chrome, mỗi Chrome ~40 tab)
+    chrome_instances: int = field(default_factory=lambda: int(_env("MUSE2API_CHROME_INSTANCES", "0")))
+    tabs_per_chrome: int = field(default_factory=lambda: int(_env("MUSE2API_TABS_PER_CHROME", "40")))
     anti_detect: bool = field(default_factory=lambda: _env("MUSE2API_ANTI_DETECT", "1").strip() != "0")
 
     @property
