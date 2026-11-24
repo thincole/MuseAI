@@ -1460,15 +1460,18 @@ class MuseEngine:
             # The caller's generation deadline remains the bounded timeout.
             # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件）
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt and not has_pending_att:
-                is_media_report = _is_media_report_text(cur_txt)
+                is_outage = is_service_outage_text(cur_txt)
+                is_media_report = (not is_outage) and _is_media_report_text(cur_txt)
                 now_ts = time.time()
                 if cur_txt == last_txt:
                     if txt_stable_since == 0.0:
                         txt_stable_since = now_ts
                 else:
                     last_txt, txt_stable_since = cur_txt, now_ts
-                need_stable_s = 45.0 if is_media_report else 12.0
+                need_stable_s = 6.0 if is_outage else (45.0 if is_media_report else 12.0)
                 if txt_stable_since > 0.0 and (now_ts - txt_stable_since) >= need_stable_s and elapsed > 8.0:
+                    if is_outage:
+                        raise MuseGenerationError(f"Dịch vụ tạo video Muse.ai đang lỗi/quá tải tạm thời: {cur_txt[:120]}")
                     raise MuseGenerationError(f"Mô hình không sinh video, chỉ phản hồi văn bản: {cur_txt[:120]}")
             else:
                 txt_stable_since = 0.0
@@ -2576,6 +2579,28 @@ _VM_IMAGE_PATH_ERR_RE = re.compile(
     re.I,
 )
 
+# Nhận diện lỗi dịch vụ tạo video tạm thời từ chính máy chủ Muse.ai (502/503/504, quá tải, không khả dụng...)
+# -> KHÔNG do tài khoản cũng KHÔNG do sản phẩm: không phạt TK nghỉ 30p-4h, không trừ điểm TK, trả SP về pending.
+_SERVICE_OUTAGE_RE = re.compile(
+    r"(?:dịch\s*vụ|hệ\s*thống|công\s*cụ|máy\s*chủ|bên|phía)\s*(?:(?:tạo|làm|sinh)\s*)?video[^\n]{0,60}"
+    r"(?:đang\s*lỗi|gặp\s*lỗi|báo\s*lỗi|lỗi\s*phía|quá\s*tải|không\s*khả\s*dụng|tạm\s*thời|ngừng|sự\s*cố|50[0234])|"
+    r"(?:lỗi\s*hệ\s*thống|lỗi\s*máy\s*chủ|lỗi\s*tạm\s*thời|lỗi\s*phía\s*(?:máy\s*chủ|dịch\s*vụ|hệ\s*thống)|"
+    r"đang\s*quá\s*tải|tạm\s*thời\s*không\s*khả\s*dụng|"
+    r"(?:báo\s*)?lỗi\s*50[0234]|báo\s*50[0234]|HTTP\s*50[0234]|\(50[0234]\)|"
+    r"502\s*Bad\s*Gateway|503\s*Service\s*Unavailable|504\s*Gateway\s*Timeout|"
+    r"Runway\s*vẫn\s*chưa\s*kết\s*nối)|"
+    r"video\s*(?:service|generation|backend|server|tool)[^\n]{0,50}"
+    r"(?:returned\s*an\s*error|error|unavailable|overloaded|down|failed|50[0234]|temporarily)|"
+    r"(?:service|server)\s*(?:is\s*)?(?:currently\s*|temporarily\s*)?(?:unavailable|overloaded|experiencing\s*(?:issues|errors))|"
+    r"视频(?:服务|生成服务|系统)[^\n]{0,25}(?:故障|不可用|过载|繁忙|错误|50[0234])|"
+    r"chưa\s*tạo\s*được\s*video\s*lúc\s*này|video\s*chưa\s*tạo\s*được(?:\s*lúc\s*này|\s*lần\s*này|,?\s*hệ\s*thống|,?\s*dịch\s*vụ)",
+    re.I,
+)
+
+
+def is_service_outage_text(txt: str) -> bool:
+    return bool(txt and _SERVICE_OUTAGE_RE.search(txt))
+
 # Nhận diện phản hồi văn bản kiểu "video đã tạo xong / đính kèm bên dưới" để chờ thẻ <video> kịp dựng trên Chrome
 # khi chạy nhiều luồng (tránh cắt nhầm video vừa render xong thành lỗi "chỉ phản hồi văn bản").
 _MEDIA_REPORT_RE = re.compile(
@@ -3294,15 +3319,18 @@ class MuseWorkerSession:
 
             # Phát hiện sớm khi mô hình chỉ trả lời bằng văn bản (không có Stop button và không có video/thẻ đính kèm sinh ra)
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt and not has_pending_att:
-                is_media_report = _is_media_report_text(cur_txt)
+                is_outage = is_service_outage_text(cur_txt)
+                is_media_report = (not is_outage) and _is_media_report_text(cur_txt)
                 now_ts = time.time()
                 if cur_txt == last_txt:
                     if txt_stable_since == 0.0:
                         txt_stable_since = now_ts
                 else:
                     last_txt, txt_stable_since = cur_txt, now_ts
-                need_stable_s = 45.0 if is_media_report else 12.0
+                need_stable_s = 6.0 if is_outage else (45.0 if is_media_report else 12.0)
                 if txt_stable_since > 0.0 and (now_ts - txt_stable_since) >= need_stable_s and elapsed > 8.0:
+                    if is_outage:
+                        raise MuseGenerationError(f"Dịch vụ tạo video Muse.ai đang lỗi/quá tải tạm thời: {cur_txt[:120]}")
                     raise MuseGenerationError(f"Mô hình không sinh video, chỉ phản hồi văn bản: {cur_txt[:120]}")
             else:
                 txt_stable_since = 0.0

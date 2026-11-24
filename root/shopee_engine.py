@@ -1549,6 +1549,11 @@ ACCOUNT_FAULT_MARKERS = (
     "Muse is disconnected", "Muse đã ngắt kết nối", "Phiên TK hết hạn", "Something went wrong",
     "ProxyError", "Không có tài khoản nào khả dụng", "tất cả tài khoản đang bận", "Đã hết thời gian chờ tác vụ",
     "Lỗi xác thực tài khoản", "MuseAuthError", "hết hạn ngạch", "额度不足",
+    # Lỗi dịch vụ tạm thời từ chính máy chủ Muse.ai (502/quá tải/không khả dụng) -> trả SP về pending, KHÔNG đánh failed
+    "Dịch vụ tạo video Muse.ai đang lỗi", "dịch vụ tạo video đang lỗi",
+    "hệ thống tạo video đang", "hệ thống làm video đang lỗi", "hệ thống video đang lỗi", "hệ thống video báo lỗi",
+    "công cụ tạo video đang không khả dụng", "bên tạo video đang không khả dụng",
+    "lỗi hệ thống video", "lỗi hệ thống 502", "video service returned an error", "temporarily unavailable",
 )
 MAX_REQUEUE = 3                      # 1 SP bị trả về hàng chờ tối đa chừng này lần, quá thì đánh `failed`
 REQUEUE_FILE = os.path.join(CFG.data_dir, "requeue_counts.json")

@@ -1002,8 +1002,21 @@ def _active_gen_stats(slow_threshold_s: float = 150.0) -> tuple[int, int, float]
     return len(ages), slow, round(sum(ages) / len(ages), 1)
 
 
+def _is_muse_service_outage(err_str: str) -> bool:
+    s = err_str or ""
+    if "Dịch vụ tạo video Muse.ai đang lỗi" in s:
+        return True
+    try:
+        from engine import is_service_outage_text
+        return is_service_outage_text(s)
+    except Exception:
+        return False
+
+
 def _classify_fail(err_str: str, refusal: bool = False) -> str:
     s = err_str or ""
+    if _is_muse_service_outage(s):
+        return "Dịch vụ Muse lỗi/quá tải"
     if refusal or _REFUSAL_RE.search(s):
         return "Muse từ chối nội dung"
     if "chỉ phản hồi văn bản" in s:
@@ -1308,13 +1321,21 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 is_vm_path = "Máy ảo Muse đọc sai đường dẫn ảnh" in err_str
                 is_init_fail = "Khởi tạo trang muse.ai" in err_str or "no-file-input" in err_str
                 is_text_only = "chỉ phản hồi văn bản" in err_str
-                refusal_stop = is_text_only and bool(_REFUSAL_RE.search(err_str))
+                is_service_outage = _is_muse_service_outage(err_str)
+                if is_service_outage and "Dịch vụ tạo video Muse.ai đang lỗi" not in err_str:
+                    err_str = f"Dịch vụ tạo video Muse.ai đang lỗi/quá tải tạm thời: {err_str[:140]}"
+                    last_exc = MuseGenerationError(err_str)
+                refusal_stop = (not is_service_outage) and is_text_only and bool(_REFUSAL_RE.search(err_str))
                 fast_skip = disconnected or is_quota or is_region or is_vm_path or is_init_fail
-                log.warning("✗ [Video Gen] Lỗi tạo video với TK %s: %s", cur_acc["id"], exc)
+                if is_service_outage:
+                    log.warning("⚠️ [Muse 5xx/Quá tải] Dịch vụ tạo video Muse.ai đang lỗi tạm thời (không do TK %s): %s",
+                                cur_acc["id"], err_str[:160])
+                else:
+                    log.warning("✗ [Video Gen] Lỗi tạo video với TK %s: %s", cur_acc["id"], exc)
                 _record_gen_event(False, _classify_fail(err_str, refusal_stop))
-                if not fast_skip and not refusal_stop:
+                if not fast_skip and not refusal_stop and not is_service_outage:
                     store.record_outcome(cur_acc["id"], False)
-                if is_text_only and not refusal_stop:
+                if is_text_only and not refusal_stop and not is_service_outage:
                     # TK trả lời bằng chữ (không rõ lý do) 3 lần liên tiếp: thường là TK đang bị Muse hạn chế ngầm -> nghỉ 30 phút
                     n_txt = _TEXT_ONLY_STREAK.get(cur_acc["id"], 0) + 1
                     _TEXT_ONLY_STREAK[cur_acc["id"]] = n_txt
@@ -1454,10 +1475,16 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                                 STUCK_COOLDOWN_SECONDS // 60)
                 if session:
                     try:
-                        engine.release_session(session, error=True)
+                        # Lỗi 502/quá tải từ dịch vụ Muse: giữ nguyên phiên ấm để hồi tốc độ ngay khi Muse hết lỗi
+                        engine.release_session(session, error=not is_service_outage)
                     except Exception:
                         pass
                     session = None
+                if is_service_outage and attempt == 0:
+                    # Nghỉ nhẹ 4s trước khi thử lại để không dồn request quá dày lúc Muse đang 502
+                    rem_s = (deadline - time.monotonic()) if deadline is not None else 10.0
+                    if rem_s > 6.0:
+                        time.sleep(4.0)
             except Exception as exc:
                 log.exception("✗ [Video Gen] Ngoại lệ không xác định khi tạo video với TK %s: %s", cur_acc["id"], exc)
                 last_exc = MuseGenerationError(f"Tạo video thất bại: {exc}")
