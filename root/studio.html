@@ -2026,13 +2026,23 @@
     
     <div style="padding:20px;display:flex;flex-direction:column;gap:16px;max-height:70vh;overflow-y:auto;">
       <div style="font-size:12.5px;color:var(--text-muted);line-height:1.5;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);padding:10px 14px;border-radius:8px;">
-        Hệ thống sẽ tự động quét và <b>bỏ qua (không render)</b> các sản phẩm có tên chứa từ khóa cấm hoặc Item ID nằm trong Blacklist, giúp tiết kiệm tối đa lượt tạo video và phòng tránh bị khóa tài khoản Muse.ai do vi phạm chính sách an toàn.
+        Hệ thống sẽ tự động quét và <b>bỏ qua (không render, tự đánh dấu failed trên DB)</b> các sản phẩm chứa từ khóa cấm, thương hiệu/bản quyền hoặc Item ID nằm trong Blacklist — áp dụng cho cả <b>Nhận SP</b> lẫn <b>Tự nhận thêm SP</b>.
       </div>
 
-      <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;">
+      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;">
         <label class="shopee-chk" style="font-weight:600;color:#f1f5f9;">
           <input type="checkbox" id="bl_enabled" checked>
           <span>Bật tính năng lọc Blacklist</span>
+        </label>
+
+        <label class="shopee-chk" style="font-weight:600;color:#38bdf8;" title="Áp dụng 10 nhóm luật Listing Violations chuẩn Shopee PH (24949), MY (614) và ID (19582): Vũ khí, 18+, Vape/Rượu, Ma túy, Thuốc Rx/Y tế, Hóa chất/Trừ sâu, Giấy tờ CP, Dịch vụ cấm/Doxing, Hàng số/TV Box/Cờ bạc, Link ngoài sàn">
+          <input type="checkbox" id="bl_filter_shopee_policy" checked>
+          <span>Tự lọc Luật Shopee PH / MY / ID (10 nhóm vi phạm)</span>
+        </label>
+
+        <label class="shopee-chk" style="font-weight:600;color:#f1f5f9;">
+          <input type="checkbox" id="bl_filter_brand" checked>
+          <span>Tự lọc thương hiệu / bản quyền (Vi Phạm CS)</span>
         </label>
 
         <label class="shopee-chk" style="font-weight:600;color:#f1f5f9;">
@@ -2041,18 +2051,29 @@
         </label>
       </div>
 
+      <div id="bl_policy_summary" style="font-size:11.5px;color:#94a3b8;line-height:1.5;background:rgba(56,189,248,0.06);border:1px solid rgba(56,189,248,0.2);padding:8px 12px;border-radius:8px;">
+        📋 <b>Luật Shopee tích hợp (PH 24949 · MY 614 · ID 19582):</b> Vũ khí/tự vệ · 18+/kích dục · Thuốc lá/vape/rượu · Ma túy · Thuốc Rx/y tế xâm lấn/FDA · Hóa chất/thuốc trừ sâu cấm · Đồng phục/giấy tờ CP · Dịch vụ cấm/doxing/tâm linh · Hàng số/TV Box/phá sóng/cờ bạc/động vật sống · Hàng nhái/link kéo ngoài sàn/checkout ảo.
+      </div>
+
       <div>
         <label style="font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:6px;display:block;">
-          Từ khóa cấm (Mỗi từ hoặc cụm từ một dòng, không phân biệt hoa thường):
+          Từ khóa nhạy cảm / cấm (Mỗi từ hoặc cụm từ một dòng, khớp theo từ nguyên vẹn):
         </label>
-        <textarea id="bl_keywords" rows="6" style="width:100%;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:8px;color:#fff;padding:8px 12px;font-family:monospace;font-size:12px;line-height:1.5;resize:vertical;" placeholder="vape&#10;pod&#10;sex&#10;18+&#10;thuốc lá&#10;cờ bạc&#10;vũ khí"></textarea>
+        <textarea id="bl_keywords" rows="5" style="width:100%;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:8px;color:#fff;padding:8px 12px;font-family:monospace;font-size:12px;line-height:1.5;resize:vertical;" placeholder="vape&#10;pod&#10;sex&#10;18+&#10;thuốc lá&#10;cờ bạc&#10;vũ khí"></textarea>
+      </div>
+
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#fbbf24;margin-bottom:6px;display:block;">
+          Từ khóa thương hiệu / bản quyền (Tự lọc khi Nhận SP, Tự nhận thêm SP &amp; nút Xóa Vi Phạm CS):
+        </label>
+        <textarea id="bl_brand_keywords" rows="5" style="width:100%;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:8px;color:#fff;padding:8px 12px;font-family:monospace;font-size:12px;line-height:1.5;resize:vertical;" placeholder="disney&#10;marvel&#10;nike&#10;adidas&#10;hello kitty&#10;pokemon"></textarea>
       </div>
 
       <div>
         <label style="font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:6px;display:block;">
           Danh sách Item ID cấm (Mỗi Item ID một dòng):
         </label>
-        <textarea id="bl_item_ids" rows="5" style="width:100%;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:8px;color:#fff;padding:8px 12px;font-family:monospace;font-size:12px;line-height:1.5;resize:vertical;" placeholder="24381029381&#10;19203918293"></textarea>
+        <textarea id="bl_item_ids" rows="4" style="width:100%;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:8px;color:#fff;padding:8px 12px;font-family:monospace;font-size:12px;line-height:1.5;resize:vertical;" placeholder="24381029381&#10;19203918293"></textarea>
       </div>
     </div>
 
@@ -4458,13 +4479,40 @@
     }
   }
 
-  function clearPolicyViolations() {
+  async function clearPolicyViolations() {
     if (!shopeeClaimedProducts.length) {
       showToast("Chưa có danh sách sản phẩm để lọc vi phạm", "info");
       return;
     }
     const beforeCount = shopeeClaimedProducts.length;
-    const blockList = ["disney", "marvel", "nike", "adidas", "gucci", "chanel", "louis vuitton", "apple", "iphone", "samsung", "doraemon", "hello kitty", "pokemon", "naruto", "one piece", "rolex", "zara", "h&m", "dior", "prada", "versace", "balenciaga"];
+    try {
+      const payload = {
+        products: shopeeClaimedProducts.map(p => ({
+          item_id: p.item_id,
+          name: p.name || "",
+          _is_imported: !!p._is_imported
+        })),
+        mark_failed_on_db: true
+      };
+      const res = await fetch("/api/shopee/filter-violations", {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const rmSet = new Set((data.removed_ids || []).map(x => String(x)));
+      shopeeClaimedProducts = shopeeClaimedProducts.filter(p => !rmSet.has(String(p.item_id)));
+      const removed = beforeCount - shopeeClaimedProducts.length;
+      renderShopeeProductsConsole();
+      const dbNote = data.marked_db > 0 ? ` (đã đánh dấu bỏ qua ${data.marked_db} SP trên DB)` : "";
+      appendShopeeLog(`🛡️ Đã lọc và xóa ${removed} sản phẩm vi phạm Blacklist / thương hiệu bản quyền${dbNote}.`);
+      showToast(`Đã loại bỏ ${removed} sản phẩm vi phạm chính sách!`, "success");
+      return;
+    } catch (e) {
+      console.warn("filter-violations API lỗi, dùng bộ lọc cục bộ:", e);
+    }
+    const blockList = ["disney", "marvel", "nike", "adidas", "gucci", "chanel", "louis vuitton", "apple", "iphone", "samsung", "doraemon", "hello kitty", "pokemon", "naruto", "one piece", "rolex", "zara", "h&m", "dior", "prada", "versace", "balenciaga", "sanrio", "cinnamoroll", "my melody", "kuromi", "marlboro"];
     shopeeClaimedProducts = shopeeClaimedProducts.filter(p => {
       const name = (p.name || "").toLowerCase();
       return !blockList.some(word => name.includes(word));
@@ -5385,6 +5433,9 @@
           throw new Error(err);
         }
         const data = await res.json();
+        if (data.blacklisted_count > 0) {
+          appendShopeeLog(`🛡️ [Tự nhận SP] Đã tự động lọc bỏ ${data.blacklisted_count} SP vi phạm Blacklist / thương hiệu bản quyền (đã đánh dấu bỏ qua trên DB).`);
+        }
         // Database trả lại cả SP mình đã nhận mà chưa làm xong -> chỉ thêm SP chưa có trong batch này
         const fresh = (data.products || []).filter(p => p && p.item_id && !seenItemIds.has(String(p.item_id)));
         fresh.forEach(p => seenItemIds.add(String(p.item_id)));
@@ -5480,31 +5531,33 @@
       failedCount++;
       appendShopeeLog(`❌ [Luồng ${workerId}] Lỗi SP ${prod.item_id}: ${err.message}`);
 
-      // Tự động kiểm tra và thêm vào Blacklist nếu vi phạm chính sách an toàn
-      const msgLow = (err.message || "").toLowerCase();
-      if (msgLow.includes("safety") || msgLow.includes("policy") || msgLow.includes("vi phạm") || msgLow.includes("nsfw") || msgLow.includes("prohibited")) {
-        try {
-          await fetch("/api/shopee/add-to-blacklist", {
-            method: "POST",
-            headers: getHeaders(),
-            body: JSON.stringify({ item_id: prod.item_id, reason: err.message })
-          });
-          appendShopeeLog(`🛡️ [Luồng ${workerId}] Đã tự động thêm SP ${prod.item_id} vào Blacklist (vi phạm chính sách Muse.ai)!`);
-        } catch (_) {}
-      }
+      // Tự động kiểm tra và thêm vào Blacklist nếu vi phạm chính sách / bản quyền
+      const errMsgStr = String(err && err.message || "");
+      const isPolicyErr = /safety|policy|vi\s*phạm|nsfw|prohibited|copyright|trademark|bản\s*quyền|kiểm\s*duyệt|từ\s*chối\s*(?:nội\s*dung|sản\s*xuất|tạo)|logo\s*thương\s*hiệu|thuốc\s*(?:lá|thú\s*y)|veterinary|không\s*làm\s*tvc/i.test(errMsgStr);
 
       if (!prod._is_imported) {
         try {
           const cr = await fetch("/api/shopee/complete", {
             method: "POST",
             headers: getHeaders(),
-            body: JSON.stringify({ item_id: prod.item_id, status: "failed", error: String(err && err.message || "").slice(0, 800) })
+            body: JSON.stringify({ item_id: prod.item_id, status: "failed", error: errMsgStr.slice(0, 800) })
           });
           const cj = await cr.json().catch(() => ({}));
           if (cj && cj.requeued) {
             requeuedCount++;
             appendShopeeLog(`↩️ [Luồng ${workerId}] SP ${prod.item_id}: lỗi do tài khoản/proxy (không phải do SP) -> đã trả về hàng chờ để làm lại (lần ${cj.requeued}), không đánh lỗi.`);
+          } else if (cj && cj.auto_blacklisted) {
+            appendShopeeLog(`🛡️ [Luồng ${workerId}] Đã tự động thêm SP ${prod.item_id} vào Blacklist (vi phạm chính sách / bản quyền Muse.ai)!`);
           }
+        } catch (_) {}
+      } else if (isPolicyErr) {
+        try {
+          await fetch("/api/shopee/add-to-blacklist", {
+            method: "POST",
+            headers: getHeaders(),
+            body: JSON.stringify({ item_id: prod.item_id, reason: errMsgStr.slice(0, 160) })
+          });
+          appendShopeeLog(`🛡️ [Luồng ${workerId}] Đã tự động thêm SP ${prod.item_id} vào Blacklist (vi phạm chính sách / bản quyền Muse.ai)!`);
         } catch (_) {}
       }
     }
@@ -5739,10 +5792,19 @@
       if (res.ok) {
         const data = await res.json();
         document.getElementById("bl_enabled").checked = data.enabled !== false;
-        document.getElementById("bl_auto_block").checked = data.auto_block_safety_errors !== false;
+        const policyChk = document.getElementById("bl_filter_shopee_policy");
+        if (policyChk) policyChk.checked = data.filter_shopee_policy !== false;
+        const brandChk = document.getElementById("bl_filter_brand");
+        if (brandChk) brandChk.checked = data.filter_brand_policy !== false;
+        const autoVal = data.auto_block_safety !== undefined ? data.auto_block_safety : data.auto_block_safety_errors;
+        document.getElementById("bl_auto_block").checked = autoVal !== false;
         document.getElementById("bl_keywords").value = (data.keywords || []).join("\n");
+        const brandTa = document.getElementById("bl_brand_keywords");
+        if (brandTa) brandTa.value = (data.brand_keywords || []).join("\n");
         document.getElementById("bl_item_ids").value = (data.item_ids || []).join("\n");
-        document.getElementById("bl_status_text").innerText = `Đang có ${(data.keywords || []).length} từ khóa, ${(data.item_ids || []).length} ID`;
+        const pgCount = Array.isArray(data.policy_groups) ? data.policy_groups.length : 10;
+        document.getElementById("bl_status_text").innerText =
+          `Đang có ${pgCount} nhóm luật Shopee, ${(data.keywords || []).length} từ khóa cấm, ${(data.brand_keywords || []).length} thương hiệu, ${(data.item_ids || []).length} ID`;
       }
     } catch (e) {
       console.warn("Lỗi tải blacklist:", e);
@@ -5757,11 +5819,15 @@
 
   async function saveBlacklistData() {
     const enabled = document.getElementById("bl_enabled").checked;
+    const filterShopeePolicy = (document.getElementById("bl_filter_shopee_policy") || { checked: true }).checked;
+    const filterBrand = (document.getElementById("bl_filter_brand") || { checked: true }).checked;
     const autoBlock = document.getElementById("bl_auto_block").checked;
     const kwText = document.getElementById("bl_keywords").value;
+    const brandText = (document.getElementById("bl_brand_keywords") || { value: "" }).value;
     const idText = document.getElementById("bl_item_ids").value;
 
     const keywords = kwText.split("\n").map(s => s.trim()).filter(Boolean);
+    const brand_keywords = brandText.split("\n").map(s => s.trim()).filter(Boolean);
     const item_ids = idText.split("\n").map(s => s.trim()).filter(Boolean);
 
     try {
@@ -5770,14 +5836,19 @@
         headers: getHeaders(),
         body: JSON.stringify({
           enabled: enabled,
+          filter_shopee_policy: filterShopeePolicy,
+          filter_brand_policy: filterBrand,
+          auto_block_safety: autoBlock,
           auto_block_safety_errors: autoBlock,
           keywords: keywords,
+          brand_keywords: brand_keywords,
           item_ids: item_ids
         })
       });
       if (res.ok) {
         showToast("Đã lưu Blacklist thành công!", "success");
-        document.getElementById("bl_status_text").innerText = `✓ Đã lưu: ${keywords.length} từ khóa, ${item_ids.length} ID`;
+        document.getElementById("bl_status_text").innerText =
+          `✓ Đã lưu: ${filterShopeePolicy ? "10 nhóm luật Shopee ON, " : ""}${keywords.length} từ khóa cấm, ${brand_keywords.length} thương hiệu, ${item_ids.length} ID`;
         setTimeout(() => {
           closeBlacklistModal();
         }, 500);

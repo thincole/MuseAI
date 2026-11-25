@@ -3808,47 +3808,8 @@ def _claim_shopee_jobs_pg(
     else:
         order_sql = "monthly_sold DESC NULLS LAST, sold DESC"
 
-    conn = _shopee_db_connect(server_url)
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        # Lấy trước các SP đang dở (processing) của chính máy này mà vẫn đạt bộ lọc
-        cur.execute(
-            f"SELECT {cols} FROM shopee_products "
-            f"WHERE video_status = 'processing' AND claimed_by = %s AND {where_sql} "
-            f"ORDER BY {order_sql} LIMIT %s",
-            [client_id, *filter_params, int(limit)],
-        )
-        rows = list(cur.fetchall())
-
-        remain = max(0, int(limit) - len(rows))
-        if remain > 0:
-            cur.execute(
-                f"WITH picked AS ("
-                f"  SELECT item_id FROM shopee_products "
-                f"  WHERE video_status = 'pending' AND {where_sql} "
-                f"  ORDER BY {order_sql} LIMIT %s "
-                f"  FOR UPDATE SKIP LOCKED"
-                f") "
-                f"UPDATE shopee_products p "
-                f"SET video_status = 'processing', claimed_by = %s, claimed_at = NOW() "
-                f"FROM picked WHERE p.item_id = picked.item_id "
-                f"RETURNING {ret_cols}",
-                [*filter_params, remain, client_id],
-            )
-            rows.extend(cur.fetchall())
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
-    finally:
-        conn.close()
-
-    raw_products = []
-    for r in rows:
-        raw_products.append({
+    def _row_to_prod(r: dict) -> dict:
+        return {
             "item_id": int(r["item_id"]) if r.get("item_id") is not None else 0,
             "shop_id": int(r["shop_id"]) if r.get("shop_id") is not None else 0,
             "name": r.get("name") or "",
@@ -3860,17 +3821,96 @@ def _claim_shopee_jobs_pg(
             "commission_rate": float(r["commission_rate"]) if r.get("commission_rate") is not None else 0.0,
             "market": r.get("market") or market,
             "monthly_sold": int(r["monthly_sold"]) if r.get("monthly_sold") is not None else None,
-        })
+        }
 
-    return shopee_engine.normalize_and_filter_products(
-        raw_products,
-        min_item_id=min_item_id,
-        min_commission=min_commission,
-        min_sold=min_sold,
-        min_monthly_sold=min_monthly_sold,
-        min_price=min_price,
-        max_price=max_price,
-    )
+    all_products: list[dict] = []
+    total_bl = 0
+    total_marked_failed = 0
+    conn = _shopee_db_connect(server_url)
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        for pass_idx in range(3):
+            rows = []
+            if pass_idx == 0:
+                # Lấy trước các SP đang dở (processing) của chính máy này mà vẫn đạt bộ lọc
+                cur.execute(
+                    f"SELECT {cols} FROM shopee_products "
+                    f"WHERE video_status = 'processing' AND claimed_by = %s AND {where_sql} "
+                    f"ORDER BY {order_sql} LIMIT %s",
+                    [client_id, *filter_params, int(limit)],
+                )
+                rows = list(cur.fetchall())
+
+            picked_new = 0
+            remain = max(0, int(limit) - len(all_products) - len(rows))
+            if remain > 0:
+                cur.execute(
+                    f"WITH picked AS ("
+                    f"  SELECT item_id FROM shopee_products "
+                    f"  WHERE video_status = 'pending' AND {where_sql} "
+                    f"  ORDER BY {order_sql} LIMIT %s "
+                    f"  FOR UPDATE SKIP LOCKED"
+                    f") "
+                    f"UPDATE shopee_products p "
+                    f"SET video_status = 'processing', claimed_by = %s, claimed_at = NOW() "
+                    f"FROM picked WHERE p.item_id = picked.item_id "
+                    f"RETURNING {ret_cols}",
+                    [*filter_params, remain, client_id],
+                )
+                new_rows = cur.fetchall()
+                picked_new = len(new_rows)
+                rows.extend(new_rows)
+
+            raw_batch = [_row_to_prod(r) for r in rows]
+            clean_batch, bl_cnt, rejected = shopee_engine.normalize_and_filter_products(
+                raw_batch,
+                min_item_id=min_item_id,
+                min_commission=min_commission,
+                min_sold=min_sold,
+                min_monthly_sold=min_monthly_sold,
+                min_price=min_price,
+                max_price=max_price,
+                return_rejected=True,
+            )
+            all_products.extend(clean_batch)
+            total_bl += bl_cnt
+
+            if rejected:
+                rej_ids = []
+                for rj in rejected:
+                    try:
+                        iid = int(rj.get("item_id") or 0)
+                        if iid > 0:
+                            rej_ids.append(iid)
+                    except Exception:
+                        pass
+                if rej_ids:
+                    cur.execute(
+                        "UPDATE shopee_products "
+                        "SET video_status = 'failed', "
+                        "    created_by_tool = COALESCE(created_by_tool, 'museai'), "
+                        "    video_updated_at = NOW() "
+                        "WHERE item_id = ANY(%s) AND video_status = 'processing' AND claimed_by = %s",
+                        [rej_ids, client_id],
+                    )
+                    total_marked_failed += cur.rowcount or 0
+
+            conn.commit()
+            # Đã có SP sạch hoặc DB không còn pending nữa -> dừng; chỉ lấy thêm vòng nữa nếu cả lô vừa lấy đều vi phạm
+            if all_products or (picked_new == 0 and (pass_idx > 0 or not rows)):
+                break
+        if total_marked_failed > 0:
+            log.info("🗑️ [Blacklist PG] Đã đánh dấu bỏ qua (failed) %d SP vi phạm ngay lúc nhận lô (không bị kẹt processing)", total_marked_failed)
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    return all_products, total_bl
 
 
 @app.post("/api/shopee/claim")
@@ -3912,7 +3952,7 @@ def claim_shopee_jobs(req: dict):
                 max_price=max_price,
             )
         else:
-            products, bl_count = shopee_engine.claim_jobs_from_server(
+            products, bl_count, rejected = shopee_engine.claim_jobs_from_server(
                 server_url=server_url,
                 api_key=api_key,
                 client_id=client_id,
@@ -3925,8 +3965,17 @@ def claim_shopee_jobs(req: dict):
                 min_monthly_sold=0,
                 min_price=min_price,
                 max_price=max_price,
-                return_stats=True
+                return_rejected=True,
             )
+            if rejected:
+                rej_ids = [r.get("item_id") for r in rejected if r.get("item_id")]
+                if rej_ids:
+                    threading.Thread(
+                        target=shopee_engine.mark_blacklisted_jobs_failed,
+                        args=(server_url, api_key, rej_ids),
+                        daemon=True,
+                        name="bl-mark-fail",
+                    ).start()
         return {"success": True, "count": len(products), "products": products, "blacklisted_count": bl_count}
     except Exception as e:
         raise HTTPException(500, f"Lỗi lấy sản phẩm từ Database: {e}")
@@ -3953,18 +4002,27 @@ def complete_shopee_job(req: dict):
     item_id = req.get("item_id", "")
     status = req.get("status", "completed")
     video_path = req.get("video_path")
+    err_msg = str(req.get("error") or "")
     requeued = 0
-    if status == "failed" and shopee_engine.is_account_fault(req.get("error")):
+    auto_blacklisted = False
+    if status == "failed" and shopee_engine.is_account_fault(err_msg):
         # Lỗi do TK / proxy / Muse (không phải do SP): trả SP về hàng chờ thay vì đánh failed vĩnh viễn (tối đa MAX_REQUEUE lần)
         requeued = shopee_engine.take_requeue_slot(item_id)
         if requeued:
             status = "pending"
             log.info("↩️ [Hàng chờ] SP %s lỗi do TK/proxy -> trả về hàng chờ (lần %d/%d), không đánh failed",
                      item_id, requeued, shopee_engine.MAX_REQUEUE)
+    elif status == "failed" and item_id and shopee_engine.is_policy_violation_error(err_msg):
+        try:
+            if shopee_engine.get_blacklist().get("auto_block_safety", True):
+                shopee_engine.add_to_blacklist(item_id=str(item_id), reason=err_msg[:160])
+                auto_blacklisted = True
+        except Exception:
+            pass
     elif status == "completed":
         shopee_engine.forget_requeue(item_id)
     res = shopee_engine.report_job_completion(server_url, api_key, item_id, status, video_path)
-    return {"success": res, "requeued": requeued}
+    return {"success": res, "requeued": requeued, "auto_blacklisted": auto_blacklisted}
 
 
 @app.get("/api/shopee/fail-stats")
@@ -5200,7 +5258,9 @@ def get_app_version():
 # ------------------------- Blacklist Sản Phẩm -------------------------
 @app.get("/api/shopee/blacklist")
 def get_shopee_blacklist():
-    return shopee_engine.get_blacklist()
+    bl = shopee_engine.get_blacklist()
+    bl["policy_groups"] = shopee_engine.get_shopee_policy_groups()
+    return bl
 
 
 @app.post("/api/shopee/save-blacklist")
@@ -5216,6 +5276,74 @@ def add_to_shopee_blacklist(req: dict):
     reason = req.get("reason", "")
     res = shopee_engine.add_to_blacklist(item_id=item_id, keyword=keyword, reason=reason)
     return {"success": True, "blacklist": res}
+
+
+@app.post("/api/shopee/filter-violations")
+def filter_shopee_violations(req: dict):
+    """Lọc danh sách SP trên giao diện theo đúng bộ lọc Blacklist + Luật Shopee PH/MY/ID + thương hiệu/bản quyền
+    (dùng cho nút Xóa Vi Phạm CS) và tự đánh dấu failed trên DB cho các SP đã claim bị loại bỏ."""
+    items = req.get("products") or []
+    mark_db = bool(req.get("mark_failed_on_db", True))
+    bl = shopee_engine.get_blacklist()
+    bl["enabled"] = True
+    bl["filter_shopee_policy"] = True
+    bl["filter_brand_policy"] = True
+
+    removed_ids: list[str] = []
+    db_fail_ids: list[int] = []
+    samples: list[str] = []
+    for p in items:
+        if not isinstance(p, dict):
+            continue
+        is_bl, reason = shopee_engine.is_product_blacklisted(p, bl)
+        if is_bl:
+            sid = str(p.get("item_id") or "").strip()
+            if sid:
+                removed_ids.append(sid)
+                if not p.get("_is_imported") and sid.isdigit():
+                    db_fail_ids.append(int(sid))
+            if len(samples) < 5:
+                samples.append(f"SP {sid}: {reason}")
+
+    marked_db = 0
+    if mark_db and db_fail_ids:
+        cfg = _get_shopee_settings()
+        server_url = req.get("server_url") or cfg.get("sv_server_url") or shopee_engine.DEFAULT_SERVER_URL
+        api_key = req.get("api_key") or cfg.get("sv_api_key") or shopee_engine.DEFAULT_API_KEY
+        client_id = req.get("client_id") or cfg.get("sv_client_id") or shopee_engine.DEFAULT_CLIENT_ID
+        if server_url:
+            try:
+                conn = _shopee_db_connect(server_url)
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE shopee_products "
+                        "SET video_status = 'failed', "
+                        "    created_by_tool = COALESCE(created_by_tool, 'museai'), "
+                        "    video_updated_at = NOW() "
+                        "WHERE item_id = ANY(%s) AND video_status = 'processing' AND claimed_by = %s",
+                        [db_fail_ids, client_id],
+                    )
+                    marked_db = cur.rowcount or 0
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception:
+                if api_key:
+                    threading.Thread(
+                        target=shopee_engine.mark_blacklisted_jobs_failed,
+                        args=(server_url, api_key, db_fail_ids),
+                        daemon=True,
+                        name="bl-filter-fail",
+                    ).start()
+
+    return {
+        "success": True,
+        "removed_ids": removed_ids,
+        "removed_count": len(removed_ids),
+        "marked_db": marked_db,
+        "samples": samples,
+    }
 
 
 # ------------------------- HomeProxy từ E:\ThinAptm0707 -------------------------

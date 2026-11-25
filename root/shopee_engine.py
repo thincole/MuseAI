@@ -960,15 +960,28 @@ def clear_cached_clip_keys(item_id: str, keys: tuple[str, ...] | list[str]) -> N
 
 BLACKLIST_FILE = os.path.join(CFG.data_dir, "shopee_blacklist.json")
 
+DEFAULT_BRAND_POLICY_KEYWORDS = [
+    "disney", "marvel", "nike", "air jordan", "adidas", "gucci", "chanel", "louis vuitton",
+    "hermes", "fendi", "burberry", "ysl", "yves saint laurent",
+    "apple", "iphone", "airpods", "macbook", "ipad", "samsung",
+    "doraemon", "hello kitty", "pokemon", "pikachu", "naruto", "one piece",
+    "dragon ball", "demon slayer", "pop mart", "labubu",
+    "rolex", "zara", "h&m", "dior", "prada", "versace", "balenciaga",
+    "sanrio", "cinnamoroll", "my melody", "kuromi", "marlboro",
+]
+
 DEFAULT_BLACKLIST = {
     "enabled": True,
     "auto_block_safety": True,
+    "filter_brand_policy": True,
+    "filter_shopee_policy": True,
     "keywords": [
-        "vape", "pod", "thuốc lá", "thuoc la", "cigar", "cigarette", "xì gà", "xi ga",
+        "vape", "vape pod", "pod kit", "thuốc lá", "thuoc la", "cigar", "cigarette", "xì gà", "xi ga",
         "bao cao su", "kích dục", "kich duc", "sextoy", "sex toy", "tình dục", "tinh duc",
-        "18+", "người lớn", "nguoi lon", "dao găm", "súng", "sung", "vũ khí", "vu khi",
+        "18+", "đồ chơi người lớn", "dao găm", "súng", "sung", "vũ khí", "vu khi",
         "fake", "replica", "hàng nhái", "hang nhai", "shisha", "bóng cười", "bong cuoi"
     ],
+    "brand_keywords": list(DEFAULT_BRAND_POLICY_KEYWORDS),
     "item_ids": []
 }
 
@@ -979,19 +992,27 @@ def _default_blacklist() -> dict:
 
 
 def get_blacklist() -> dict:
-    """Lấy danh sách Blacklist (từ khóa cấm & Item ID cấm). Luôn trả về object mới, an toàn để sửa."""
+    """Lấy danh sách Blacklist (từ khóa cấm, luật Shopee PH/MY/ID, thương hiệu/bản quyền & Item ID cấm)."""
     with _BLACKLIST_LOCK:
         data, _status = _load_json_file(BLACKLIST_FILE, "blacklist")
     if data is None:
-        return _default_blacklist()
+        data = _default_blacklist()
     if not isinstance(data.get("keywords"), list):
         data["keywords"] = copy.deepcopy(DEFAULT_BLACKLIST["keywords"])
+    if "brand_keywords" not in data or not isinstance(data.get("brand_keywords"), list):
+        data["brand_keywords"] = copy.deepcopy(DEFAULT_BRAND_POLICY_KEYWORDS)
     if not isinstance(data.get("item_ids"), list):
         data["item_ids"] = []
     if "enabled" not in data:
         data["enabled"] = True
     if "auto_block_safety" not in data:
-        data["auto_block_safety"] = True
+        data["auto_block_safety"] = bool(data.get("auto_block_safety_errors", True))
+    if "filter_brand_policy" not in data:
+        data["filter_brand_policy"] = True
+    if "filter_shopee_policy" not in data:
+        data["filter_shopee_policy"] = True
+    # Giữ tương thích ngược cho frontend cũ đọc auto_block_safety_errors
+    data["auto_block_safety_errors"] = bool(data["auto_block_safety"])
     return data
 
 
@@ -999,11 +1020,20 @@ def save_blacklist(data: dict) -> bool:
     """Lưu danh sách Blacklist xuống file data/shopee_blacklist.json (dưới khóa, ghi nguyên tử)."""
     with _BLACKLIST_LOCK:
         try:
-            kw_list = []
-            for kw in data.get("keywords", []) or []:
-                k = unicodedata.normalize("NFC", str(kw)).strip().lower()
-                if k and k not in kw_list:
-                    kw_list.append(k)
+            def _clean_kws(raw_list) -> list[str]:
+                out = []
+                for kw in raw_list or []:
+                    k = unicodedata.normalize("NFC", str(kw)).strip().lower()
+                    if k and k not in out:
+                        out.append(k)
+                return out
+
+            kw_list = _clean_kws(data.get("keywords", []))
+            cur_bl = get_blacklist()
+            if "brand_keywords" in data and isinstance(data.get("brand_keywords"), list):
+                brand_kw_list = _clean_kws(data.get("brand_keywords"))
+            else:
+                brand_kw_list = _clean_kws(cur_bl.get("brand_keywords", DEFAULT_BRAND_POLICY_KEYWORDS))
 
             ids_list = []
             for iid in data.get("item_ids", []) or []:
@@ -1011,10 +1041,30 @@ def save_blacklist(data: dict) -> bool:
                 if i and i not in ids_list:
                     ids_list.append(i)
 
+            if "auto_block_safety" in data:
+                auto_block = bool(data.get("auto_block_safety"))
+            elif "auto_block_safety_errors" in data:
+                auto_block = bool(data.get("auto_block_safety_errors"))
+            else:
+                auto_block = True
+
+            if "filter_brand_policy" in data:
+                filter_brand = bool(data.get("filter_brand_policy"))
+            else:
+                filter_brand = bool(cur_bl.get("filter_brand_policy", True))
+
+            if "filter_shopee_policy" in data:
+                filter_shopee = bool(data.get("filter_shopee_policy"))
+            else:
+                filter_shopee = bool(cur_bl.get("filter_shopee_policy", True))
+
             clean_data = {
                 "enabled": bool(data.get("enabled", True)),
-                "auto_block_safety": bool(data.get("auto_block_safety", True)),
+                "auto_block_safety": auto_block,
+                "filter_brand_policy": filter_brand,
+                "filter_shopee_policy": filter_shopee,
                 "keywords": kw_list,
+                "brand_keywords": brand_kw_list,
                 "item_ids": ids_list,
                 "updated_at": int(time.time())
             }
@@ -1155,8 +1205,177 @@ def _match_blacklist_keyword(name: str, keywords) -> str | None:
     return None
 
 
+# ---------- Bộ luật Shopee Listing Violations đa thị trường (PH 24949 + MY 614 + ID 19582) ----------
+# Mỗi luật gồm: (mã_nhóm, tên_nhóm, nguồn_chính_sách, regex_vi_phạm, regex_loại_trừ_bắt_nhầm)
+# Đã đối chiếu trên 32.000 SP thật (PH/VN/MY/ID) để tránh bắt nhầm phụ kiện, đồ gia dụng, từ đồng âm.
+_SHOPEE_POLICY_RULE_SPECS: tuple[tuple[str, str, str, str, str | None], ...] = (
+    (
+        "weapons",
+        "Vũ khí / Súng / Tự vệ",
+        "PH 24949 (11354) · MY 614 · ID",
+        r"\b(?:firearms?|handguns?|revolvers?|rifles?|shotguns?|ammunitions?|airsoft\s+guns?|pellet\s+guns?|bb\s+guns?|"
+        r"stun\s+guns?|tasers?|pepper\s+sprays?|tear\s+gas|brass\s+knuckles?|knuckle\s+dusters?|"
+        r"switchblades?|butterfly\s+kni(?:fe|ves)|balisongs?|karambits?|kerambits?|machetes?|"
+        r"tactical\s+kni(?:fe|ves)|throwing\s+kni(?:fe|ves)|crossbows?|kubotans?|bulletproof\s+vests?|body\s+armor|"
+        r"senapan\s+angin|senjata\s+api|senjata\s+tajam|sajam|buku\s+lima|sangkur|celurit|alat\s+setrum|"
+        r"renjatan\s+elektrik|semburan\s+lada|semprotan\s+merica|bình\s+xịt\s+hơi\s+cay|binh\s+xit\s+hoi\s+cay|roi\s+điện|roi\s+dien)\b",
+        r"\b(?:glue\s+gun|súng\s+bắn\s+keo|súng\s+bắn\s+ghim|massage\s+gun|heat\s+gun|spray\s+gun|water\s+gun|nail\s+gun|bubble\s+gun|toy\s+gun)\b",
+    ),
+    (
+        "adult_sexual",
+        "Người lớn 18+ / Kích dục",
+        "PH 24949 (25010) · MY 614 · ID",
+        r"\b(?:sex\s*toys?|dildos?|vibrators?|fleshlights?|masturbators?|butt\s+plugs?|anal\s+plugs?|"
+        r"bdsm|bondage|erotic|pornographic|porn|hentai|sex\s+dolls?|love\s+dolls?|blow[\s\-]+up\s+dolls?|"
+        r"nipple\s+clamps?|cock\s+rings?|penis\s+rings?|penis\s+pumps?|penis\s+enlargers?|"
+        r"genital\s+enlargement|erection\s+boost|delay\s+sprays?|aphrodisiacs?|condoms?|"
+        r"pampatigas|pampalaki|robust\s+extreme|titan\s+gel|"
+        r"ubat\s+kuat|gambir\s+sarawak|gambir\s+emas|candy\s+b|soloco|"
+        r"obat\s+kuat|obat\s+perangsang|perangsang\s+(?:wanita|pria)|pembesar\s+penis|alat\s+bantu\s+sex|"
+        r"kondom|tisu\s+magic|hajar\s+jahanam|viagra|cialis|kamagra|"
+        r"đồ\s+chơi\s+người\s+lớn|do\s+choi\s+nguoi\s+lon|bao\s+cao\s+su|kích\s+dục|kich\s+duc)\b",
+        r"\b(?:skun|kabel|cable|terminal\s+skun)\b",
+    ),
+    (
+        "tobacco_vape_alcohol",
+        "Thuốc lá / Vape / Rượu bia",
+        "PH 24949 (25019/18262) · MY 614 · ID",
+        r"\b(?:vapes?|vaping|e[\-\s]?cigarettes?|e[\-\s]?cigs?|e[\-\s]?liquids?|e[\-\s]?juices?|"
+        r"nicotine|salt\s+nic|nic\s+salt|vape\s+pods?|disposable\s+pods?|pod\s+kits?|pod\s+vapes?|"
+        r"relx|iqos|heets|terea|juul|puff\s+bars?|vape\s+coils?|vape\s+juices?|flavour\s+vape|liquid\s+vape|likuid\s+vape|occ\s+vape|cartridge\s+vape|"
+        r"cigarettes?|cigars?|tobacco|shisha|hookahs?|rolling\s+papers?|snus|chewing\s+tobacco|"
+        r"rokok|tembakau|cerut|cerutu|thuốc\s+lá|thuoc\s+la|xì\s+gà|xi\s+ga|bóng\s+cười|bong\s+cuoi|"
+        r"vodka|tequila|cognac|bourbon|soju|red\s+horse\s+beer|san\s+miguel\s+beer|craft\s+beer|"
+        r"emperador\s+(?:light|brandy)|tanduay\s+(?:rum|rhum|select)|alfonso\s+(?:light|brandy)|"
+        r"alcoholic\s+beverages?|bootleg\s+alcohol|minuman\s+keras|miras|anggur\s+merah|arak\s+(?:bali|putih|beras))\b",
+        r"\b(?:stain\s+removal|toothpaste|ubat\s+gigi|ice\s+mold|cake\s+topper|glass(?:es)?|opener|coaster)\b",
+    ),
+    (
+        "drugs_illicit",
+        "Ma túy & Chất cấm",
+        "PH 24949 (25060) · MY 614 · ID",
+        r"\b(?:cannabis|marijuana|kush|thc|cbd\s+oil|hemp\s+oil|kratom|ketum|daun\s+ketum|"
+        r"cocaine|heroin|methamphetamine|shabu|syabu|sabu|ecstasy|ekstasi|psilocybin|"
+        r"opium|morphine|fentanyl|codeine|tramadol|xanax|valium|ketamine|poppers|nitrous\s+oxide|"
+        r"narkoba|narkotika|ganja|dadah|ma\s+túy|ma\s+tuy|cần\s+sa|can\s+sa)\b",
+        r"\b(?:urine\s+drug\s+test|test\s+kit)\b",
+    ),
+    (
+        "medical_rx_fda",
+        "Thuốc kê đơn / Thiết bị y tế xâm lấn / FDA / Thú y",
+        "PH 24949 (25021/25063) · MY 614",
+        r"\b(?:rx\s+only|prescription\s+(?:drug|medicine|only)|antibiotics?|amoxicillin|azithromycin|ciprofloxacin|"
+        r"metformin|losartan|amlodipine|mefenamic|omeprazole|anabolic\s+steroids?|steroids?|sarms|ivermectin|"
+        r"antidepressants?|opioids?|abortion|cytotec|misoprostol|obat\s+aborsi|penggugur\s+kandungan|"
+        r"gluta\s+drip|glutathione\s+iv|iv\s+push|botox|dermal\s+fillers?|mesotherapy|"
+        r"hydroquinone|tretinoin|isotretinoin|clobetasol|ketoconazole|"
+        r"hypodermic|disposable\s+syringes?|insulin\s+syringes?|iv\s+cannula|catheters?|scalpels?|surgical\s+blades?|"
+        r"diy\s+braces|slimming\s+pills?|diet\s+pills?|weight\s+loss\s+pills?|appetite\s+suppressants?|"
+        r"vet\s+medicine|veterinary\s+(?:medicine|drug|injection)|thuốc\s+thú\s+y|thuoc\s+thu\s+y|thuốc\s+kê\s+đơn|"
+        r"stage\s*1\s+infant\s+milk|step\s*1\s+infant\s+milk|susu\s+formula\s+0[\-\s]?6)\b",
+        r"\b(?:chiết\s+nước\s+hoa|perfume\s+refill|veterinary\s+diet|cat\s+food|dog\s+food|kucing|anjing)\b",
+    ),
+    (
+        "chemicals_pesticides",
+        "Hóa chất độc hại / Thuốc trừ sâu cấm / Chất nổ",
+        "PH 24949 (25011) · MY 614 (DOA) · ID",
+        r"\b(?:firecrackers?|pyrotechnics?|gunpowder|detonators?|petasan|bahan\s+peledak|pháo\s+hoa|thuốc\s+nổ|"
+        r"muriatic\s+acid|hydrochloric\s+acid|sulfuric\s+acid|nitric\s+acid|caustic\s+soda|"
+        r"potassium\s+nitrate|cyanide|arsenic|chloroform|asbestos|merkuri|formalin|boraks|"
+        r"paraquat|pentachlorophenol|trichlorphon|dicofol|monocrotophos|chlorpyrifos|zinc\s+phosphide|"
+        r"herbicides?|weed\s+killers?|rodenticides?|rat\s+poisons?|racun\s+rumpai|racun\s+rumput|racun\s+perosak|racun\s+tikus|"
+        r"pestisida|thuốc\s+diệt\s+chuột|thuốc\s+trừ\s+sâu|magnetic\s+putty|burning\s+laser)\b",
+        r"\b(?:insecticide[\-\s]?free|pesticide[\-\s]?free|tanpa\s+pestisida|bebas\s+pestisida|no\s+pesticide|mercury[\-\s]?free|formalin[\-\s]?free|test\s+kit|detector)\b",
+    ),
+    (
+        "gov_royalty_ids",
+        "Đồng phục / Giấy tờ chính phủ / Hoàng gia",
+        "PH 24949 (25012) · MY 614 · ID",
+        r"\b(?:pnp\s+uniform|afp\s+uniform|police\s+uniform|military\s+uniform|army\s+uniform|"
+        r"bfp\s+uniform|bjmp\s+uniform|coast\s+guard\s+uniform|police\s+badge|police\s+blinker|wang\s+wang\s+siren|"
+        r"rela\s+uniform|bomba\s+uniform|darjah\s+kebesaran|pingat\s+persekutuan|"
+        r"government\s+id|fake\s+id|tin\s+id|philhealth\s+id|postal\s+id|drivers?\s+license|"
+        r"lto\s+plate|replica\s+plate|mykad|ic\s+palsu|sijil\s+halal|halal\s+certificate|"
+        r"ktp\s+palsu|sim\s+palsu|ijazah\s+palsu|surat\s+dokter\s+palsu|stnk\s+palsu|bpkb\s+palsu|materai\s+palsu|"
+        r"đồng\s+phục\s+công\s+an|quân\s+phục)\b",
+        None,
+    ),
+    (
+        "prohibited_services",
+        "Dịch vụ cấm / Doxing / Dữ liệu cá nhân / Tâm linh",
+        "ID 19582 · MY 614 · PH 24949 (25062)",
+        r"\b(?:jasa\s+doxing|doxing|jasa\s+hack|jasa\s+sadap|sadap\s+wa|sadap\s+whatsapp|"
+        r"jasa\s+lacak|jasa\s+bobol|jasa\s+phising|jual\s+database|database\s+nomor|database\s+rekening|"
+        r"jual\s+rekening|jasa\s+gestun|gesek\s+tunai|jasa\s+pinjol|joki\s+pinjol|jasa\s+galbay|"
+        r"bi\s+checking|jasa\s+slik|jasa\s+edit\s+ktp|jasa\s+bikin\s+ktp|jasa\s+surat\s+sakit|"
+        r"jasa\s+followers?|jasa\s+like|jasa\s+buzzer|jasa\s+review\s+palsu|jasa\s+fake\s+order|jasa\s+suntik|"
+        r"open\s+bo|video\s+call\s+sex|pijat\s+plus|escort\s+service|webcam\s+service|"
+        r"jasa\s+santet|jasa\s+pelet|penglaris|pesugihan|jasa\s+dukun|jasa\s+ramal|jasa\s+tarot|"
+        r"tarot\s+reading|fortune\s+telling|bomoh|santau|minyak\s+dagu|minyak\s+pengasih|"
+        r"tangkal|azimat|ritual\s+service|jual\s+kyc|verifikasi\s+kyc|"
+        r"akun\s+dana\s+premium|akun\s+ovo|akun\s+gopay|akun\s+shopee|verified\s+gcash|gcash\s+account|maya\s+account)\b",
+        None,
+    ),
+    (
+        "digital_restricted_misc",
+        "Hàng số / Phá sóng / TV Box / Tiền tệ / Cờ bạc / Động vật sống",
+        "PH 24949 (25017/25062/25590/26803/25013) · MY 614",
+        r"\b(?:signal\s+jammers?|gps\s+jammers?|wifi\s+jammers?|rf\s+jammers?|cell\s+phone\s+jammers?|"
+        r"wiretaps?|telephone\s+bugging|cable\s+tv\s+descramblers?|radar\s+scanners?|lockpicks?|lock\s+picks?|bump\s+keys?|card\s+skimmers?|"
+        r"android\s+tv\s+box|iptv\s+box|svicloud|evpad|unblock\s+tech|mxq\s+pro|"
+        r"netflix\s+account|spotify\s+premium|canva\s+pro|chatgpt\s+plus|cracked\s+software|pirated\s+software|"
+        r"digital\s+download|digital\s+product|activation\s+key|license\s+key|windows\s+key|"
+        r"robux|mlbb\s+diamonds?|codm\s+cp|valorant\s+points?|steam\s+wallet|game\s+credits?|"
+        r"concert\s+tickets?|event\s+tickets?|movie\s+tickets?|tiket\s+konsert|"
+        r"prop\s+money|uang\s+palsu|specimen\s+bank\s*notes?|gold\s+bars?|bullion|bitcoin|usdt|"
+        r"house\s+and\s+lot|condo\s+for\s+sale|lot\s+for\s+sale|used\s+car\s+for\s+sale|motorcycle\s+for\s+sale|"
+        r"gambling|casino|slot\s+machines?|roulette|sabong|cockfighting|tari\s+sabong|jueteng|"
+        r"lottery\s+tickets?|raffle\s+tickets?|judi|slot\s+gacor|chip\s+higgs\s+domino|chip\s+domino|togel|cờ\s+bạc|tài\s+xỉu|lô\s+đề|"
+        r"remove\s+barcode|buang\s+barcode|cut\s+qr\s+code|buang\s+qr|"
+        r"live\s+fish|live\s+betta|live\s+shrimp|live\s+turtle|live\s+bird|live\s+puppy|live\s+kitten|live\s+reptile|live\s+snake|"
+        r"elephant\s+ivory|gading\s+gajah|shark\s+fin|taxidermy|human\s+skull|human\s+bone|human\s+organ|nazi|swastika|hitler)\b",
+        r"\b(?:remote\s+control|replacement\s+remote|remote\s+for|storage\s+holder|wall\s+mount|rack|bracket|stand|money\s+detector|bill\s+checker)\b",
+    ),
+    (
+        "counterfeit_spam",
+        "Hàng nhái / Kéo giao dịch ngoài sàn / Link checkout ảo",
+        "PH 24949 (1375/3101/24989) · MY 614 · ID",
+        r"(?:https?://|www\.[a-z0-9\-]+\.[a-z]{2,}|(?:facebook|fb|instagram|tiktok)\.com/|t\.me/|wa\.me/)|"
+        r"\b(?:super\s+fake|aaa\s+grade|top\s+grade|1:1\s+copy|mirror\s+copy|high\s+copy|knockoffs?|bootlegs?|"
+        r"ua\s+pair|unauthorized\s+authentic|oem\s+replica|kw\s+super|grade\s+ori|miror\s+1:1|hàng\s+nhái|hang\s+nhai|"
+        r"live\s+selling\s+checkout|live\s+checkout\s+link|mine\s+checkout|for\s+live\s+checkout|"
+        r"checkout\s+link\s+only|do\s+not\s+checkout|shipping\s+fee\s+only|link\s+checkout\s+live|khusus\s+live\s+checkout|"
+        r"gcash\s+direct|outside\s+shopee)\b",
+        r"\b(?:money\s+detector|counterfeit\s+detector|bill\s+checker)\b",
+    ),
+)
+
+_SHOPEE_POLICY_COMPILED = tuple(
+    (key, label, src, re.compile(pat, re.I), re.compile(exc, re.I) if exc else None)
+    for key, label, src, pat, exc in _SHOPEE_POLICY_RULE_SPECS
+)
+
+
+def get_shopee_policy_groups() -> list[dict]:
+    """Danh sách tóm tắt các nhóm luật vi phạm Shopee (PH 24949 + MY 614 + ID 19582) cho giao diện."""
+    return [{"key": k, "label": lbl, "sources": src} for k, lbl, src, _p, _e in _SHOPEE_POLICY_RULE_SPECS]
+
+
+def match_shopee_policy_violation(name: str) -> tuple[str | None, str, str]:
+    """Kiểm tra tên sản phẩm theo bộ luật Shopee Listing Violations (PH/MY/ID).
+    Trả về (group_key, group_label, matched_term) hoặc (None, '', '')."""
+    s = unicodedata.normalize("NFC", str(name or "")).strip()
+    if not s:
+        return None, "", ""
+    for key, label, _src, pat, exc in _SHOPEE_POLICY_COMPILED:
+        m = pat.search(s)
+        if m and not (exc and exc.search(s)):
+            return key, label, m.group(0).strip()
+    return None, "", ""
+
+
 def is_product_blacklisted(product: dict, blacklist_data: dict | None = None) -> tuple[bool, str]:
-    """Kiểm tra sản phẩm có vi phạm Blacklist không. Trả về (is_blacklisted, lý do)."""
+    """Kiểm tra sản phẩm có vi phạm Blacklist / Luật Shopee PH-MY-ID / Thương hiệu bản quyền không."""
     bl = blacklist_data if blacklist_data is not None else get_blacklist()
     if not bl.get("enabled", True):
         return False, ""
@@ -1167,7 +1386,7 @@ def is_product_blacklisted(product: dict, blacklist_data: dict | None = None) ->
     if iid_str and iid_str in blacklisted_ids:
         return True, f"ID {iid_str} nằm trong danh sách đen (Blacklist)"
 
-    # 2. Kiểm tra Từ khóa cấm trong tên sản phẩm (theo ranh giới từ, xem _compile_blacklist_keywords)
+    # 2. Kiểm tra tên sản phẩm
     name = product.get("name") or ""
     if not str(name).strip():
         return False, ""
@@ -1176,7 +1395,37 @@ def is_product_blacklisted(product: dict, blacklist_data: dict | None = None) ->
     if hit:
         return True, f"Chứa từ khóa cấm '{hit}'"
 
+    # 3. Bộ luật Listing Violations đa thị trường Shopee (PH 24949 + MY 614 + ID 19582)
+    if bl.get("filter_shopee_policy", True):
+        _gkey, glabel, term = match_shopee_policy_violation(name)
+        if _gkey:
+            return True, f"Vi phạm CS Shopee [{glabel}]: '{term}'"
+
+    # 4. Thương hiệu / Bản quyền (IP Infringement)
+    if bl.get("filter_brand_policy", True):
+        brand_hit = _match_blacklist_keyword(name, bl.get("brand_keywords", []))
+        if brand_hit:
+            return True, f"Vi phạm thương hiệu / bản quyền ('{brand_hit}')"
+
     return False, ""
+
+
+_POLICY_VIOLATION_ERR_RE = re.compile(
+    r"safety|policy|nsfw|prohibited|copyright|trademark|violat|"
+    r"vi\s*phạm|bản\s*quyền|kiểm\s*duyệt|từ\s*chối\s*(?:nội\s*dung|sản\s*xuất|tạo)|"
+    r"logo\s*thương\s*hiệu|thuốc\s*(?:lá|thú\s*y)|veterinary|không\s*làm\s*tvc|"
+    r"không\s*(?:thể\s*tạo|thể\s*làm|làm)\s*video[^\n]{0,50}(?:cho\s*(?:sản\s*phẩm|mẫu|món)|được)|"
+    r"against\s*(?:our|the)\s*polic",
+    re.I,
+)
+
+
+def is_policy_violation_error(message: str) -> bool:
+    """Nhận diện lỗi do chính sản phẩm vi phạm chính sách/bản quyền (không phải lỗi tài khoản hay lỗi dịch vụ Muse)."""
+    msg = str(message or "")
+    if not msg or is_account_fault(msg):
+        return False
+    return bool(_POLICY_VIOLATION_ERR_RE.search(msg))
 
 
 def _nvenc_try_order(use_gpu: bool) -> list[bool]:
@@ -1404,11 +1653,13 @@ def normalize_and_filter_products(
     min_monthly_sold: int = 0,
     min_price: float = 0.0,
     max_price: float | None = None,
-) -> tuple[list[dict], int]:
-    """Chuẩn hóa dữ liệu sản phẩm và lọc chặt theo thông số + Blacklist."""
+    return_rejected: bool = False,
+) -> tuple:
+    """Chuẩn hóa dữ liệu sản phẩm và lọc chặt theo thông số + Blacklist/Thương hiệu."""
     bl = get_blacklist()
     blacklisted_count = 0
     blacklisted_samples = []
+    rejected_items: list[dict] = []
 
     products = []
     for item in raw:
@@ -1439,10 +1690,11 @@ def normalize_and_filter_products(
         if min_monthly_sold > 0 and ms_raw is not None and (ms_val or 0) < min_monthly_sold:
             continue
 
-        # Kiểm tra Blacklist
+        # Kiểm tra Blacklist & thương hiệu/bản quyền
         is_bl, reason = is_product_blacklisted(p, bl)
         if is_bl:
             blacklisted_count += 1
+            rejected_items.append({"item_id": p.get("item_id"), "reason": reason})
             if len(blacklisted_samples) < 5:
                 blacklisted_samples.append(f"SP {p.get('item_id')}: {reason}")
             continue
@@ -1465,7 +1717,33 @@ def normalize_and_filter_products(
     if blacklisted_count > 0:
         log.info("🚫 Blacklist đã loại bỏ %d sản phẩm vi phạm (%s)", blacklisted_count, "; ".join(blacklisted_samples))
 
+    if return_rejected:
+        return products, blacklisted_count, rejected_items
     return products, blacklisted_count
+
+
+def mark_blacklisted_jobs_failed(
+    server_url: str | None,
+    api_key: str | None,
+    item_ids: list,
+) -> int:
+    """Đánh dấu failed trên Server cho các SP vừa bị lọc Blacklist lúc claim để không còn kẹt ở trạng thái processing."""
+    clean_ids = [str(i).strip() for i in (item_ids or []) if str(i).strip()]
+    if not clean_ids:
+        return 0
+    import concurrent.futures
+    done = 0
+
+    def _one(iid: str) -> bool:
+        return report_job_completion(server_url, api_key, iid, "failed", None)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="bl_fail") as ex:
+        for ok in ex.map(_one, clean_ids):
+            if ok:
+                done += 1
+    if done:
+        log.info("🗑️ [Blacklist DB] Đã đánh dấu bỏ qua (failed) %d/%d SP vi phạm trên Server", done, len(clean_ids))
+    return done
 
 
 def claim_jobs_from_server(
@@ -1482,7 +1760,8 @@ def claim_jobs_from_server(
     min_price: float = 0.0,
     max_price: float = None,
     return_stats: bool = False,
-) -> list[dict] | tuple[list[dict], int]:
+    return_rejected: bool = False,
+) -> list[dict] | tuple:
     """Nhận lô sản phẩm từ Server PostgreSQL trung tâm của Shopee và tự động lọc Blacklist."""
     server_url = server_url or _env_server_url()
     api_key = api_key or _env_api_key()
@@ -1511,7 +1790,7 @@ def claim_jobs_from_server(
     res = call_seed_api(server_url, api_key, "POST", "/api/thinaptm/claim-jobs", payload)
     raw = res.get("products", []) if isinstance(res, dict) else []
 
-    products, blacklisted_count = normalize_and_filter_products(
+    products, blacklisted_count, rejected = normalize_and_filter_products(
         raw,
         min_item_id=min_item_id,
         min_commission=min_commission,
@@ -1519,8 +1798,11 @@ def claim_jobs_from_server(
         min_monthly_sold=min_monthly_sold,
         min_price=min_price,
         max_price=max_price,
+        return_rejected=True,
     )
 
+    if return_rejected:
+        return products, blacklisted_count, rejected
     if return_stats:
         return products, blacklisted_count
     return products
