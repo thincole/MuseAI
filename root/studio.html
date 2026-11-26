@@ -4205,6 +4205,27 @@
     return "even";
   }
 
+  let _liveBatchRefreshWorkers = null;
+  let _liveThreadsDebounce = null;
+
+  function _notifyLiveBatchThreadsChanged(immediate = false) {
+    if (!isShopeeBatchRunning || typeof _liveBatchRefreshWorkers !== "function") return;
+    if (_liveThreadsDebounce) {
+      clearTimeout(_liveThreadsDebounce);
+      _liveThreadsDebounce = null;
+    }
+    if (immediate) {
+      _liveBatchRefreshWorkers();
+    } else {
+      _liveThreadsDebounce = setTimeout(() => {
+        _liveThreadsDebounce = null;
+        if (isShopeeBatchRunning && typeof _liveBatchRefreshWorkers === "function") {
+          _liveBatchRefreshWorkers();
+        }
+      }, 450);
+    }
+  }
+
   function onShopeeThreadsChange() {
     const sel = document.getElementById("sp_threads_select");
     const numInput = document.getElementById("sp_threads");
@@ -4220,11 +4241,13 @@
     }
     updateShopeeThreadsHint();
     saveShopeeSettings();
+    _notifyLiveBatchThreadsChanged(true);
   }
 
   function onShopeeThreadsCustomChange() {
     updateShopeeThreadsHint();
     saveShopeeSettings();
+    _notifyLiveBatchThreadsChanged(false);
   }
 
   async function onFfmpegConcurrencyChange() {
@@ -5401,7 +5424,7 @@
 
     if (isShopeeBatchRunning) return;
 
-    const autoThreadsMode = isAutoThreadsSelected();
+    let autoThreadsMode = isAutoThreadsSelected();
 
     // Chọn quá sức máy (chế độ nhập tay) -> hỏi lại trước khi chạy (tránh lag/đơ cả máy)
     const cap = await fetchMachineCapacity();
@@ -5448,7 +5471,7 @@
     const form = getShopeeFormData();
     const outDir = form.out_dir || "";
     clearShopeePrefetch(); // bỏ dữ liệu chuẩn bị từ batch trước (có thể khác cài đặt)
-    const requestedWorkers = Math.max(1, parseInt(document.getElementById("sp_threads").value) || 2);
+    let requestedWorkers = Math.max(1, parseInt(document.getElementById("sp_threads").value) || 2);
 
     // Truy vấn trạng thái tài khoản mới nhất để biết chính xác số tài khoản còn sống
     let aliveAccounts = cachedAliveCount;
@@ -5781,7 +5804,11 @@
     async function refreshAllowedWorkers() {
       if (shopeeStopRequested || shopeeForceStopRequested) return;
       try {
-        const r = await fetch(`/api/shopee/capacity?mode=${schedMode}&requested=${requestedWorkers}`, { headers: getHeaders() });
+        // Đọc nóng chế độ & số luồng ngay trên giao diện để đổi luồng giữa chừng có tác dụng ngay lập tức
+        autoThreadsMode = isAutoThreadsSelected();
+        requestedWorkers = Math.max(1, parseInt(document.getElementById("sp_threads")?.value) || 2);
+        const curSchedMode = autoThreadsMode ? "auto" : "manual";
+        const r = await fetch(`/api/shopee/capacity?mode=${curSchedMode}&requested=${requestedWorkers}`, { headers: getHeaders() });
         if (!r.ok) return;
         const d = await r.json();
         const target = Math.max(1, parseInt(d.recommended_workers) || allowedWorkers);
@@ -5790,7 +5817,7 @@
           allowedWorkers = target;
           const congPct = Math.round((d.congestion_rate_5m || 0) * 100);
           appendShopeeLog(
-            `⚙️ [AIMD] Luồng chạy: ${prev} → ${target} | ${d.reason || "Điều chỉnh"} ` +
+            `⚙️ [${autoThreadsMode ? "AIMD" : "Điều phối"}] Luồng chạy: ${prev} → ${target} | ${d.reason || "Điều chỉnh"} ` +
             `(${Number(d.goodput_vpm || 0).toFixed(1)} vid/p, ~${Math.round(d.avg_duration_s || 0)}s/vid, nghẽn ${congPct}%, TK: ${d.accounts_usable}, ấm: ${d.warm_accounts || 0}, CPU: ${Math.round(d.cpu_pct || 0)}%, RAM: ${Math.round(d.ram_used_pct || 0)}%, FFmpeg: ${d.ffmpeg_active || 0}/${d.ffmpeg_limit || 0})`
           );
         }
@@ -5801,6 +5828,7 @@
       } catch (_) {}
     }
 
+    _liveBatchRefreshWorkers = refreshAllowedWorkers;
     if (initSched) renderLiveSchedulerHint(initSched);
     const pollMs = autoThreadsMode ? 10000 : 15000;
     const capacityTimer = setInterval(refreshAllowedWorkers, pollMs);
@@ -5879,6 +5907,7 @@
       waitedWorkers = workerPromises.length;
       await Promise.all(slice);
     }
+    _liveBatchRefreshWorkers = null;
     clearInterval(capacityTimer);
     clearShopeePrefetch();
     fetchMachineCapacity();

@@ -248,7 +248,8 @@ def _ffmpeg_global_thread_args() -> list[str]:
 def _video_encode_args(use_nvenc: bool) -> list[str]:
     if use_nvenc:
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23", "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-preset", "superfast", "-crf", "22", "-threads", "2", "-pix_fmt", "yuv420p"]
+    preset = os.environ.get("MUSE2API_FFMPEG_PRESET", "superfast").strip() or "superfast"
+    return ["-c:v", "libx264", "-preset", preset, "-crf", "23", "-threads", "2", "-pix_fmt", "yuv420p"]
 
 # ==================== CẤU HÌNH DATABASE NOVAGATE (đọc từ .env, không ghi cứng secret) ====================
 # Server URL / API key / Client ID để trong .env (file này đã được .gitignore) để không lộ khi commit.
@@ -2246,27 +2247,27 @@ def ghep_anh_12s(
 
         total_image_frames = int(round(image_dur * fps_int))
 
-        # Hiệu ứng phóng to mượt mà (Zoom-In) 1.0x -> 1.3x
-        w_scale = int(width * 1.3)
-        if w_scale % 2 != 0: w_scale += 1
-        h_scale = int(height * 1.3)
-        if h_scale % 2 != 0: h_scale += 1
-
-        zoom_step = 0.3 / max(1, total_image_frames)
-        zoom_expr = f"min(zoom+{zoom_step:.6f},1.3)"
+        # Hiệu ứng phóng to mượt mà (Zoom-In) 1.0x -> 1.25x trực tiếp ở đúng kích thước width x height
+        # trong không gian yuv420p + fast_bilinear (nhanh gấp ~4x so với upscale 1.3x + bicubic trên RGB/YUV444).
+        zoom_step = 0.25 / max(1, total_image_frames)
+        zoom_expr = f"min(zoom+{zoom_step:.6f},1.25)"
         x_expr = "iw/2-(iw/zoom/2)"
         y_expr = "ih/2-(ih/zoom/2)"
 
-        # Video AI nguyên bản, không làm chậm, cắt chuẩn video_dur.
-        # Bỏ scale thừa trên [0:v] khi kích thước video nguồn đã đúng width x height.
-        # setsar=1 (cả 2 đoạn): một số clip Muse có tỉ lệ điểm ảnh lạ (SAR 16:9, 1124:1125...) -> ép về 1:1.
+        # Video AI nguyên bản, cắt chuẩn video_dur; chỉ tpad khi clip thật sự ngắn hơn video_dur (hoặc chưa đo được)
+        # để tránh nhân bản thừa cả 8s frame rồi cắt bỏ.
+        need_pad = (probed_dur is None) or (probed_dur < (video_dur - 0.05))
         scale_v0 = "" if has_dims else f"scale={width}:{height}:flags=fast_bilinear,"
-        v_part = f"[0:v]{scale_v0}fps={fps_int},tpad=stop_mode=clone:stop_duration={video_dur},trim=0:{video_dur},setsar=1,setpts=PTS-STARTPTS[v_part]"
+        tpad_v0 = ""
+        if need_pad:
+            pad_sec = max(0.5, video_dur - (probed_dur or 0.0) + 0.5)
+            tpad_v0 = f"tpad=stop_mode=clone:stop_duration={pad_sec:.2f},"
+        v_part = f"[0:v]{scale_v0}fps={fps_int},{tpad_v0}trim=0:{video_dur},setsar=1,setpts=PTS-STARTPTS[v_part]"
 
-        # Outro ảnh chuyển động phóng to (zoom-in) — chỉ đọc 1 khung ảnh rồi zoompan sinh ra đúng total_image_frames
+        # Outro ảnh chuyển động phóng to (zoom-in): đưa về yuv420p trước zoompan để giảm 3x lượng pixel chroma phải xử lý
         i_v = (
-            f"[1:v]scale={w_scale}:{h_scale}:force_original_aspect_ratio=increase:flags=fast_bilinear,"
-            f"crop={w_scale}:{h_scale},"
+            f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase:flags=fast_bilinear,"
+            f"crop={width}:{height},format=yuv420p,"
             f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height}:fps={fps_int},"
             f"trim=0:{image_dur},setsar=1,setpts=PTS-STARTPTS[i_v]"
         )
@@ -2275,10 +2276,11 @@ def ghep_anh_12s(
         if has_audio:
             fade_dur = 0.6
             fade_start = max(0.0, video_dur - fade_dur)
-            # Làm mượt âm thanh: chuẩn hóa stereo 48kHz, pad nếu thiếu, fade-out nhẹ 0.6s cuối video AI
+            # Làm mượt âm thanh: chuẩn hóa stereo 48kHz, chỉ apad khi clip ngắn hơn video_dur, fade-out 0.6s cuối AI
+            apad_a0 = f"apad=whole_dur={video_dur}," if need_pad else ""
             a_part = (
                 f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-                f"apad=whole_dur={video_dur},atrim=0:{video_dur},"
+                f"{apad_a0}atrim=0:{video_dur},"
                 f"afade=t=out:st={fade_start:.2f}:d={fade_dur:.2f},asetpts=PTS-STARTPTS[a_part]"
             )
             i_a = f"anullsrc=r=48000:cl=stereo,atrim=0:{image_dur},asetpts=PTS-STARTPTS[i_a]"
@@ -2293,15 +2295,17 @@ def ghep_anh_12s(
         filter_complex_str = "; ".join(filter_parts)
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-        # -reinit_filter 0: một số clip Muse đổi định dạng điểm ảnh giữa chừng (vd 36 khung đầu yuv444p rồi yuv420p)
-        # -> FFmpeg khởi tạo lại chuỗi bộ lọc, mốc thời gian quay về 0 và vứt ~35 khung -> video ra 10.54s thay vì 12s.
+        # -reinit_filter 0: tránh FFmpeg reset filter khi clip Muse đổi pix_fmt giữa chừng.
+        # -sws_flags fast_bilinear: tăng tốc mạnh bộ lọc zoompan đơn luồng.
         base_cmd = [
             "ffmpeg", "-y",
             *_ffmpeg_global_thread_args(),
-            "-reinit_filter", "0", "-i", video_path,
+            "-sws_flags", "fast_bilinear",
+            "-threads", "2", "-reinit_filter", "0", "-i", video_path,
             "-i", image_path,
             "-filter_complex", filter_complex_str,
             *map_args,
+            "-max_muxing_queue_size", "1024",
         ]
     except Exception as e:
         log.warning("Lỗi chuẩn bị ghép video 12s: %s", e)
@@ -2314,7 +2318,7 @@ def ghep_anh_12s(
             def _build(try_gpu: bool) -> list[str]:
                 cmd = list(base_cmd) + _video_encode_args(try_gpu)
                 if has_audio:
-                    cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                    cmd.extend(["-c:a", "aac", "-b:a", "128k"])
                 cmd.extend(["-movflags", "+faststart", output_path])
                 return cmd
 
