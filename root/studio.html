@@ -1048,6 +1048,14 @@
       <button class="btn-header" onclick="refreshAll()" title="Làm mới trạng thái">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
       </button>
+
+      <button class="btn-header" id="btnToggleConsole" onclick="toggleDesktopConsole()" style="display:none;" title="Hiện hoặc ẩn cửa sổ CMD log chạy ngầm kèm phần mềm">
+        🖥️ Hiện CMD
+      </button>
+
+      <button class="btn-header" id="btnExitDesktop" onclick="exitDesktopApp()" style="display:none;background:rgba(239,68,68,0.16);border:1px solid rgba(239,68,68,0.45);color:#fca5a5;" title="Thoát hẳn phần mềm (nút X góc trên sẽ chỉ thu nhỏ xuống Taskbar)">
+        ⏻ Thoát
+      </button>
     </div>
   </header>
 
@@ -1385,10 +1393,20 @@
             🔋 Tự động bỏ qua TK hết token khi giao việc <span style="color:var(--text-dim);">(mặc định tắt — xem gợi ý khi rê chuột)</span>
           </label>
 
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#f87171;cursor:pointer;margin-bottom:10px;" title="Ẩn khỏi bảng các TK đã bị khoá vì Muse ngắt kết nối (Muse is disconnected) hoặc phiên hết hạn. Chỉ ẩn trên giao diện, các TK này vẫn bị khoá và không được giao việc. Bỏ chọn để hiện lại và bấm 'Mở khoá' khi cần.">
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#f87171;cursor:pointer;margin-bottom:8px;" title="Ẩn khỏi bảng các TK đã bị khoá vì Muse ngắt kết nối (Muse is disconnected) hoặc phiên hết hạn. Chỉ ẩn trên giao diện, các TK này vẫn bị khoá và không được giao việc. Bỏ chọn để hiện lại và bấm 'Mở khoá' khi cần.">
             <input type="checkbox" id="hideLockedAccounts" onchange="onHideLockedChange()">
             🙈 Ẩn các TK bị khoá (Muse is disconnected) <span id="hiddenLockedCount" style="color:var(--text-dim);"></span>
           </label>
+
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:10px;" title="Khi bật: tự động quét định kỳ (30 phút/lần) và xóa các tài khoản quá số giờ cài đặt mà không tạo được video thành công nào (tính từ lần tạo video TC gần nhất, hoặc thời điểm thêm TK nếu chưa từng tạo TC). Luôn tự sao lưu tại data/backups/ trước khi xóa và không xóa TK đang chạy.">
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#fb923c;cursor:pointer;">
+              <input type="checkbox" id="autoDeleteStaleAccs" onchange="onAutoDeleteStaleChange()">
+              🧹 Tự xóa tài khoản nếu &gt;
+            </label>
+            <input type="number" id="autoDeleteStaleHours" value="50" min="1" max="720" onchange="onAutoDeleteStaleHoursChange()" style="width:54px;padding:1px 5px;border-radius:6px;border:1px solid rgba(251,146,60,0.45);background:#0d1117;color:#fdba74;font-size:12px;font-weight:700;text-align:center;">
+            <span style="font-size:12px;color:#fb923c;">giờ không tạo video thành công</span>
+            <span id="staleAccsCount" style="font-size:12px;color:var(--text-dim);"></span>
+          </div>
 
           <div style="background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.25);border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:10px;">
             <span style="font-size:20px;">🛡️</span>
@@ -2192,6 +2210,57 @@
     });
   });
 
+  function _renderDesktopConsoleBtn(visible) {
+    const btn = document.getElementById("btnToggleConsole");
+    if (!btn) return;
+    btn.style.display = "inline-flex";
+    btn.innerHTML = visible ? "🖥️ Ẩn CMD" : "🖥️ Hiện CMD";
+  }
+
+  async function initDesktopControls() {
+    if (!(window.pywebview && window.pywebview.api)) return;
+    const exitBtn = document.getElementById("btnExitDesktop");
+    if (exitBtn && window.pywebview.api.exit_app) {
+      exitBtn.style.display = "inline-flex";
+    }
+    if (window.pywebview.api.get_console_state) {
+      try {
+        const st = await window.pywebview.api.get_console_state();
+        if (st && st.has_console) {
+          _renderDesktopConsoleBtn(!!st.visible);
+        }
+      } catch (_) {}
+    }
+  }
+
+  async function toggleDesktopConsole() {
+    if (!(window.pywebview && window.pywebview.api && window.pywebview.api.toggle_console)) return;
+    try {
+      const res = await window.pywebview.api.toggle_console();
+      if (res && res.has_console) {
+        _renderDesktopConsoleBtn(!!res.visible);
+      }
+    } catch (_) {}
+  }
+
+  async function exitDesktopApp() {
+    if (!(window.pywebview && window.pywebview.api && window.pywebview.api.exit_app)) return;
+    const ok = confirm(
+      "Đóng hẳn phần mềm MuseAI Video Studio và dừng toàn bộ luồng Chrome đang chạy?\n\n" +
+      "(Lưu ý: bấm nút X góc trên chỉ thu nhỏ phần mềm xuống Taskbar để chạy ngầm 24/7.)"
+    );
+    if (!ok) return;
+    try {
+      await window.pywebview.api.exit_app();
+    } catch (_) {}
+  }
+
+  window.addEventListener("pywebviewready", () => {
+    initDesktopControls();
+    // Cập nhật lại trạng thái nút CMD sau khi cửa sổ chính tự ẩn CMD (~400ms sau shown)
+    setTimeout(initDesktopControls, 700);
+  });
+
   // Config loader
   async function initConfig() {
     try {
@@ -2200,6 +2269,7 @@
         const dCfg = await window.pywebview.api.get_desktop_config();
         if (dCfg && dCfg.api_key) API_KEY = dCfg.api_key;
         if (dCfg && dCfg.media_dir) document.getElementById("cfgMediaDir").value = dCfg.media_dir;
+        initDesktopControls();
       }
       
       // 2. Fetch config endpoint from FastAPI
@@ -2922,6 +2992,82 @@
     loadAccounts();
   }
 
+  function getAutoDeleteStaleHours() {
+    const el = document.getElementById("autoDeleteStaleHours");
+    const v = parseInt(el?.value, 10);
+    return Number.isNaN(v) ? 50 : Math.max(1, Math.min(720, v));
+  }
+
+  function _countStaleAccounts(accs, hours) {
+    if (!Array.isArray(accs) || !accs.length || !hours || hours <= 0) return 0;
+    const nowSec = Date.now() / 1000;
+    const cutoff = hours * 3600;
+    let cnt = 0;
+    for (const a of accs) {
+      if (!a || (a.busy_slots || 0) > 0) continue;
+      const lastOk = Number(a.last_success_at || 0);
+      const refTs = lastOk > 0 ? lastOk : Number(a.created_at || 0);
+      if (refTs > 0 && (nowSec - refTs) >= cutoff) cnt++;
+    }
+    return cnt;
+  }
+
+  function _updateStaleAccsCount(accs) {
+    const el = document.getElementById("staleAccsCount");
+    if (!el) return;
+    const hours = getAutoDeleteStaleHours();
+    const list = Array.isArray(accs) ? accs : cachedAccounts;
+    const n = _countStaleAccounts(list, hours);
+    const on = !!document.getElementById("autoDeleteStaleAccs")?.checked;
+    el.textContent = n > 0
+      ? `(hiện có ${n} TK quá ${hours}h chưa có video TC${on ? " · đang bật tự dọn 30p/lần" : ""})`
+      : (on ? `(đang bật tự dọn 30p/lần · hiện 0 TK quá ${hours}h)` : `(mặc định tắt · hiện 0 TK quá ${hours}h)`);
+  }
+
+  async function onAutoDeleteStaleChange() {
+    const on = !!document.getElementById("autoDeleteStaleAccs")?.checked;
+    const hours = getAutoDeleteStaleHours();
+    await saveShopeeSettings();
+    _updateStaleAccsCount(cachedAccounts);
+    if (!on) {
+      showToast("Đã tắt tự động xóa TK không tạo video thành công.", "info");
+      return;
+    }
+    const staleCnt = _countStaleAccounts(cachedAccounts, hours);
+    if (staleCnt > 0) {
+      const ok = confirm(
+        `Đã bật tự xóa TK quá ${hours}h không tạo video thành công.\n\n` +
+        `Hiện có ${staleCnt} tài khoản đã quá ${hours} giờ chưa có video thành công (không tính TK đang chạy).\n` +
+        `Bạn có muốn xóa ngay ${staleCnt} tài khoản này bây giờ không? (Hệ thống tự sao lưu tại data/backups/ trước khi xóa)`
+      );
+      if (ok) {
+        try {
+          const res = await fetch("/admin/accounts/prune-stale", {
+            method: "POST",
+            headers: getHeaders(),
+            body: JSON.stringify({ hours })
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+          showToast(`🧹 Đã xóa ${data.deleted || 0} TK quá ${hours}h không tạo video TC (còn ${data.remaining ?? 0} TK).`, "success");
+          await loadAccounts();
+        } catch (e) {
+          showToast(`Lỗi xóa TK quá hạn: ${e.message}`, "danger");
+        }
+        return;
+      }
+    }
+    showToast(`🧹 Đã bật tự xóa TK quá ${hours}h không tạo video thành công (tự quét mỗi 30 phút).`, "success");
+  }
+
+  async function onAutoDeleteStaleHoursChange() {
+    const el = document.getElementById("autoDeleteStaleHours");
+    const hours = getAutoDeleteStaleHours();
+    if (el) el.value = String(hours);
+    await saveShopeeSettings();
+    _updateStaleAccsCount(cachedAccounts);
+  }
+
   // Khôi phục lựa chọn "Ẩn TK bị khoá" của lần trước (nếu trình duyệt cho phép lưu)
   (function restoreHideLocked() {
     try {
@@ -3015,6 +3161,7 @@
       updateShopeeThreadsHint();
 
       _updateAccountDeleteButtons(accs);
+      _updateStaleAccsCount(accs);
 
       if (!accs || accs.length === 0) {
         cachedAliveCount = 0;
@@ -3942,6 +4089,16 @@
         if (elFf) elFf.value = String(Math.max(1, Math.min(64, parseInt(data.ffmpeg_concurrency) || 16)));
       }
       if (data.skip_exhausted_accounts !== undefined) document.getElementById("skipExhausted").checked = !!data.skip_exhausted_accounts;
+      if (data.auto_delete_stale_accounts !== undefined) {
+        const elAutoDel = document.getElementById("autoDeleteStaleAccs");
+        if (elAutoDel) elAutoDel.checked = !!data.auto_delete_stale_accounts;
+      }
+      if (data.auto_delete_stale_hours !== undefined) {
+        const elAutoH = document.getElementById("autoDeleteStaleHours");
+        const hVal = Math.max(1, Math.min(720, parseInt(data.auto_delete_stale_hours, 10) || 50));
+        if (elAutoH) elAutoH.value = String(hVal);
+      }
+      _updateStaleAccsCount(cachedAccounts);
       updateShopeeThreadsHint();
       onShopeeDurationChange();
       updateTempStitchButtonStatus();
@@ -4116,6 +4273,8 @@
       account_dispatch_mode: getShopeeDispatchMode(),
       ffmpeg_concurrency: Math.max(1, Math.min(64, parseInt(document.getElementById("sp_ffmpeg_threads")?.value) || 16)),
       skip_exhausted_accounts: !!document.getElementById("skipExhausted")?.checked,
+      auto_delete_stale_accounts: !!document.getElementById("autoDeleteStaleAccs")?.checked,
+      auto_delete_stale_hours: getAutoDeleteStaleHours(),
       naming: document.getElementById("sp_naming").value,
       out_dir: document.getElementById("sp_out_dir").value.trim(),
       limit: parseInt(document.getElementById("sp_limit").value) || 2000,

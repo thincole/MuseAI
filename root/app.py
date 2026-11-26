@@ -2334,6 +2334,47 @@ def bulk_delete_accounts(payload: dict = Body(default={}), _=Depends(admin_auth)
     }
 
 
+def _prune_stale_accounts_now(hours: float | None = None) -> list[dict]:
+    """Xóa các tài khoản quá `hours` giờ không tạo video thành công (đã sao lưu trong data/backups/) và đóng phiên Chrome."""
+    if store.is_hub_client():
+        return []
+    if hours is None:
+        cfg = _get_shopee_settings()
+        hours = float(cfg.get("auto_delete_stale_hours") or 50)
+    hours = max(1.0, min(720.0, float(hours or 50.0)))
+    removed = store.delete_stale_accounts(hours)
+    for item in removed:
+        try:
+            engine.close_session_for_account(item["id"])
+        except Exception:
+            pass
+    if removed:
+        labels = ", ".join(str(x.get("label") or x.get("id")) for x in removed[:6])
+        more = f" (+{len(removed) - 6} TK khác)" if len(removed) > 6 else ""
+        log.warning("🧹 [Tự xóa TK >%gh] Đã xóa %d tài khoản quá %g giờ không tạo video thành công (%s%s) — bản sao lưu tại data/backups/",
+                    hours, len(removed), hours, labels, more)
+    return removed
+
+
+@app.post("/admin/accounts/prune-stale")
+def prune_stale_accounts(payload: dict = Body(default={}), _=Depends(admin_auth)):
+    """Xóa ngay các tài khoản quá N giờ không tạo được video thành công (bỏ qua TK đang chạy, tự sao lưu trước khi xóa)."""
+    cfg = _get_shopee_settings()
+    raw_h = (payload or {}).get("hours")
+    try:
+        hours = max(1, min(720, int(raw_h if raw_h is not None else (cfg.get("auto_delete_stale_hours") or 50))))
+    except Exception:
+        hours = 50
+    removed = _prune_stale_accounts_now(hours)
+    return {
+        "ok": True,
+        "hours": hours,
+        "deleted": len(removed),
+        "removed": removed,
+        "remaining": len(store.list_accounts()),
+    }
+
+
 def _sync_from_manual_browser(aid: str) -> dict:
     """Nếu tài khoản đang mở cửa sổ Chrome thủ công (bằng nút Mở), tự động đọc cookie mới nhất
     qua cổng gỡ lỗi CDP và cập nhật vào kho lưu trữ, đồng thời mở khoá tài khoản."""
@@ -3569,7 +3610,9 @@ def _get_shopee_settings() -> dict:
         "account_dispatch_mode": "even",
         "threads_mode": "manual",
         "ffmpeg_concurrency": shopee_engine.FFMPEG_CONCURRENCY,
-        "skip_exhausted_accounts": True
+        "skip_exhausted_accounts": True,
+        "auto_delete_stale_accounts": False,
+        "auto_delete_stale_hours": 50,
     }
     if os.path.isfile(SHOPEE_SETTINGS_FILE):
         try:
@@ -3587,6 +3630,11 @@ def _get_shopee_settings() -> dict:
     default_settings["account_dispatch_mode"] = normalize_dispatch_mode(
         default_settings.get("account_dispatch_mode", "even")
     )
+    default_settings["auto_delete_stale_accounts"] = bool(default_settings.get("auto_delete_stale_accounts", False))
+    try:
+        default_settings["auto_delete_stale_hours"] = max(1, min(720, int(default_settings.get("auto_delete_stale_hours") or 50)))
+    except Exception:
+        default_settings["auto_delete_stale_hours"] = 50
     return default_settings
 
 
@@ -3617,6 +3665,13 @@ def save_shopee_settings(settings: dict):
         clean_settings["jobs_per_account"] = _apply_jobs_per_account(clean_settings["jobs_per_account"])
     if "account_dispatch_mode" in clean_settings:
         clean_settings["account_dispatch_mode"] = _apply_dispatch_mode(clean_settings["account_dispatch_mode"])
+    if "auto_delete_stale_accounts" in clean_settings:
+        clean_settings["auto_delete_stale_accounts"] = bool(clean_settings["auto_delete_stale_accounts"])
+    if "auto_delete_stale_hours" in clean_settings:
+        try:
+            clean_settings["auto_delete_stale_hours"] = max(1, min(720, int(clean_settings["auto_delete_stale_hours"] or 50)))
+        except Exception:
+            clean_settings["auto_delete_stale_hours"] = 50
     with open(SHOPEE_SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(clean_settings, f, ensure_ascii=False, indent=2)
     if "ffmpeg_concurrency" in clean_settings:
@@ -6561,10 +6616,11 @@ async def _startup():
 
 async def _maintenance_loop():
     """Việc nền định kỳ: làm mới danh sách proxy Webshare (10 phút), trả về hàng chờ SP kẹt `processing` (30 phút),
-    và tự dọn file tạm an toàn (mặc định 60 phút/lần) cho máy cắm 24/7."""
+    tự xóa TK quá N giờ không tạo video thành công (30 phút, khi người dùng bật), và tự dọn file tạm an toàn (60 phút)."""
     await asyncio.sleep(60)
     last_reclaim = 0.0
     last_proxy_sweep = 0.0
+    last_stale_prune = 0.0
     # Lần dọn temp đầu tiên chạy sau khi khởi động ~5 phút (không làm chậm lúc mở app)
     last_temp_cleanup = time.time() - max(0, CFG.temp_cleanup_interval_minutes * 60 - 240) if CFG.temp_cleanup_interval_minutes > 0 else 0.0
     while True:
@@ -6596,6 +6652,14 @@ async def _maintenance_loop():
                     log.info("🧹 [Dọn DB] Đã trả %d SP kẹt `processing` quá %g giờ về hàng chờ", n, hours)
         except Exception as exc:  # noqa: BLE001
             log.warning("Dọn SP processing treo lỗi: %s", exc)
+        try:
+            cfg = _get_shopee_settings()
+            if cfg.get("auto_delete_stale_accounts") and not store.is_hub_client() and (time.time() - last_stale_prune) >= 1800:
+                last_stale_prune = time.time()
+                stale_h = float(cfg.get("auto_delete_stale_hours") or 50)
+                await asyncio.to_thread(_prune_stale_accounts_now, stale_h)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("🧹 Tự xóa TK quá hạn định kỳ lỗi: %s", exc)
         try:
             _check_success_rate_alert()
         except Exception as exc:  # noqa: BLE001

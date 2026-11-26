@@ -632,6 +632,65 @@ class Store:
             self._COND.notify_all()
             return removed_ids
 
+    @staticmethod
+    def is_account_stale_no_success(acc: dict, max_hours: float, now_ts: float | None = None) -> bool:
+        """True nếu tài khoản đã quá `max_hours` giờ mà không tạo được video thành công nào.
+        - Đã từng tạo video thành công: tính từ `last_success_at`.
+        - Chưa từng tạo thành công: tính từ `created_at` (không xóa oan TK mới thêm chưa đủ ngưỡng giờ)."""
+        hours = float(max_hours or 0)
+        if hours <= 0:
+            return False
+        now = time.time() if now_ts is None else float(now_ts)
+        last_ok = float(acc.get("last_success_at") or 0)
+        if last_ok > 0:
+            ref_ts = last_ok
+        else:
+            created = float(acc.get("created_at") or 0)
+            if created <= 0:
+                return False
+            ref_ts = created
+        return (now - ref_ts) >= (hours * 3600.0)
+
+    def delete_stale_accounts(self, max_hours: float = 50.0) -> list[dict]:
+        """Xóa các tài khoản quá `max_hours` giờ không tạo video thành công (bỏ qua TK đang chạy).
+        Tự sao lưu kho hiện tại ra data/backups trước khi xóa. Trả về danh sách tóm tắt TK đã xóa."""
+        if self.is_hub_client():
+            return []
+        hours = max(1.0, min(720.0, float(max_hours or 50.0)))
+        now = time.time()
+        with self._COND:
+            self._sync_from_disk()
+            stale = []
+            for a in self.accounts:
+                aid = a.get("id")
+                if not aid:
+                    continue
+                if (self._BUSY_COUNT.get(aid, 0) + self._hub_remote_busy(aid)) > 0:
+                    continue
+                if self.is_account_stale_no_success(a, hours, now_ts=now):
+                    stale.append(a)
+            if not stale:
+                return []
+            if self.accounts:
+                self._save_accounts(force=True)
+                backup_accounts(self.cfg.accounts_file, force=True)
+            rem_set = {a["id"] for a in stale}
+            removed_info = [
+                {
+                    "id": a["id"],
+                    "label": a.get("label") or a["id"],
+                    "last_success_at": a.get("last_success_at"),
+                    "created_at": a.get("created_at"),
+                }
+                for a in stale
+            ]
+            self.accounts = [a for a in self.accounts if a["id"] not in rem_set]
+            for aid in rem_set:
+                self._purge_account_runtime(aid)
+            self._save_accounts(force=True)
+            self._COND.notify_all()
+            return removed_info
+
     def pick_account(self, preferred_id: str | None = None, rotate: bool = True,
                      force_rotate: bool = False, exclude_id: str | None = None) -> dict | None:
         """选择可用账号：优先复用当前已预热的健康账号（减少切号重连耗时），每满 15 次或遇错自动轮转。"""

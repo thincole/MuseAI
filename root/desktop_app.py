@@ -6,6 +6,7 @@ tích hợp trực tiếp máy chủ FastAPI & Browser Automation Engine.
 from __future__ import annotations
 
 import base64
+import ctypes
 import mimetypes
 import os
 import shutil
@@ -30,11 +31,91 @@ import shopee_engine
 import store
 
 
+# ==================== ĐIỀU KHIỂN CỬA SỔ CMD (WINDOWS) ====================
+_SW_HIDE = 0
+_SW_SHOW = 5
+
+
+def _get_console_hwnd() -> int:
+    if os.name != "nt":
+        return 0
+    try:
+        return int(ctypes.windll.kernel32.GetConsoleWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _disable_console_quick_edit() -> None:
+    """Tắt QuickEdit Mode của CMD để click nhầm vào cửa sổ đen không làm treo toàn bộ tiến trình Python."""
+    if os.name != "nt":
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        h_in = k32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(h_in, ctypes.byref(mode)):
+            # Bỏ ENABLE_QUICK_EDIT_MODE (0x0040), bật ENABLE_EXTENDED_FLAGS (0x0080)
+            new_mode = (mode.value & ~0x0040) | 0x0080
+            k32.SetConsoleMode(h_in, new_mode)
+    except Exception:
+        pass
+
+
+def _is_console_visible() -> bool:
+    hwnd = _get_console_hwnd()
+    if not hwnd:
+        return False
+    try:
+        return bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+    except Exception:
+        return False
+
+
+def _set_console_visible(visible: bool) -> bool:
+    hwnd = _get_console_hwnd()
+    if not hwnd:
+        return False
+    try:
+        ctypes.windll.user32.ShowWindow(hwnd, _SW_SHOW if visible else _SW_HIDE)
+        return _is_console_visible()
+    except Exception:
+        return False
+
+
+def _should_auto_hide_console() -> bool:
+    """Chỉ tự ẩn CMD khi mở qua trình chạy riêng (Chay_MESUAI.bat) hoặc đặt MUSE2API_HIDE_CONSOLE=1.
+    Đặt MUSE2API_SHOW_CONSOLE=1 để luôn giữ cửa sổ CMD khi debug."""
+    if os.name != "nt":
+        return False
+    if os.environ.get("MUSE2API_SHOW_CONSOLE", "").strip() == "1":
+        return False
+    hwnd = _get_console_hwnd()
+    if not hwnd:
+        return False
+    if os.environ.get("MUSE2API_HIDE_CONSOLE", "").strip() == "1":
+        return True
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        if ctypes.windll.kernel32.GetConsoleTitleW(buf, len(buf)):
+            if "museai" in (buf.value or "").lower():
+                return True
+    except Exception:
+        pass
+    try:
+        pids = (ctypes.c_uint32 * 8)()
+        cnt = ctypes.windll.kernel32.GetConsoleProcessList(pids, 8)
+        # <= 2 tiến trình gắn console (chỉ cmd.exe + python.exe do click đúp .bat) -> an toàn để tự ẩn
+        return 0 < cnt <= 2
+    except Exception:
+        return False
+
+
 class DesktopAPI:
     """Cầu nối giao tiếp 2 chiều giữa giao diện JavaScript và hệ điều hành Windows."""
 
     def __init__(self):
         self._window = None
+        self._allow_close = False
 
     def set_window(self, win):
         self._window = win
@@ -48,7 +129,36 @@ class DesktopAPI:
             "media_dir": CFG.media_dir,
             "chromium": CFG.chromium,
             "is_desktop": True,
+            "has_console": bool(_get_console_hwnd()),
+            "console_visible": _is_console_visible(),
+            "close_to_taskbar": os.environ.get("MUSE2API_CLOSE_TO_TASKBAR", "1").strip() != "0",
         }
+
+    def get_console_state(self) -> dict:
+        return {
+            "has_console": bool(_get_console_hwnd()),
+            "visible": _is_console_visible(),
+        }
+
+    def toggle_console(self) -> dict:
+        """Bật/tắt hiển thị cửa sổ CMD chạy ngầm kèm phần mềm."""
+        if not _get_console_hwnd():
+            return {"success": False, "has_console": False, "visible": False}
+        want = not _is_console_visible()
+        now_vis = _set_console_visible(want)
+        return {"success": True, "has_console": True, "visible": now_vis}
+
+    def exit_app(self) -> dict:
+        """Thoát hẳn phần mềm (bỏ qua cơ chế thu nhỏ xuống Taskbar khi bấm X) và dọn sạch Chrome/proxy."""
+        self._allow_close = True
+        if self._window:
+            def _do_destroy():
+                try:
+                    self._window.destroy()
+                except Exception:
+                    os._exit(0)
+            threading.Timer(0.05, _do_destroy).start()
+        return {"success": True}
 
     def choose_image(self) -> dict:
         """Mở hộp thoại chọn file ảnh chuẩn của Windows (Native OpenFileDialog)."""
@@ -230,6 +340,7 @@ def _start_background_server(err_box: dict | None = None):
 
 
 def main():
+    _disable_console_quick_edit()
     CFG.ensure_dirs()
     port = CFG.port or 18610
     server_url = f"http://127.0.0.1:{port}"
@@ -301,13 +412,46 @@ def main():
     )
     api.set_window(window)
 
+    # Ấn nút X (Close) -> thu nhỏ xuống Taskbar thay vì đóng app (trừ khi bấm nút "Thoát" trong giao diện
+    # hoặc đặt MUSE2API_CLOSE_TO_TASKBAR=0).
+    close_to_taskbar = os.environ.get("MUSE2API_CLOSE_TO_TASKBAR", "1").strip() != "0"
+
+    def _on_closing():
+        if api._allow_close or not close_to_taskbar:
+            return True
+
+        def _do_minimize():
+            try:
+                window.minimize()
+            except Exception:
+                pass
+
+        # Gọi minimize sau 50ms để WinForms hoàn tất hủy sự kiện FormClosing trước khi đổi WindowState
+        threading.Timer(0.05, _do_minimize).start()
+        return False
+
+    def _on_shown():
+        # Tự ẩn cửa sổ CMD ngay khi giao diện Desktop đã hiện lên (lỗi lúc khởi động trước đó vẫn thấy rõ trên CMD)
+        if _should_auto_hide_console():
+            threading.Timer(0.25, lambda: _set_console_visible(False)).start()
+
+    window.events.closing += _on_closing
+    window.events.shown += _on_shown
+
+    _cleanup_lock = threading.Lock()
+    _cleaned_up = {"done": False}
+
     def _cleanup():
+        with _cleanup_lock:
+            if _cleaned_up["done"]:
+                return
+            _cleaned_up["done"] = True
         print("[*] Đang đóng trình duyệt Chrome và dọn dẹp các tiến trình ngầm...")
         try:
             from app import engine
             engine.stop()
             engine.kill_orphaned_chromes()
-        except Exception as e:
+        except Exception:
             try:
                 from engine import engine
                 engine.stop()
@@ -367,6 +511,10 @@ def main():
     print(f"[*] Đang mở cửa sổ ứng dụng Desktop...")
     try:
         webview.start(gui="edgechromium", debug=False)
+    except BaseException:
+        # Nếu app crash bất thường khi CMD đang ẩn -> hiện lại CMD để người dùng thấy thông báo lỗi / pause không bị treo ẩn
+        _set_console_visible(True)
+        raise
     finally:
         _cleanup()
         print(f"[*] Đã đóng ứng dụng MuseAI Studio.")

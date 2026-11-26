@@ -18,6 +18,7 @@ import urllib.request
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -96,28 +97,29 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 _SCROLLER_JS = (
     "var __sc=(function(){"
     "var now=Date.now();var c=window.__m2aScroller;"
-    "function ok(e){if(!e||!e.isConnected)return false;var s=getComputedStyle(e);"
-    "return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;}"
-    "if(c&&c.el&&(now-c.ts)<1500&&ok(c.el))return c.el;"
-    "if(c&&!c.el&&(now-c.ts)<500)return null;"
-    "var els=[...document.querySelectorAll('*')].filter(function(e){"
-    "var s=getComputedStyle(e);"
-    "return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});"
-    "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
-    "var v={el:els[0]||null,ts:now};"
+    "if(c&&c.el&&c.el.isConnected&&(now-c.ts)<15000&&c.el.scrollHeight>c.el.clientHeight+50)return c.el;"
+    "if(c&&!c.el&&(now-c.ts)<5000)return null;"
+    "var best=null,bestH=0;"
+    "var els=document.querySelectorAll('main,section,div');"
+    "for(var i=0;i<els.length;i++){"
+    "var e=els[i];"
+    "if(e.clientHeight<120||e.scrollHeight<=e.clientHeight+100)continue;"
+    "var ov=getComputedStyle(e).overflowY;"
+    "if((ov==='auto'||ov==='scroll')&&e.scrollHeight>bestH){best=e;bestH=e.scrollHeight;}}"
+    "var v={el:best,ts:now};"
     "try{Object.defineProperty(window,'__m2aScroller',{value:v,writable:true,configurable:true,enumerable:false});}"
     "catch(e){window.__m2aScroller=v;}"
-    "return v.el;})();"
-    "if(__sc)__sc.scrollTop=__sc.scrollHeight;"
+    "return best;})();"
+    "if(__sc&&(__sc.scrollTop+__sc.clientHeight<__sc.scrollHeight-20))__sc.scrollTop=__sc.scrollHeight;"
 )
 
 _SCROLL_BOTTOM_JS = (
     "(function(){"
     + _SCROLLER_JS +
     "var s=document.scrollingElement||document.body;"
-    "s.scrollTop=s.scrollHeight;"
-    "var el=document.querySelector('textarea');"
-    "if(el)el.scrollIntoView({block:'end'});return 1;})()"
+    "if(s&&(s.scrollTop+s.clientHeight<s.scrollHeight-20))s.scrollTop=s.scrollHeight;"
+    "if(!__sc){var el=document.querySelector('textarea');if(el)el.scrollIntoView({block:'end'});}"
+    "return 1;})()"
 )
 
 
@@ -1421,7 +1423,7 @@ class MuseEngine:
                 st_raw = self.page.js("""(function(){
                     var bs=[].slice.call(document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]'))
                         .filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});
-                    var lastTxt = bs.length ? (bs[bs.length-1].innerText||'').trim() : '';
+                    var lastTxt = bs.length ? (bs[bs.length-1].textContent||'').trim() : '';
                     var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
@@ -1430,9 +1432,9 @@ class MuseEngine:
                     var lastUser = uGroups.length ? uGroups[uGroups.length-1] : null;
                     var lastUserIdx = lastUser ? allGroups.indexOf(lastUser) : -1;
                     var afterUserTxt = (lastUserIdx >= 0 ? allGroups.slice(lastUserIdx + 1) : [])
-                        .map(function(g){return (g.innerText||'').trim();}).join('\\n');
+                        .map(function(g){return (g.textContent||'').trim();}).join('\\n');
                     var alertTxt = [].slice.call(document.querySelectorAll('[role="alert"],[data-sonner-toast]'))
-                        .map(function(el){return (el.innerText||'').trim();}).join('\\n');
+                        .map(function(el){return (el.textContent||'').trim();}).join('\\n');
                     var attNodes = [].slice.call(document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]'))
                         .filter(function(a){return !a.closest('form, [class*=chat-user-bubble], [class*="group/msg"]');}).length;
                     var tail = (afterUserTxt + '\\n' + alertTxt).trim().slice(-700);
@@ -3123,21 +3125,95 @@ class MuseWorkerSession:
             pass
         log.warning("🔎 [Stuck Debug] TK %s (%s) state=%s screenshot=%s", self.account_id, reason, raw, shot or "n/a")
 
-    def _wait_poll_interval(self) -> float:
-        """Tự giãn nhịp kiểm tra DOM nhẹ theo tải của CHÍNH Chrome Shard chứa tab này để giảm nghẽn CDP/GIL."""
+    # Gộp cuộn đáy + lấy danh sách attachment + trạng thái chat trong 1 lần gọi CDP duy nhất,
+    # dùng textContent thay cho innerText để KHÔNG kích hoạt layout reflow toàn trang trên 80-100 tab.
+    _WORKER_WAIT_POLL_JS = (
+        "(function(){"
+        + _SCROLLER_JS +
+        "var list=[];var seen=new Set();"
+        "function addEl(el,tid){"
+        "if(!el||seen.has(el))return;"
+        "seen.add(el);"
+        "if(el.closest('form,[class*=chat-user-bubble],[class*=\"group/msg\"]'))return;"
+        "var v=el.querySelector('video')||(el.tagName==='VIDEO'?el:null);"
+        "var img=el.querySelector('img')||(el.tagName==='IMG'?el:null);"
+        "var isVid=(tid||'').indexOf('video')!==-1||!!v;"
+        "var primary=isVid?(v||img):(img||v);"
+        "var vSrc=v?(v.currentSrc||v.src||(v.querySelector('source')&&v.querySelector('source').src)||''):'';"
+        "var iSrc=img?(img.currentSrc||img.src||''):'';"
+        "var src=isVid?(vSrc||iSrc):(iSrc||vSrc);"
+        "if(src&&!seen.has(src)){"
+        "seen.add(src);"
+        "list.push({tid:tid||el.getAttribute('data-testid')||(isVid?'video':'image'),"
+        "hasVideo:!!v,hasImg:!!img,src:src,vSrc:vSrc,iSrc:iSrc,"
+        "w:primary?(primary.videoWidth||primary.naturalWidth||0):0,"
+        "h:primary?(primary.videoHeight||primary.naturalHeight||0):0});}}"
+        "var attEls=document.querySelectorAll('[data-testid^=\"hatch-chat-attachment-presentation-\"]');"
+        "var attNodes=0;"
+        "for(var i=0;i<attEls.length;i++){"
+        "var a=attEls[i];"
+        "if(!a.closest('form,[class*=chat-user-bubble],[class*=\"group/msg\"]'))attNodes++;"
+        "addEl(a,a.getAttribute('data-testid'));}"
+        "var mediaEls=document.querySelectorAll('div[class*=\"hatch-agent-bubble-bg\"] img,div[class*=\"hatch-agent-bubble-bg\"] video');"
+        "for(var j=0;j<mediaEls.length;j++){"
+        "var m=mediaEls[j];"
+        "var ms=m.currentSrc||m.src||(m.querySelector&&m.querySelector('source')&&m.querySelector('source').src)||'';"
+        "if(ms&&ms.indexOf('avatar')===-1&&ms.indexOf('emoji')===-1)addEl(m.parentElement||m,'agent-media');}"
+        "var bs=[].slice.call(document.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
+        ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
+        "var lastTxt=bs.length?(bs[bs.length-1].textContent||'').trim():'';"
+        "var hasStop=!!(document.querySelector('[data-testid=\"hatch-composer-stop-button\"]')"
+        "||document.querySelector('button[aria-label*=\"Stop\" i]')"
+        "||document.querySelector('button[aria-label*=\"停止\"]'));"
+        "var allGroups=[].slice.call(document.querySelectorAll('[class*=\"group/msg\"]'));"
+        "var groups=allGroups.filter(function(g){return g.querySelector('[class*=\"chat-user-bubble\"]');});"
+        "var lastUser=groups.length?groups[groups.length-1]:null;"
+        "var lastUserIdx=lastUser?allGroups.indexOf(lastUser):-1;"
+        "var afterUserTxt=(lastUserIdx>=0?allGroups.slice(lastUserIdx+1):[])"
+        ".map(function(g){return (g.textContent||'').trim();}).join('\\n');"
+        "var alertTxt=[].slice.call(document.querySelectorAll('[role=\"alert\"],[data-sonner-toast]'))"
+        ".map(function(el){return (el.textContent||'').trim();}).join('\\n');"
+        "var tail=(afterUserTxt+'\\n'+alertTxt).trim().slice(-700);"
+        "var outRe=/đã\\s*hết\\s*mức\\s*sử\\s*dụng|out\\s*of\\s*usage/i;"
+        "var outOfUsage=outRe.test(tail)||outRe.test(lastTxt);"
+        "window.__m2aPollTick=(window.__m2aPollTick||0)+1;"
+        "if(!outOfUsage){"
+        "var dlg=document.querySelector('[role=\"dialog\"]');"
+        "if(dlg&&outRe.test(dlg.textContent||''))outOfUsage=true;"
+        "else if((!hasStop||(window.__m2aPollTick%4===0))&&document.body&&outRe.test(document.body.textContent||''))outOfUsage=true;}"
+        "var undelivered=!!(lastUser&&/Delivery not confirmed/i.test(lastUser.textContent||''));"
+        "var ta=document.querySelector('textarea');"
+        "var taLen=ta?(ta.value||'').trim().length:0;"
+        "return JSON.stringify({atts:list,cnt:bs.length,txt:lastTxt,stop:hasStop,tail:tail,"
+        "out_of_usage:outOfUsage,undelivered:undelivered,"
+        "new_thread:location.pathname==='/thread/new',"
+        "user_cnt:groups.length,ta_len:taLen,att_nodes:attNodes});})()"
+    )
+
+    def _wait_poll_interval(self, elapsed: float = 0.0, has_stop: bool = False, has_pending_att: bool = False) -> float:
+        """Tự giãn nhịp poll theo TỔNG số luồng đang chạy (giảm tranh Python GIL/CDP) và giai đoạn render:
+        - 8s đầu hoặc đang chờ gắn video xong (!has_stop / có att_nodes): poll nhanh 1.0–1.6s.
+        - Đang render giữa chừng (has_stop=True, elapsed>=8s): giãn 1.6s -> 2.3s -> 3.2s (+ jitter ±0.25s tránh đồng bộ đánh thức)."""
+        try:
+            _total, active = self.engine.active_session_counts()
+        except Exception:
+            active = 0
         shard = getattr(self, "shard", None)
-        if shard is not None:
-            load = int(getattr(shard, "active_contexts", 0) or 0)
+        shard_load = int(getattr(shard, "active_contexts", 0) or 0) if shard is not None else active
+        eff_load = max(active, shard_load)
+
+        if has_stop and elapsed >= 8.0 and not has_pending_att:
+            if eff_load >= 60:
+                base = 3.2
+            elif eff_load >= 25:
+                base = 2.3
+            else:
+                base = 1.6
+        elif elapsed < 8.0 or has_pending_att:
+            base = 1.4 if eff_load >= 60 else (1.1 if eff_load >= 25 else 0.8)
         else:
-            try:
-                _total, load = self.engine.active_session_counts()
-            except Exception:
-                return 0.6
-        if load > 45:
-            return 1.3
-        if load > 20:
-            return 0.95
-        return 0.6
+            base = 1.8 if eff_load >= 60 else (1.35 if eff_load >= 25 else 0.95)
+        return max(0.5, base + random.uniform(-0.22, 0.22))
 
     def _wait_attachment(self, baseline_src: str, timeout: int, expect: str,
                          on_progress=None, base_agent_cnt: int = 0,
@@ -3154,12 +3230,18 @@ class MuseWorkerSession:
         last_seen_txt = ""
         last_seen_att_nodes = base_att_cnt
         resent_once = False
+        prev_has_stop = False
+        prev_has_pending_att = False
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("Máy khách đã ngắt kết nối, dừng tác vụ tạo")
-            time.sleep(self._wait_poll_interval())
-            self._scroll_bottom()
-            atts = self.attachments()
+            time.sleep(self._wait_poll_interval(time.time() - t_start, prev_has_stop, prev_has_pending_att))
+            try:
+                st_raw = self.page.js(self._WORKER_WAIT_POLL_JS)
+                st = json.loads(st_raw) if st_raw else {}
+            except Exception:
+                st = {}
+            atts = st.get("atts") if isinstance(st.get("atts"), list) else self.attachments()
             att = None
             fallback_att = None
             if atts:
@@ -3211,46 +3293,14 @@ class MuseWorkerSession:
                     on_progress(prog)
                 except Exception:
                     pass
-            try:
-                st_raw = self.page.js("""(function(){
-                    var bs=[].slice.call(document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]'))
-                        .filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});
-                    var lastTxt = bs.length ? (bs[bs.length-1].innerText||'').trim() : '';
-                    var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
-                        || document.querySelector('button[aria-label*="Stop" i]')
-                        || document.querySelector('button[aria-label*="停止"]'));
-                    var bodyTxt = document.body ? (document.body.innerText||'') : '';
-                    var outOfUsage = /đã\\s*hết\\s*mức\\s*sử\\s*dụng|out\\s*of\\s*usage/i.test(bodyTxt);
-                    // Chữ đỏ "Delivery not confirmed" nằm trong nhóm tin nhắn của CHÍNH prompt vừa gửi
-                    // (không lấy chữ "Connecting..." ở thanh bên vì có thể là trạng thái cũ).
-                    var allGroups = [].slice.call(document.querySelectorAll('[class*="group/msg"]'));
-                    var groups = allGroups.filter(function(g){return g.querySelector('[class*="chat-user-bubble"]');});
-                    var lastUser = groups.length ? groups[groups.length-1] : null;
-                    var lastUserIdx = lastUser ? allGroups.indexOf(lastUser) : -1;
-                    var afterUserTxt = (lastUserIdx >= 0 ? allGroups.slice(lastUserIdx + 1) : [])
-                        .map(function(g){return (g.innerText||'').trim();}).join('\\n');
-                    var alertTxt = [].slice.call(document.querySelectorAll('[role="alert"],[data-sonner-toast]'))
-                        .map(function(el){return (el.innerText||'').trim();}).join('\\n');
-                    var attNodes = [].slice.call(document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]'))
-                        .filter(function(a){return !a.closest('form, [class*=chat-user-bubble], [class*="group/msg"]');}).length;
-                    var tail = (afterUserTxt + '\\n' + alertTxt).trim().slice(-700);
-                    var undelivered = !!(lastUser && /Delivery not confirmed/i.test(lastUser.innerText||''));
-                    var ta = document.querySelector('textarea');
-                    var taLen = ta ? (ta.value || '').trim().length : 0;
-                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail,
-                                           out_of_usage: outOfUsage, undelivered: undelivered,
-                                           new_thread: location.pathname === '/thread/new',
-                                           user_cnt: groups.length, ta_len: taLen, att_nodes: attNodes});
-                })()""")
-                st = json.loads(st_raw) if st_raw else {}
-            except Exception:
-                st = {}
             tail = st.get("tail") or ""
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
             cur_att_nodes = int(st.get("att_nodes") or 0)
             has_pending_att = cur_att_nodes > base_att_cnt
+            prev_has_stop = has_stop
+            prev_has_pending_att = has_pending_att
 
             active_agent_txt = cur_txt if cur_cnt > base_agent_cnt else ""
             combined_txt = f"{active_agent_txt}\n{tail}".strip()
