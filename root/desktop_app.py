@@ -412,25 +412,251 @@ def main():
     )
     api.set_window(window)
 
-    # Ấn nút X (Close) -> thu nhỏ xuống Taskbar thay vì đóng app (trừ khi bấm nút "Thoát" trong giao diện
-    # hoặc đặt MUSE2API_CLOSE_TO_TASKBAR=0).
-    close_to_taskbar = os.environ.get("MUSE2API_CLOSE_TO_TASKBAR", "1").strip() != "0"
+    # ==================== KHAY HỆ THỐNG (SYSTEM TRAY GÓC PHẢI) ====================
+    # Dùng trực tiếp System.Windows.Forms.NotifyIcon của WinForms (có sẵn cùng pywebview, không cần cài thư viện ngoài).
+    class _SystemTrayController:
+        def __init__(self, win, api_obj):
+            self._win = win
+            self._api = api_obj
+            self.ready = False
+            self._balloon_shown = False
+            self._form = None
+            self._notify_icon = None
+            self._menu = None
+            self._icon = None
+            self._bmp = None
+            self._callbacks = []  # giữ tham chiếu mạnh tránh Python GC thu hồi delegate WinForms
+
+        def _load_icon(self, Drawing, Drawing2D):
+            ico_path = os.path.join(BASE_DIR, "muse-logo.ico")
+            if os.path.isfile(ico_path):
+                try:
+                    return Drawing.Icon(ico_path), None
+                except Exception:
+                    pass
+            # Fallback: tự vẽ biểu tượng chữ M màu xanh-tím sắc nét 32x32 nếu thiếu muse-logo.ico
+            bmp = Drawing.Bitmap(32, 32)
+            g = Drawing.Graphics.FromImage(bmp)
+            g.SmoothingMode = Drawing2D.SmoothingMode.AntiAlias
+            brush = Drawing2D.LinearGradientBrush(
+                Drawing.Rectangle(0, 0, 32, 32),
+                Drawing.Color.FromArgb(255, 79, 70, 229),
+                Drawing.Color.FromArgb(255, 14, 165, 233),
+                45.0,
+            )
+            g.FillRectangle(brush, 2, 2, 28, 28)
+            font = Drawing.Font("Segoe UI", 16.0, Drawing.FontStyle.Bold)
+            sf = Drawing.StringFormat()
+            sf.Alignment = Drawing.StringAlignment.Center
+            sf.LineAlignment = Drawing.StringAlignment.Center
+            g.DrawString("M", font, Drawing.SolidBrush(Drawing.Color.White), Drawing.RectangleF(0.0, 1.0, 32.0, 32.0), sf)
+            g.Dispose()
+            return Drawing.Icon.FromHandle(bmp.GetHicon()), bmp
+
+        def setup(self) -> bool:
+            if os.name != "nt" or self.ready:
+                return self.ready
+            try:
+                import clr
+                clr.AddReference("System.Windows.Forms")
+                clr.AddReference("System.Drawing")
+                from System import Action
+                import System.Windows.Forms as WinForms
+                import System.Drawing as Drawing
+                import System.Drawing.Drawing2D as Drawing2D
+                import webview.platforms.winforms as wf
+
+                form = wf.BrowserView.instances.get(self._win.uid)
+                if form is None:
+                    return False
+                self._form = form
+
+                def _create_on_ui_thread():
+                    if self.ready:
+                        return
+                    ico, bmp = self._load_icon(Drawing, Drawing2D)
+                    self._icon = ico
+                    self._bmp = bmp
+                    try:
+                        form.Icon = ico
+                    except Exception:
+                        pass
+
+                    ni = WinForms.NotifyIcon()
+                    ni.Icon = ico
+                    ni.Text = "MuseAI Video Studio Pro (Đang chạy)"
+                    ni.Visible = True
+
+                    menu = WinForms.ContextMenuStrip()
+                    mi_open = WinForms.ToolStripMenuItem("Mở MuseAI Video Studio")
+                    mi_cmd = WinForms.ToolStripMenuItem("Hiện / Ẩn cửa sổ CMD")
+                    mi_exit = WinForms.ToolStripMenuItem("Thoát hẳn MuseAI (Dừng toàn bộ luồng)")
+
+                    def _restore(_s=None, _e=None):
+                        try:
+                            form.Show()
+                            if form.WindowState == WinForms.FormWindowState.Minimized:
+                                form.WindowState = WinForms.FormWindowState.Normal
+                            form.Activate()
+                            form.TopMost = True
+                            form.TopMost = False
+                        except Exception:
+                            try:
+                                self._win.show()
+                            except Exception:
+                                pass
+
+                    def _on_mouse_click(_s, e):
+                        try:
+                            if e.Button == WinForms.MouseButtons.Left:
+                                _restore()
+                        except Exception:
+                            _restore()
+
+                    def _on_toggle_cmd(_s, _e):
+                        try:
+                            self._api.toggle_console()
+                        except Exception:
+                            pass
+
+                    def _on_exit(_s, _e):
+                        self.dispose()
+                        self._api.exit_app()
+
+                    mi_open.Click += _restore
+                    mi_cmd.Click += _on_toggle_cmd
+                    mi_exit.Click += _on_exit
+                    ni.MouseClick += _on_mouse_click
+                    ni.DoubleClick += _restore
+                    ni.BalloonTipClicked += _restore
+
+                    menu.Items.Add(mi_open)
+                    if _get_console_hwnd():
+                        menu.Items.Add(mi_cmd)
+                    menu.Items.Add(WinForms.ToolStripSeparator())
+                    menu.Items.Add(mi_exit)
+                    ni.ContextMenuStrip = menu
+
+                    self._notify_icon = ni
+                    self._menu = menu
+                    self._callbacks = [_restore, _on_mouse_click, _on_toggle_cmd, _on_exit]
+                    self.ready = True
+
+                if form.InvokeRequired:
+                    form.Invoke(Action(_create_on_ui_thread))
+                else:
+                    _create_on_ui_thread()
+                return self.ready
+            except Exception as exc:
+                print(f"[!] Không khởi tạo được biểu tượng khay hệ thống (System Tray): {exc}")
+                return False
+
+        def hide_to_tray(self) -> bool:
+            if not self.ready:
+                self.setup()
+            if not self.ready or self._form is None:
+                return False
+            try:
+                from System import Action
+                import System.Windows.Forms as WinForms
+
+                def _do():
+                    if self._notify_icon is not None:
+                        self._notify_icon.Visible = True
+                    self._form.Hide()
+                    if not self._balloon_shown and self._notify_icon is not None:
+                        self._balloon_shown = True
+                        try:
+                            self._notify_icon.ShowBalloonTip(
+                                2500,
+                                "MuseAI Video Studio vẫn đang chạy ngầm",
+                                "Phần mềm đã ẩn ở góc phải (khay hệ thống). Bấm biểu tượng để mở lại hoặc chuột phải để Thoát hẳn.",
+                                WinForms.ToolTipIcon.Info,
+                            )
+                        except Exception:
+                            pass
+
+                if self._form.InvokeRequired:
+                    self._form.Invoke(Action(_do))
+                else:
+                    _do()
+                return True
+            except Exception:
+                return False
+
+        def dispose(self):
+            ni = self._notify_icon
+            self._notify_icon = None
+            form = self._form
+            if ni is None:
+                return
+
+            def _do_dispose():
+                try:
+                    ni.Visible = False
+                    ni.Dispose()
+                except Exception:
+                    pass
+                try:
+                    if self._menu is not None:
+                        self._menu.Dispose()
+                        self._menu = None
+                except Exception:
+                    pass
+                try:
+                    if self._icon is not None:
+                        self._icon.Dispose()
+                        self._icon = None
+                except Exception:
+                    pass
+                try:
+                    if self._bmp is not None:
+                        self._bmp.Dispose()
+                        self._bmp = None
+                except Exception:
+                    pass
+
+            try:
+                if form is not None and not form.IsDisposed and form.InvokeRequired:
+                    from System import Action
+                    form.Invoke(Action(_do_dispose))
+                else:
+                    _do_dispose()
+            except Exception:
+                _do_dispose()
+
+    tray = _SystemTrayController(window, api)
+
+    # Ấn nút X (Close) -> ẩn vào khay hệ thống góc dưới bên phải (System Tray) thay vì đóng app
+    # (trừ khi bấm nút "Thoát" trong giao diện / chuột phải biểu tượng khay -> Thoát hẳn, hoặc MUSE2API_CLOSE_TO_TASKBAR=0).
+    close_to_tray = (
+        os.environ.get("MUSE2API_CLOSE_TO_TRAY", "1").strip() != "0"
+        and os.environ.get("MUSE2API_CLOSE_TO_TASKBAR", "1").strip() != "0"
+    )
 
     def _on_closing():
-        if api._allow_close or not close_to_taskbar:
+        if api._allow_close or not close_to_tray:
+            tray.dispose()
             return True
 
-        def _do_minimize():
+        def _do_hide():
             try:
-                window.minimize()
+                if not tray.hide_to_tray():
+                    # Dự phòng an toàn: nếu không tạo được icon khay hệ thống thì thu nhỏ xuống Taskbar để không mất dấu app
+                    window.minimize()
             except Exception:
-                pass
+                try:
+                    window.minimize()
+                except Exception:
+                    pass
 
-        # Gọi minimize sau 50ms để WinForms hoàn tất hủy sự kiện FormClosing trước khi đổi WindowState
-        threading.Timer(0.05, _do_minimize).start()
+        # Gọi ẩn sau 50ms để WinForms hoàn tất hủy sự kiện FormClosing trước khi Hide()
+        threading.Timer(0.05, _do_hide).start()
         return False
 
     def _on_shown():
+        # Tạo sẵn biểu tượng MuseAI ở khay hệ thống góc phải
+        threading.Timer(0.15, tray.setup).start()
         # Tự ẩn cửa sổ CMD ngay khi giao diện Desktop đã hiện lên (lỗi lúc khởi động trước đó vẫn thấy rõ trên CMD)
         if _should_auto_hide_console():
             threading.Timer(0.25, lambda: _set_console_visible(False)).start()
@@ -446,6 +672,10 @@ def main():
             if _cleaned_up["done"]:
                 return
             _cleaned_up["done"] = True
+        try:
+            tray.dispose()
+        except Exception:
+            pass
         print("[*] Đang đóng trình duyệt Chrome và dọn dẹp các tiến trình ngầm...")
         try:
             from app import engine

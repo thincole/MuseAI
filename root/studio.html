@@ -1053,7 +1053,7 @@
         🖥️ Hiện CMD
       </button>
 
-      <button class="btn-header" id="btnExitDesktop" onclick="exitDesktopApp()" style="display:none;background:rgba(239,68,68,0.16);border:1px solid rgba(239,68,68,0.45);color:#fca5a5;" title="Thoát hẳn phần mềm (nút X góc trên sẽ chỉ thu nhỏ xuống Taskbar)">
+      <button class="btn-header" id="btnExitDesktop" onclick="exitDesktopApp()" style="display:none;background:rgba(239,68,68,0.16);border:1px solid rgba(239,68,68,0.45);color:#fca5a5;" title="Thoát hẳn phần mềm (nút X góc trên sẽ ẩn vào khay hệ thống góc phải dưới đồng hồ)">
         ⏻ Thoát
       </button>
     </div>
@@ -2247,7 +2247,7 @@
     if (!(window.pywebview && window.pywebview.api && window.pywebview.api.exit_app)) return;
     const ok = confirm(
       "Đóng hẳn phần mềm MuseAI Video Studio và dừng toàn bộ luồng Chrome đang chạy?\n\n" +
-      "(Lưu ý: bấm nút X góc trên chỉ thu nhỏ phần mềm xuống Taskbar để chạy ngầm 24/7.)"
+      "(Lưu ý: bấm nút X góc trên sẽ ẩn phần mềm vào khay hệ thống góc phải gần đồng hồ để chạy ngầm 24/7.)"
     );
     if (!ok) return;
     try {
