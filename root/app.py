@@ -3332,6 +3332,8 @@ def cleanup_temp_files(
             ("shopee_images_cache", os.path.join(BASE_DIR, "data", "shopee_images_cache"), app_cutoff, False, set()),
             ("downloads", CFG.download_dir, app_cutoff, False, set()),
         ]
+        for idx_s, sdir in enumerate(shopee_engine.get_known_ssd_stage_dirs()):
+            targets.append((f"ssd_stage_{idx_s}", sdir, app_cutoff, False, set()))
         if media_hrs > 0:
             media_cutoff = now - media_hrs * 3600
             targets.append(("orphan_media", CFG.media_dir, media_cutoff, False, _active_media_filenames()))
@@ -3610,6 +3612,7 @@ def _get_shopee_settings() -> dict:
         "account_dispatch_mode": "even",
         "threads_mode": "manual",
         "ffmpeg_concurrency": shopee_engine.FFMPEG_CONCURRENCY,
+        "ssd_staging": shopee_engine.SSD_STAGING_ENABLED,
         "skip_exhausted_accounts": True,
         "auto_delete_stale_accounts": False,
         "auto_delete_stale_hours": 50,
@@ -3630,6 +3633,7 @@ def _get_shopee_settings() -> dict:
     default_settings["account_dispatch_mode"] = normalize_dispatch_mode(
         default_settings.get("account_dispatch_mode", "even")
     )
+    default_settings["ssd_staging"] = bool(default_settings.get("ssd_staging", True))
     default_settings["auto_delete_stale_accounts"] = bool(default_settings.get("auto_delete_stale_accounts", False))
     try:
         default_settings["auto_delete_stale_hours"] = max(1, min(720, int(default_settings.get("auto_delete_stale_hours") or 50)))
@@ -3640,7 +3644,16 @@ def _get_shopee_settings() -> dict:
 
 @app.get("/api/shopee/settings")
 def get_shopee_settings():
-    return _get_shopee_settings()
+    cfg = _get_shopee_settings()
+    cfg["ssd_staging_info"] = shopee_engine.get_ssd_staging_info(out_dir=cfg.get("out_dir"))
+    return cfg
+
+
+@app.get("/api/shopee/ssd-staging")
+def get_shopee_ssd_staging(out_dir: str = "", refresh: bool = False):
+    """Kiểm tra ổ SSD lưu tạm tự động chọn tương ứng với thư mục lưu video hiện tại."""
+    resolved = _resolve_shopee_out_dir(out_dir) if out_dir else _resolve_shopee_out_dir()
+    return shopee_engine.get_ssd_staging_info(out_dir=resolved, refresh=bool(refresh))
 
 
 def _apply_jobs_per_account(value) -> int:
@@ -3672,17 +3685,22 @@ def save_shopee_settings(settings: dict):
             clean_settings["auto_delete_stale_hours"] = max(1, min(720, int(clean_settings["auto_delete_stale_hours"] or 50)))
         except Exception:
             clean_settings["auto_delete_stale_hours"] = 50
+    if "ssd_staging" in clean_settings:
+        clean_settings["ssd_staging"] = shopee_engine.set_ssd_staging_enabled(clean_settings["ssd_staging"])
     with open(SHOPEE_SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(clean_settings, f, ensure_ascii=False, indent=2)
     if "ffmpeg_concurrency" in clean_settings:
         shopee_engine.set_ffmpeg_concurrency(clean_settings["ffmpeg_concurrency"])
     if "skip_exhausted_accounts" in clean_settings:
         store.set_skip_exhausted(clean_settings["skip_exhausted_accounts"])
+    out_for_info = clean_settings.get("out_dir") or _resolve_shopee_out_dir()
     return {
         "success": True,
         "jobs_per_account": store.MAX_JOBS_PER_ACCOUNT,
         "account_dispatch_mode": store.ACCOUNT_DISPATCH_MODE,
         "ffmpeg_concurrency": shopee_engine.FFMPEG_CONCURRENCY,
+        "ssd_staging": shopee_engine.SSD_STAGING_ENABLED,
+        "ssd_staging_info": shopee_engine.get_ssd_staging_info(out_dir=out_for_info),
     }
 
 
@@ -4721,15 +4739,9 @@ def save_temp_clip(req: dict):
     target_filename = f"{item_id}-{part}.mp4"
     target_path = os.path.join(temp_dir, target_filename)
 
-    # Chuyển trực tiếp file sang out_dir/temp/{item_id}-{part}.mp4 để không chiếm gấp đôi dung lượng ổ cứng
-    try:
-        shutil.move(src_path, target_path)
-    except Exception:
-        shutil.copy2(src_path, target_path)
-        try:
-            os.remove(src_path)
-        except Exception:
-            pass
+    # Chuyển trực tiếp file sang out_dir/temp/{item_id}-{part}.mp4 theo cơ chế atomic + giới hạn luồng HDD
+    if not shopee_engine.atomic_transfer_file(src_path, target_path, move=True):
+        raise HTTPException(500, f"Không thể lưu clip tạm sang '{target_path}'")
 
     cache_updates = {f"clip_{part}": target_path}
     image_url = str(req.get("image_url", "")).strip()
@@ -5224,10 +5236,10 @@ def auto_stitch_temp_clips(req: dict):
                 log.warning("Ghép ảnh 12s cho SP %s thất bại: %s", iid, ge)
 
         if not stitched_raw and not ghep_anh:
-            # Nếu không chọn ghép ảnh, copy thô clip raw sang output
+            # Nếu không chọn ghép ảnh, copy thô clip raw sang output theo cơ chế atomic + giới hạn luồng HDD
             try:
-                shutil.copy2(f_raw, out_final)
-                stitched_raw = os.path.isfile(out_final) and os.path.getsize(out_final) >= 10000
+                ok_cp = shopee_engine.atomic_transfer_file(f_raw, out_final, move=False)
+                stitched_raw = ok_cp and os.path.isfile(out_final) and os.path.getsize(out_final) >= 10000
             except Exception as ce:
                 log.warning("Copy clip raw SP %s sang output thất bại: %s", iid, ce)
 
@@ -5874,11 +5886,7 @@ def _save_rendered_video_sync(req: dict) -> dict:
                     raw_target_name = f"{tid_rescue}-raw{ext}"
                     raw_target_path = os.path.join(tdir, raw_target_name)
                     if not os.path.isfile(raw_target_path):
-                        try:
-                            shutil.move(src, raw_target_path)
-                        except Exception:
-                            shutil.copy2(src, raw_target_path)
-                            shopee_engine._safe_remove(src)
+                        shopee_engine.atomic_transfer_file(src, raw_target_path, move=True)
                     if os.path.isfile(raw_target_path) and os.path.getsize(raw_target_path) > 1000:
                         has_temp_copy = True
                         _remember_file_account(raw_target_name, _FILE_ACCOUNT.pop(os.path.basename(filename), None))
@@ -5899,7 +5907,8 @@ def _save_rendered_video_sync(req: dict) -> dict:
 
         if not stitched:
             if os.path.abspath(src) != os.path.abspath(dst):
-                shutil.copy2(src, dst)
+                if not shopee_engine.atomic_transfer_file(src, dst, move=False):
+                    raise HTTPException(500, f"Không thể chuyển file video sang '{dst}'")
 
         # Tự động dọn dẹp file trung gian sau khi đã lưu xong video hoàn chỉnh
         if os.path.isfile(dst) and os.path.getsize(dst) > 1000:
@@ -6595,6 +6604,12 @@ async def _startup():
     log.info("🎬 Số video cùng lúc / tài khoản: %d · Chế độ chia TK: %s", n_jobs, disp_mode)
     if sp_init.get("ffmpeg_concurrency"):
         shopee_engine.set_ffmpeg_concurrency(sp_init["ffmpeg_concurrency"])
+    ssd_en = shopee_engine.set_ssd_staging_enabled(sp_init.get("ssd_staging", True))
+    if ssd_en:
+        try:
+            shopee_engine.get_ssd_staging_info(out_dir=sp_init.get("out_dir"), refresh=True)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Không khởi tạo được thông tin SSD staging lúc bật app: %s", exc)
     skip_ex = store.set_skip_exhausted(sp_init.get("skip_exhausted_accounts", False))
     log.info("🔋 Bỏ qua TK hết token khi giao việc: %s", "BẬT" if skip_ex else "tắt")
     # Luồng xử lý (ảnh lẫn video) đã chết khi tắt app: đóng các task còn treo để không bị đếm/kẹt mãi.

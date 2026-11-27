@@ -1702,8 +1702,14 @@
             </select>
 
             <span class="shopee-lbl" style="margin-left:8px;">Lưu Video:</span>
-            <input type="text" class="shopee-input" id="sp_out_dir" value="" placeholder="Mặc định: thư mục output cạnh app" style="width:360px;">
+            <input type="text" class="shopee-input" id="sp_out_dir" value="" placeholder="Mặc định: thư mục output cạnh app" style="width:320px;" onchange="saveShopeeSettings()">
             <button type="button" class="shopee-btn shopee-btn-blue" onclick="pickShopeeFolder()">Chọn</button>
+
+            <label class="shopee-chk" style="margin-left:8px;" title="Tự động tìm ổ SSD nhanh nhất còn đủ dung lượng để FFmpeg xử lý/ghép tạm trên SSD, xong mới chuyển (move) tuần tự sang thư mục Lưu Video (tránh nghẽn ổ HDD)">
+              <input type="checkbox" id="sp_ssd_staging" checked onchange="saveShopeeSettings()">
+              <span>⚡ Tạm SSD</span>
+            </label>
+            <span id="sp_ssd_badge" style="font-size:11px;padding:3px 8px;border-radius:6px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.35);color:#34d399;white-space:nowrap;cursor:pointer;" onclick="refreshSsdStagingInfo(true)" title="Bấm để quét lại ổ SSD tạm">⚡ Đang quét SSD...</span>
           </div>
           </div>
         </div>
@@ -4074,6 +4080,11 @@
       }
       if (data.del_img !== undefined) document.getElementById("sp_del_img").checked = !!data.del_img;
       if (data.ghep_anh !== undefined) document.getElementById("sp_ghep_anh").checked = !!data.ghep_anh;
+      if (data.ssd_staging !== undefined) {
+        const elSsd = document.getElementById("sp_ssd_staging");
+        if (elSsd) elSsd.checked = !!data.ssd_staging;
+      }
+      if (data.ssd_staging_info) renderSsdStagingBadge(data.ssd_staging_info);
       if (data.auto_claim !== undefined) document.getElementById("sp_auto_claim").checked = !!data.auto_claim;
       if (data.jobs_per_account !== undefined) {
         const elJobs = document.getElementById("sp_jobs_per_account");
@@ -4291,6 +4302,7 @@
       ai_prompt: document.getElementById("sp_ai_prompt").value,
       del_img: document.getElementById("sp_del_img").checked,
       ghep_anh: document.getElementById("sp_ghep_anh").checked,
+      ssd_staging: document.getElementById("sp_ssd_staging") ? !!document.getElementById("sp_ssd_staging").checked : true,
       auto_claim: !!document.getElementById("sp_auto_claim")?.checked,
       jobs_per_account: getShopeeJobsPerAccount(),
       account_dispatch_mode: getShopeeDispatchMode(),
@@ -4316,14 +4328,65 @@
     };
   }
 
+  function renderSsdStagingBadge(info) {
+    const el = document.getElementById("sp_ssd_badge");
+    if (!el) return;
+    if (!info || !info.enabled) {
+      el.textContent = "Tạm SSD: Tắt";
+      el.style.color = "#94a3b8";
+      el.style.background = "rgba(148,163,184,0.12)";
+      el.style.borderColor = "rgba(148,163,184,0.3)";
+      el.title = "Đang ghi trực tiếp vào thư mục Lưu Video. Tích 'Tạm SSD' để tự xử lý trên SSD rồi move sang Output.";
+      return;
+    }
+    if (info.active && info.stage_dir) {
+      const drv = info.drive || "SSD";
+      const bus = info.bus ? ` ${info.bus}` : "";
+      const freeTxt = typeof info.free_gb === "number" ? ` · trống ${info.free_gb.toFixed(1)} GB` : "";
+      const modeTxt = info.same_drive_zero_copy ? " (rename tức thì)" : " → move sang Output";
+      el.textContent = `⚡ ${drv}${bus}${freeTxt}`;
+      el.style.color = "#34d399";
+      el.style.background = "rgba(16,185,129,0.12)";
+      el.style.borderColor = "rgba(16,185,129,0.35)";
+      el.title = `Thư mục tạm SSD: ${info.stage_dir}${modeTxt}\n(Bấm để quét lại danh sách ổ đĩa)`;
+    } else {
+      el.textContent = "⚠️ Không tìm thấy SSD trống";
+      el.style.color = "#fbbf24";
+      el.style.background = "rgba(251,191,36,0.12)";
+      el.style.borderColor = "rgba(251,191,36,0.35)";
+      el.title = "Không tìm thấy ổ SSD nào còn đủ dung lượng trống -> ghi trực tiếp vào thư mục Lưu Video. (Bấm để quét lại)";
+    }
+  }
+
+  async function refreshSsdStagingInfo(refresh = false) {
+    try {
+      const outDir = (document.getElementById("sp_out_dir")?.value || "").trim();
+      const res = await fetch(`/api/shopee/ssd-staging?out_dir=${encodeURIComponent(outDir)}&refresh=${refresh ? "1" : "0"}`, {
+        headers: getHeaders()
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      renderSsdStagingBadge(data);
+      if (refresh && data.stage_dir) {
+        showToast(`⚡ Đã quét lại ổ SSD tạm: ${data.stage_dir} (trống ${data.free_gb} GB)`, "success");
+      }
+    } catch (_) {}
+  }
+
   async function saveShopeeSettings() {
     try {
       const payload = getShopeeFormData();
-      await fetch("/api/shopee/save-settings", {
+      const res = await fetch("/api/shopee/save-settings", {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify(payload)
       });
+      if (res.ok) {
+        const resData = await res.json().catch(() => null);
+        if (resData && resData.ssd_staging_info) {
+          renderSsdStagingBadge(resData.ssd_staging_info);
+        }
+      }
     } catch (_) {}
   }
 

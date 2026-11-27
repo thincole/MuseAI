@@ -13,7 +13,9 @@ import logging
 import os
 import random
 import re
+import shutil
 import socket
+import string
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,7 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
+import uuid
 
 import ssl_ctx
 from config import CFG
@@ -173,6 +176,514 @@ def _safe_remove(path: str | None) -> None:
             os.remove(path)
     except OSError as e:
         log.debug("Không xóa được file %s: %s", path, e)
+
+
+# ==================== TỰ ĐỘNG TÌM Ổ SSD LÀM THƯ MỤC TẠM & MOVE ATOMIC SANG OUTPUT ====================
+# Khi xuất video ra ổ HDD (hoặc ổ mạng), để hàng chục FFmpeg ghi trực tiếp + chạy -movflags +faststart
+# sẽ gây nghẽn random I/O trên HDD. Cơ chế này tự phát hiện ổ SSD nhanh nhất còn đủ dung lượng trống
+# (ưu tiên NVMe -> SATA SSD, tránh làm đầy ổ C:), chạy toàn bộ FFmpeg + kiểm tra 12s trên SSD, nhả slot
+# FFmpeg xong mới chuyển (move) tuần tự tối đa 2 luồng/ổ HDD sang thư mục output gốc.
+
+SSD_STAGING_ENABLED: bool = os.environ.get("MUSE2API_SSD_STAGING", "1").strip() != "0"
+SSD_STAGING_OVERRIDE_DIR: str = os.environ.get("MUSE2API_SSD_TEMP_DIR", "").strip()
+_SSD_MIN_FREE_GB: float = 4.0
+_SSD_SYS_MIN_FREE_GB: float = 10.0
+_SSD_AMPLE_FREE_GB: float = 15.0
+_SSD_SYS_AMPLE_FREE_GB: float = 30.0
+_HDD_IO_CONCURRENCY: int = max(1, min(8, int(os.environ.get("MUSE2API_HDD_IO_CONCURRENCY", "2") or 2)))
+_SSD_STAGE_PREFIX: str = "muse_stage_"
+
+_SSD_PROBE_LOCK = threading.Lock()
+_SSD_DRIVES_CACHE: dict[str, dict] | None = None
+_SSD_WRITABLE_DIRS: set[str] = set()
+_SSD_CLEANED_DIRS: set[str] = set()
+_SSD_KNOWN_STAGE_DIRS: set[str] = set()
+_SSD_LOGGED_STAGE_DIR: str | None = None
+_SSD_NO_DRIVE_WARNED: bool = False
+
+_DRIVE_IO_LOCK = threading.Lock()
+_DRIVE_IO_LIMITERS: dict[str, threading.BoundedSemaphore] = {}
+
+
+def _drive_key(path: str) -> str:
+    """Khóa chuẩn định danh phân vùng / ổ đĩa (VD: 'C:', 'D:', hoặc '\\\\SERVER\\SHARE')."""
+    if not path:
+        return ""
+    abs_p = os.path.abspath(path)
+    if sys.platform == "win32":
+        drv, _ = os.path.splitdrive(abs_p)
+        return drv.upper()
+    cur = abs_p
+    while cur and not os.path.exists(cur):
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    try:
+        return f"dev:{os.stat(cur).st_dev}"
+    except OSError:
+        return "/"
+
+
+def _probe_windows_fixed_drives() -> dict[str, dict]:
+    """Quét nhanh mọi phân vùng ổ cứng cố định trên Windows bằng Win32 IOCTL_STORAGE_QUERY_PROPERTY
+    (không cần quyền Admin, không gọi PowerShell, <1ms): phân biệt SSD vs HDD và bus NVMe vs SATA."""
+    drives: dict[str, dict] = {}
+    if sys.platform != "win32":
+        return drives
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        FILE_SHARE_READ = 1
+        FILE_SHARE_WRITE = 2
+        OPEN_EXISTING = 3
+        DRIVE_FIXED = 3
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+        IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+        BUS_NAMES = {
+            1: "SCSI", 2: "ATAPI", 3: "ATA", 7: "USB", 8: "RAID",
+            10: "SAS", 11: "SATA", 14: "Virtual", 17: "NVMe", 18: "SCM",
+        }
+
+        class STORAGE_PROPERTY_QUERY(ctypes.Structure):
+            _fields_ = [
+                ("PropertyId", wintypes.DWORD),
+                ("QueryType", wintypes.DWORD),
+                ("AdditionalParameters", ctypes.c_byte * 1),
+            ]
+
+        class DEVICE_SEEK_PENALTY_DESCRIPTOR(ctypes.Structure):
+            _fields_ = [
+                ("Version", wintypes.DWORD),
+                ("Size", wintypes.DWORD),
+                ("IncursSeekPenalty", ctypes.c_ubyte),
+            ]
+
+        class STORAGE_DEVICE_DESCRIPTOR_HEADER(ctypes.Structure):
+            _fields_ = [
+                ("Version", wintypes.DWORD),
+                ("Size", wintypes.DWORD),
+                ("DeviceType", ctypes.c_ubyte),
+                ("DeviceTypeModifier", ctypes.c_ubyte),
+                ("RemovableMedia", ctypes.c_ubyte),
+                ("CommandQueueing", ctypes.c_ubyte),
+                ("VendorIdOffset", wintypes.DWORD),
+                ("ProductIdOffset", wintypes.DWORD),
+                ("ProductRevisionOffset", wintypes.DWORD),
+                ("SerialNumberOffset", wintypes.DWORD),
+                ("BusType", wintypes.DWORD),
+            ]
+
+        sys_drive = (os.environ.get("SystemDrive") or "C:").strip().upper()
+        for letter in string.ascii_uppercase:
+            root = f"{letter}:\\"
+            if kernel32.GetDriveTypeW(root) != DRIVE_FIXED:
+                continue
+            drv = f"{letter}:"
+            seek_penalty: bool | None = None
+            bus_name = "Unknown"
+            h = kernel32.CreateFileW(
+                f"\\\\.\\{letter}:",
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                0,
+                None,
+            )
+            if h != INVALID_HANDLE_VALUE:
+                try:
+                    q_seek = STORAGE_PROPERTY_QUERY(PropertyId=7, QueryType=0)
+                    out_seek = DEVICE_SEEK_PENALTY_DESCRIPTOR()
+                    br = wintypes.DWORD(0)
+                    if kernel32.DeviceIoControl(
+                        h, IOCTL_STORAGE_QUERY_PROPERTY,
+                        ctypes.byref(q_seek), ctypes.sizeof(q_seek),
+                        ctypes.byref(out_seek), ctypes.sizeof(out_seek),
+                        ctypes.byref(br), None,
+                    ):
+                        seek_penalty = bool(out_seek.IncursSeekPenalty)
+
+                    q_dev = STORAGE_PROPERTY_QUERY(PropertyId=0, QueryType=0)
+                    buf = (ctypes.c_byte * 512)()
+                    br2 = wintypes.DWORD(0)
+                    if kernel32.DeviceIoControl(
+                        h, IOCTL_STORAGE_QUERY_PROPERTY,
+                        ctypes.byref(q_dev), ctypes.sizeof(q_dev),
+                        buf, len(buf),
+                        ctypes.byref(br2), None,
+                    ):
+                        hdr = STORAGE_DEVICE_DESCRIPTOR_HEADER.from_buffer(buf)
+                        bus_name = BUS_NAMES.get(int(hdr.BusType), f"Bus{int(hdr.BusType)}")
+                finally:
+                    kernel32.CloseHandle(h)
+
+            if bus_name == "NVMe":
+                is_ssd: bool | None = True
+            elif seek_penalty is not None:
+                is_ssd = not seek_penalty
+            else:
+                is_ssd = None
+
+            drives[drv] = {
+                "drive": drv,
+                "root": root,
+                "is_ssd": is_ssd,
+                "bus": bus_name,
+                "is_system": (drv == sys_drive),
+            }
+    except Exception as exc:
+        log.debug("Không quét được cấu trúc ổ đĩa Windows: %s", exc)
+    return drives
+
+
+def get_drive_topology(refresh: bool = False) -> dict[str, dict]:
+    """Trả về thông tin các ổ đĩa cố định kèm dung lượng trống mới nhất (GB)."""
+    global _SSD_DRIVES_CACHE
+    with _SSD_PROBE_LOCK:
+        if _SSD_DRIVES_CACHE is None or refresh:
+            _SSD_DRIVES_CACHE = _probe_windows_fixed_drives()
+        base_map = {k: dict(v) for k, v in _SSD_DRIVES_CACHE.items()}
+
+    out: dict[str, dict] = {}
+    for drv, info in base_map.items():
+        try:
+            du = shutil.disk_usage(info["root"])
+            info["free_gb"] = du.free / (1024 ** 3)
+            info["total_gb"] = du.total / (1024 ** 3)
+        except OSError:
+            info["free_gb"] = 0.0
+            info["total_gb"] = 0.0
+        out[drv] = info
+    return out
+
+
+def is_path_on_ssd(path: str) -> bool | None:
+    """Trả về True nếu đường dẫn nằm trên SSD, False nếu HDD/mạng UNC, None nếu không xác định."""
+    if not path:
+        return None
+    abs_p = os.path.abspath(path)
+    if abs_p.startswith("\\\\"):
+        return False  # UNC network share
+    if sys.platform != "win32":
+        return None
+    drv = _drive_key(abs_p)
+    if not drv:
+        return None
+    topo = get_drive_topology(refresh=False)
+    info = topo.get(drv)
+    if info is None:
+        topo = get_drive_topology(refresh=True)
+        info = topo.get(drv)
+    return info.get("is_ssd") if info else None
+
+
+def set_ssd_staging_enabled(enabled: bool) -> bool:
+    """Bật/tắt chế độ tự tìm ổ SSD lưu tạm trước khi move sang output (áp dụng ngay)."""
+    global SSD_STAGING_ENABLED
+    SSD_STAGING_ENABLED = bool(enabled)
+    log.info("⚡ [SSD Stage] Chế độ xử lý tạm trên SSD rồi move sang Output: %s", "BẬT" if SSD_STAGING_ENABLED else "TẮT")
+    return SSD_STAGING_ENABLED
+
+
+def _stage_dir_for_drive(drive: str) -> str:
+    """Chọn thư mục tạm chuẩn trên ổ SSD (tránh ghi thẳng vào root C:\\ khi không có quyền Admin)."""
+    drv = drive.upper()
+    if drv == _drive_key(CFG.base_dir):
+        return os.path.join(CFG.data_dir, "ssd_stage")
+    if drv == _drive_key(tempfile.gettempdir()):
+        return os.path.join(tempfile.gettempdir(), "MuseAI_SSD_Temp")
+    return os.path.join(drv + os.sep, "MuseAI_SSD_Temp")
+
+
+def _ensure_writable_dir(path: str) -> bool:
+    """Đảm bảo thư mục tồn tại và ghi được thật (cache kết quả để không ghi thăm dò lặp lại)."""
+    norm = os.path.normcase(os.path.abspath(path))
+    if norm in _SSD_WRITABLE_DIRS and os.path.isdir(path):
+        return True
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f".write_probe_{os.getpid()}_{threading.get_ident()}")
+        with open(probe, "wb") as f:
+            f.write(b"1")
+        os.remove(probe)
+        with _SSD_PROBE_LOCK:
+            _SSD_WRITABLE_DIRS.add(norm)
+            _SSD_KNOWN_STAGE_DIRS.add(os.path.abspath(path))
+        return True
+    except OSError:
+        return False
+
+
+def cleanup_stale_ssd_stage_files(stage_dir: str, max_age_seconds: int = 7200) -> int:
+    """Dọn file tạm muse_stage_* mồ côi quá cũ trong thư mục SSD staging (bỏ qua file đang khóa)."""
+    removed = 0
+    if not stage_dir or not os.path.isdir(stage_dir):
+        return 0
+    cutoff = time.time() - max(60, int(max_age_seconds))
+    try:
+        for entry in os.scandir(stage_dir):
+            if not entry.is_file() or not entry.name.startswith(_SSD_STAGE_PREFIX):
+                continue
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    os.remove(entry.path)
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if removed:
+        log.info("🧹 [SSD Stage] Đã dọn %d file tạm mồ côi cũ trong %s", removed, stage_dir)
+    return removed
+
+
+def get_known_ssd_stage_dirs() -> list[str]:
+    """Trả về danh sách các thư mục SSD staging đã dùng để bộ dọn rác định kỳ quét an toàn."""
+    with _SSD_PROBE_LOCK:
+        dirs = list(_SSD_KNOWN_STAGE_DIRS)
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+def _min_free_gb_for_drive(is_system: bool) -> float:
+    return _SSD_SYS_MIN_FREE_GB if is_system else _SSD_MIN_FREE_GB
+
+
+def select_ssd_staging_dir(target_path: str | None = None, *, min_extra_mb: int = 256) -> tuple[str | None, dict]:
+    """Tự động chọn thư mục tạm tốt nhất trên ổ SSD cho tác vụ xử lý video:
+    - Nếu target_path đã nằm trên SSD còn đủ dung lượng -> dùng staging ngay trên CÙNG ổ SSD đó để bước
+      move sang output là rename tức thì O(1) không tốn gấp đôi lượt ghi SSD.
+    - Nếu target_path nằm trên HDD / ổ mạng (hoặc không truyền target_path) -> chọn ổ SSD tốt nhất
+      (ưu tiên còn rộng rãi >=15/30GB -> NVMe -> ổ phụ không phải C: -> trống nhiều nhất).
+    """
+    global _SSD_LOGGED_STAGE_DIR, _SSD_NO_DRIVE_WARNED
+    if not SSD_STAGING_ENABLED:
+        return None, {"enabled": False, "reason": "disabled"}
+
+    extra_gb = max(0.0, float(min_extra_mb) / 1024.0)
+
+    # Ưu tiên đường dẫn cấu hình tay qua biến môi trường MUSE2API_SSD_TEMP_DIR (nếu có)
+    if SSD_STAGING_OVERRIDE_DIR:
+        cand = os.path.abspath(SSD_STAGING_OVERRIDE_DIR)
+        if _ensure_writable_dir(cand):
+            try:
+                free_gb = shutil.disk_usage(cand).free / (1024 ** 3)
+            except OSError:
+                free_gb = 0.0
+            if free_gb >= 2.0 + extra_gb:
+                drv = _drive_key(cand)
+                meta = {"drive": drv, "bus": "Custom", "free_gb": free_gb, "is_ssd": True, "stage_dir": cand}
+                _maybe_log_and_clean_stage_dir(cand, meta)
+                return cand, meta
+
+    topo = get_drive_topology(refresh=False)
+    if not topo and sys.platform == "win32":
+        topo = get_drive_topology(refresh=True)
+
+    # Nếu output đích ĐÃ ở trên SSD còn đủ dung lượng -> stage trên đúng ổ SSD đó (move = rename tức thì!)
+    if target_path:
+        t_drv = _drive_key(target_path)
+        t_info = topo.get(t_drv)
+        if t_info and t_info.get("is_ssd") is True:
+            need_gb = _min_free_gb_for_drive(bool(t_info.get("is_system"))) + extra_gb
+            if t_info.get("free_gb", 0.0) >= need_gb:
+                cand = _stage_dir_for_drive(t_drv)
+                if _ensure_writable_dir(cand):
+                    meta = dict(t_info)
+                    meta["stage_dir"] = cand
+                    _maybe_log_and_clean_stage_dir(cand, meta)
+                    return cand, meta
+
+    # Tìm ổ SSD tốt nhất trên máy cho trường hợp output nằm trên HDD / mạng / ổ SSD gần đầy
+    candidates: list[dict] = []
+    for info in topo.values():
+        if info.get("is_ssd") is not True:
+            continue
+        is_sys = bool(info.get("is_system"))
+        free_gb = float(info.get("free_gb") or 0.0)
+        if free_gb < _min_free_gb_for_drive(is_sys) + extra_gb:
+            continue
+        candidates.append(info)
+
+    def _rank(info: dict):
+        is_sys = bool(info.get("is_system"))
+        free_gb = float(info.get("free_gb") or 0.0)
+        ample_thr = _SSD_SYS_AMPLE_FREE_GB if is_sys else _SSD_AMPLE_FREE_GB
+        return (
+            1 if free_gb >= ample_thr else 0,
+            1 if info.get("bus") == "NVMe" else 0,
+            0 if is_sys else 1,
+            free_gb,
+        )
+
+    candidates.sort(key=_rank, reverse=True)
+    for info in candidates:
+        cand = _stage_dir_for_drive(info["drive"])
+        if _ensure_writable_dir(cand):
+            meta = dict(info)
+            meta["stage_dir"] = cand
+            _maybe_log_and_clean_stage_dir(cand, meta)
+            return cand, meta
+
+    if not _SSD_NO_DRIVE_WARNED:
+        _SSD_NO_DRIVE_WARNED = True
+        log.warning("⚠️ [SSD Stage] Không tìm thấy ổ SSD nào còn đủ dung lượng trống (>=%.0fGB) — ghi trực tiếp vào thư mục đích.", _SSD_MIN_FREE_GB)
+    return None, {"enabled": True, "reason": "no_ssd_with_space"}
+
+
+def _maybe_log_and_clean_stage_dir(stage_dir: str, meta: dict) -> None:
+    global _SSD_LOGGED_STAGE_DIR
+    norm = os.path.normcase(os.path.abspath(stage_dir))
+    need_clean = False
+    need_log = False
+    with _SSD_PROBE_LOCK:
+        if norm not in _SSD_CLEANED_DIRS:
+            _SSD_CLEANED_DIRS.add(norm)
+            need_clean = True
+        if _SSD_LOGGED_STAGE_DIR != norm:
+            _SSD_LOGGED_STAGE_DIR = norm
+            need_log = True
+    if need_log:
+        log.info(
+            "⚡ [SSD Stage] Tự chọn ổ SSD tạm: %s (%s, trống %.1f GB)",
+            stage_dir, meta.get("bus") or "SSD", float(meta.get("free_gb") or 0.0),
+        )
+    if need_clean:
+        cleanup_stale_ssd_stage_files(stage_dir, max_age_seconds=7200)
+
+
+def get_ssd_staging_info(out_dir: str | None = None, refresh: bool = False) -> dict:
+    """Thông tin trạng thái SSD staging để hiển thị trên giao diện & log khởi động."""
+    topo = get_drive_topology(refresh=refresh)
+    stage_dir, meta = select_ssd_staging_dir(out_dir) if SSD_STAGING_ENABLED else (None, {})
+    out_is_ssd = is_path_on_ssd(out_dir) if out_dir else None
+    same_drv = bool(stage_dir and out_dir and _drive_key(stage_dir) == _drive_key(out_dir))
+    drives_summary = [
+        {
+            "drive": d["drive"],
+            "is_ssd": d["is_ssd"],
+            "bus": d["bus"],
+            "is_system": d["is_system"],
+            "free_gb": round(float(d.get("free_gb") or 0.0), 1),
+            "total_gb": round(float(d.get("total_gb") or 0.0), 1),
+        }
+        for d in sorted(topo.values(), key=lambda x: x["drive"])
+    ]
+    return {
+        "enabled": SSD_STAGING_ENABLED,
+        "active": bool(stage_dir),
+        "stage_dir": stage_dir or "",
+        "drive": meta.get("drive", ""),
+        "bus": meta.get("bus", ""),
+        "free_gb": round(float(meta.get("free_gb") or 0.0), 1),
+        "out_dir": out_dir or "",
+        "out_dir_is_ssd": out_is_ssd,
+        "same_drive_zero_copy": same_drv,
+        "hdd_io_concurrency": _HDD_IO_CONCURRENCY,
+        "drives": drives_summary,
+    }
+
+
+def _get_drive_io_limiter(path: str) -> threading.BoundedSemaphore:
+    """Giới hạn số luồng copy/move đồng thời trên từng ổ đĩa: SSD tối đa 8, HDD/mạng tối đa 2 luồng tuần tự."""
+    drv = _drive_key(path) or "_default"
+    with _DRIVE_IO_LOCK:
+        lim = _DRIVE_IO_LIMITERS.get(drv)
+        if lim is None:
+            on_ssd = is_path_on_ssd(path)
+            slots = 8 if on_ssd is True else _HDD_IO_CONCURRENCY
+            lim = threading.BoundedSemaphore(slots)
+            _DRIVE_IO_LIMITERS[drv] = lim
+        return lim
+
+
+def _replace_with_retry(src: str, dst: str, retries: int = 3) -> None:
+    """os.replace có thử lại ngắn khi Explorer / Windows Defender vừa chạm file trên Windows."""
+    last_exc: OSError | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.1 * (attempt + 1))
+    if last_exc:
+        raise last_exc
+
+
+def atomic_transfer_file(src: str, dst: str, *, move: bool = True, retries: int = 3) -> bool:
+    """Chuyển/sao chép file an toàn sang đích theo cơ chế atomic (.part -> os.replace):
+    - Cùng ổ đĩa + move=True -> rename tức thì O(1).
+    - Khác ổ đĩa -> copy đệm 1MB có giới hạn luồng tuần tự trên ổ HDD (không bao giờ để lại file hỏng dở dang).
+    """
+    if not src or not dst or not os.path.isfile(src):
+        return False
+    src_abs = os.path.abspath(src)
+    dst_abs = os.path.abspath(dst)
+    if os.path.normcase(src_abs) == os.path.normcase(dst_abs):
+        return True
+
+    dst_dir = os.path.dirname(dst_abs)
+    os.makedirs(dst_dir, exist_ok=True)
+    src_drv = _drive_key(src_abs)
+    dst_drv = _drive_key(dst_abs)
+
+    # Nhanh nhất: cùng phân vùng và yêu cầu move -> rename trực tiếp O(1)
+    if move and src_drv and src_drv == dst_drv:
+        try:
+            _replace_with_retry(src_abs, dst_abs, retries=retries)
+            return os.path.isfile(dst_abs)
+        except OSError:
+            pass  # fallback sang copy + replace nếu khác mount/junction
+
+    try:
+        src_size = os.path.getsize(src_abs)
+    except OSError:
+        return False
+
+    # Khóa theo thứ tự tên ổ tăng dần nếu cả nguồn và đích là 2 ổ HDD khác nhau (tránh deadlock)
+    lim_keys = sorted({k for k in (src_drv, dst_drv) if k})
+    limiters: list[threading.BoundedSemaphore] = []
+    for k in lim_keys:
+        ref_path = src_abs if k == src_drv else dst_abs
+        if is_path_on_ssd(ref_path) is not True or k == dst_drv:
+            limiters.append(_get_drive_io_limiter(ref_path))
+
+    dst_part = os.path.join(dst_dir, f".{os.path.basename(dst_abs)}.{uuid.uuid4().hex[:8]}.part")
+    acquired: list[threading.BoundedSemaphore] = []
+    replaced = False
+    try:
+        for lim in limiters:
+            lim.acquire()
+            acquired.append(lim)
+        with open(src_abs, "rb") as fin, open(dst_part, "wb") as fout:
+            shutil.copyfileobj(fin, fout, 1024 * 1024)
+        if os.path.getsize(dst_part) != src_size:
+            raise OSError(f"Kích thước file sau copy không khớp ({os.path.getsize(dst_part)} != {src_size})")
+        _replace_with_retry(dst_part, dst_abs, retries=retries)
+        replaced = True
+    except Exception as exc:
+        log.warning("⚠️ [Transfer] Lỗi chuyển file %s -> %s: %s", os.path.basename(src_abs), dst_abs, exc)
+        return False
+    finally:
+        if not replaced:
+            _safe_remove(dst_part)
+        for lim in reversed(acquired):
+            lim.release()
+
+    if move:
+        for attempt in range(3):
+            try:
+                if os.path.isfile(src_abs):
+                    os.remove(src_abs)
+                break
+            except OSError:
+                if attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
+    return os.path.isfile(dst_abs) and os.path.getsize(dst_abs) == src_size
 
 
 def _run_ffmpeg_cmd(cmd: list[str], timeout: int = 180, check: bool = False, text: bool = False) -> subprocess.CompletedProcess:
@@ -1461,25 +1972,48 @@ def _run_encode_with_gpu_fallback(build_cmd_fn, output_path: str, timeout: int =
 
 def concat_videos(clip_paths: list[str], output_path: str) -> bool:
     """Ghép nhiều clip video thành 1 video 16s hoàn chỉnh bằng FFmpeg (giới hạn đồng thời qua FFMPEG_SEMAPHORE,
-    tiến trình ưu tiên thấp). Thất bại thì xóa file output dở dang."""
+    tiến trình ưu tiên thấp). Tự xử lý tạm trên ổ SSD (nếu có) rồi mới move atomic sang output_path.
+    Thất bại thì xóa sạch file tạm / output dở dang."""
     if not clip_paths:
         return False
     if len(clip_paths) == 1:
-        import shutil
-        shutil.copy2(clip_paths[0], output_path)
-        return True
+        return atomic_transfer_file(clip_paths[0], output_path, move=False)
 
     t0 = time.time()
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    list_file = os.path.join(tempfile.gettempdir(), f"concat_{int(time.time()*1000)}_{random.randint(100, 999)}.txt")
-    ok = False
-    with FFMPEG_SEMAPHORE:
-        try:
-            with open(list_file, "w", encoding="utf-8") as f:
-                for p in clip_paths:
-                    clean_p = p.replace(os.sep, "/").replace("'", "'\\''")
-                    f.write(f"file '{clean_p}'\n")
+    stage_dir, stage_meta = select_ssd_staging_dir(output_path)
+    staged_inputs: list[str] = []
+    work_clips: list[str] = []
+    staged_out: str | None = None
+    if stage_dir:
+        uid = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        for idx, cp in enumerate(clip_paths):
+            if is_path_on_ssd(cp) is not True:
+                st_in = os.path.join(stage_dir, f"{_SSD_STAGE_PREFIX}catin_{uid}_{idx}_{os.path.basename(cp)}")
+                if atomic_transfer_file(cp, st_in, move=False):
+                    staged_inputs.append(st_in)
+                    work_clips.append(st_in)
+                    continue
+            work_clips.append(cp)
+        staged_out = os.path.join(stage_dir, f"{_SSD_STAGE_PREFIX}catout_{uid}_{os.path.basename(output_path)}")
+        work_output = staged_out
+        list_file = os.path.join(stage_dir, f"{_SSD_STAGE_PREFIX}catlist_{uid}.txt")
+    else:
+        work_clips = list(clip_paths)
+        work_output = output_path
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        list_file = os.path.join(tempfile.gettempdir(), f"concat_{int(time.time()*1000)}_{random.randint(100, 999)}.txt")
 
+    ok_enc = False
+    ok = False
+    enc_sec = 0.0
+    try:
+        with open(list_file, "w", encoding="utf-8") as f:
+            for p in work_clips:
+                clean_p = p.replace(os.sep, "/").replace("'", "'\\''")
+                f.write(f"file '{clean_p}'\n")
+
+        with FFMPEG_SEMAPHORE:
+            t_enc0 = time.time()
             # Thử 1: stream copy (siêu nhanh ~0.1s, giữ nguyên 100% chất lượng, 0% CPU)
             cmd = [
                 "ffmpeg", "-y",
@@ -1489,16 +2023,16 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
                 "-fflags", "+genpts",
                 "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
-                output_path
+                work_output,
             ]
             res = _run_ffmpeg_cmd(cmd, timeout=120)
-            if res.returncode == 0 and os.path.isfile(output_path):
+            if res.returncode == 0 and os.path.isfile(work_output):
                 # Kiểm tra lỗi tràn số 16-bit timebase (khiến Windows Explorer hiện 01:05:32)
                 try:
-                    test_dur = get_media_duration(output_path)
+                    test_dur = get_media_duration(work_output)
                     if test_dur > 25.0:
                         log.warning("concat_videos stream-copy bị lệch timebase (độ dài đọc được %.1fs > 25s), hủy và chuyển sang reencode...", test_dur)
-                        _safe_remove(output_path)
+                        _safe_remove(work_output)
                         res.returncode = 1
                 except Exception:
                     pass
@@ -1506,7 +2040,7 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
             if res.returncode != 0:
                 err1 = (res.stderr.decode("utf-8", errors="ignore") if isinstance(res.stderr, bytes) else str(res.stderr))[-400:]
                 log.warning("concat_videos copy failed: %s; falling back to reencode", err1)
-                _safe_remove(output_path)  # bỏ output dở dang của lần stream-copy
+                _safe_remove(work_output)  # bỏ output dở dang của lần stream-copy
                 # Thử 2: re-encode nếu stream khác codec hoặc timeline (NVENC có kiểm soát slot -> CPU libx264)
                 ok_reenc, err2 = _run_encode_with_gpu_fallback(
                     lambda try_gpu: [
@@ -1518,30 +2052,55 @@ def concat_videos(clip_paths: list[str], output_path: str) -> bool:
                         *_video_encode_args(try_gpu),
                         "-c:a", "aac", "-b:a", "192k",
                         "-movflags", "+faststart",
-                        output_path
+                        work_output,
                     ],
-                    output_path,
+                    work_output,
                     timeout=240,
                 )
                 if not ok_reenc:
                     log.error("concat_videos reencode failed: %s", err2)
-                    ok = False
+                    ok_enc = False
                 else:
-                    ok = True
+                    ok_enc = True
             else:
-                ok = os.path.isfile(output_path) and os.path.getsize(output_path) > 1000
+                ok_enc = os.path.isfile(work_output) and os.path.getsize(work_output) > 1000
+            enc_sec = time.time() - t_enc0
 
-            if ok:
-                log.info("✓ [FFmpeg] Đã ghép 16s thành công: %s (%.2fs)", os.path.basename(output_path), time.time() - t0)
-            return ok
-        except Exception as e:
-            log.warning("Lỗi concat_videos: %s", e)
-            ok = False
+        if not ok_enc:
             return False
-        finally:
-            _safe_remove(list_file)
+
+        # Nhả FFMPEG_SEMAPHORE xong mới chuyển từ SSD tạm sang thư mục output đích
+        if staged_out:
+            t_mv0 = time.time()
+            ok = atomic_transfer_file(staged_out, output_path, move=True)
+            mv_sec = time.time() - t_mv0
             if not ok:
-                _safe_remove(output_path)  # không để lại file video hỏng/dở dang
+                log.warning("concat_videos lỗi move từ SSD tạm %s -> %s", staged_out, output_path)
+                return False
+            if _drive_key(staged_out) != _drive_key(output_path):
+                log.info(
+                    "✓ [FFmpeg] Đã ghép 16s thành công: %s (ghép %.2fs trên SSD %s, move->%s %.2fs, tổng %.2fs)",
+                    os.path.basename(output_path), enc_sec, stage_meta.get("drive") or "SSD",
+                    _drive_key(output_path) or "out", mv_sec, time.time() - t0,
+                )
+            else:
+                log.info("✓ [FFmpeg] Đã ghép 16s thành công: %s (ghép %.2fs, tổng %.2fs)", os.path.basename(output_path), enc_sec, time.time() - t0)
+        else:
+            ok = True
+            log.info("✓ [FFmpeg] Đã ghép 16s thành công: %s (%.2fs)", os.path.basename(output_path), time.time() - t0)
+        return ok
+    except Exception as e:
+        log.warning("Lỗi concat_videos: %s", e)
+        ok = False
+        return False
+    finally:
+        _safe_remove(list_file)
+        for st_in in staged_inputs:
+            _safe_remove(st_in)
+        if staged_out:
+            _safe_remove(staged_out)
+        elif not ok:
+            _safe_remove(output_path)  # không để lại file video hỏng/dở dang
 
 
 def build_video_prompts_16s(product_name: str, scene_choice: str = "🎲 Random", lang: str = "ph", review_style: str = "Unboxing") -> tuple[list[str], str]:
@@ -2212,125 +2771,191 @@ def ghep_anh_12s(
     - Nếu video AI 8s: giữ nguyên tốc độ chuẩn 8s (không làm chậm), tạo Outro ảnh phóng to (zoom-in) 4s -> Tổng 12.0s.
     - Nếu video AI 10s: giữ nguyên tốc độ chuẩn 10s, tạo Outro ảnh phóng to (zoom-in) 2s -> Tổng 12.0s.
     - Xử lý làm mượt âm thanh (fade out tự nhiên cuối đoạn AI) để nối sang Outro không bị giật/nổ tiếng.
-    - Bước encode FFmpeg được giới hạn đồng thời qua FFMPEG_SEMAPHORE (1 lần ffprobe chạy ngoài semaphore),
-      giới hạn -threads 2 / -filter_threads 2 để tránh bùng nổ thread và ưu tiên tiến trình thấp.
-    - Thất bại thì xóa file output dở dang.
+    - Tự động chọn ổ SSD để chạy toàn bộ FFmpeg + -movflags +faststart + kiểm tra độ dài tạm trên SSD,
+      nhả FFMPEG_SEMAPHORE xong mới move atomic (giới hạn 2 luồng/ổ HDD) sang thư mục output đích.
+    - Thất bại thì xóa sạch file tạm / output dở dang.
     """
     if not os.path.isfile(video_path) or not os.path.isfile(image_path):
         return False
 
     t0 = time.time()
-
-    # --- Chuẩn bị (1 lần ffprobe gộp + dựng filter) — KHÔNG giữ semaphore ---
-    try:
-        probed_dur, has_audio, width, height, fps, has_dims = probe_video_meta(video_path)
-        fps_int = int(round(fps))
-        if fps_int <= 0:
-            fps_int = 24
-
-        # Xác định độ dài video AI (8s hoặc 10s): ưu tiên giá trị truyền trực tiếp, rồi thời lượng thật vừa đo
-        if ai_duration is not None and ai_duration > 0:
-            chosen_ai_dur = float(ai_duration)
-        elif probed_dur is not None and probed_dur > 0:
-            chosen_ai_dur = float(probed_dur)
-        elif fallback_duration is not None and fallback_duration > 0:
-            chosen_ai_dur = float(fallback_duration)
-        else:
-            chosen_ai_dur = 8.0
-
-        if chosen_ai_dur >= 9.0:
-            video_dur = 10.0
-            image_dur = 2.0
-        else:
-            video_dur = 8.0
-            image_dur = 4.0
-
-        total_image_frames = int(round(image_dur * fps_int))
-
-        # Hiệu ứng phóng to mượt mà (Zoom-In) 1.0x -> 1.25x trực tiếp ở đúng kích thước width x height
-        # trong không gian yuv420p + fast_bilinear (nhanh gấp ~4x so với upscale 1.3x + bicubic trên RGB/YUV444).
-        zoom_step = 0.25 / max(1, total_image_frames)
-        zoom_expr = f"min(zoom+{zoom_step:.6f},1.25)"
-        x_expr = "iw/2-(iw/zoom/2)"
-        y_expr = "ih/2-(ih/zoom/2)"
-
-        # Video AI nguyên bản, cắt chuẩn video_dur; chỉ tpad khi clip thật sự ngắn hơn video_dur (hoặc chưa đo được)
-        # để tránh nhân bản thừa cả 8s frame rồi cắt bỏ.
-        need_pad = (probed_dur is None) or (probed_dur < (video_dur - 0.05))
-        scale_v0 = "" if has_dims else f"scale={width}:{height}:flags=fast_bilinear,"
-        tpad_v0 = ""
-        if need_pad:
-            pad_sec = max(0.5, video_dur - (probed_dur or 0.0) + 0.5)
-            tpad_v0 = f"tpad=stop_mode=clone:stop_duration={pad_sec:.2f},"
-        v_part = f"[0:v]{scale_v0}fps={fps_int},{tpad_v0}trim=0:{video_dur},setsar=1,setpts=PTS-STARTPTS[v_part]"
-
-        # Outro ảnh chuyển động phóng to (zoom-in): đưa về yuv420p trước zoompan để giảm 3x lượng pixel chroma phải xử lý
-        i_v = (
-            f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase:flags=fast_bilinear,"
-            f"crop={width}:{height},format=yuv420p,"
-            f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height}:fps={fps_int},"
-            f"trim=0:{image_dur},setsar=1,setpts=PTS-STARTPTS[i_v]"
-        )
-
-        filter_parts = [v_part, i_v]
-        if has_audio:
-            fade_dur = 0.6
-            fade_start = max(0.0, video_dur - fade_dur)
-            # Làm mượt âm thanh: chuẩn hóa stereo 48kHz, chỉ apad khi clip ngắn hơn video_dur, fade-out 0.6s cuối AI
-            apad_a0 = f"apad=whole_dur={video_dur}," if need_pad else ""
-            a_part = (
-                f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-                f"{apad_a0}atrim=0:{video_dur},"
-                f"afade=t=out:st={fade_start:.2f}:d={fade_dur:.2f},asetpts=PTS-STARTPTS[a_part]"
-            )
-            i_a = f"anullsrc=r=48000:cl=stereo,atrim=0:{image_dur},asetpts=PTS-STARTPTS[i_a]"
-            concat = "[v_part][a_part][i_v][i_a]concat=n=2:v=1:a=1[outv][outa]"
-            filter_parts.extend([a_part, i_a, concat])
-            map_args = ["-map", "[outv]", "-map", "[outa]"]
-        else:
-            concat = "[v_part][i_v]concat=n=2:v=1:a=0[outv]"
-            filter_parts.append(concat)
-            map_args = ["-map", "[outv]"]
-
-        filter_complex_str = "; ".join(filter_parts)
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
-        # -reinit_filter 0: tránh FFmpeg reset filter khi clip Muse đổi pix_fmt giữa chừng.
-        # -sws_flags fast_bilinear: tăng tốc mạnh bộ lọc zoompan đơn luồng.
-        base_cmd = [
-            "ffmpeg", "-y",
-            *_ffmpeg_global_thread_args(),
-            "-sws_flags", "fast_bilinear",
-            "-threads", "2", "-reinit_filter", "0", "-i", video_path,
-            "-i", image_path,
-            "-filter_complex", filter_complex_str,
-            *map_args,
-            "-max_muxing_queue_size", "1024",
-        ]
-    except Exception as e:
-        log.warning("Lỗi chuẩn bị ghép video 12s: %s", e)
-        return False
-
-    # --- Encode (nặng) — giới hạn đồng thời qua FFMPEG_SEMAPHORE, GPU NVENC (giới hạn slot) hoặc CPU libx264 ---
+    stage_dir, stage_meta = select_ssd_staging_dir(output_path)
+    staged_in_video: str | None = None
+    staged_in_image: str | None = None
+    staged_out: str | None = None
     ok = False
-    with FFMPEG_SEMAPHORE:
-        try:
-            def _build(try_gpu: bool) -> list[str]:
-                cmd = list(base_cmd) + _video_encode_args(try_gpu)
-                if has_audio:
-                    cmd.extend(["-c:a", "aac", "-b:a", "128k"])
-                cmd.extend(["-movflags", "+faststart", output_path])
-                return cmd
 
-            ok, last_err = _run_encode_with_gpu_fallback(_build, output_path, timeout=90)
-            if not ok:
-                log.warning("ghep_anh_12s failed: %s", last_err)
-                return False
-            log.info("✓ [FFmpeg] Đã ghép Outro 12s vào %s thành công (%.2fs)", os.path.basename(output_path), time.time() - t0)
-            return True
+    try:
+        if stage_dir:
+            uid = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+            # Nếu video/ảnh nguồn đang nằm trên HDD (VD: nút Ghép Clip Temp trên E:\PH\temp), copy tuần tự lên SSD trước
+            if is_path_on_ssd(video_path) is not True:
+                cand_in_v = os.path.join(stage_dir, f"{_SSD_STAGE_PREFIX}inv_{uid}_{os.path.basename(video_path)}")
+                if atomic_transfer_file(video_path, cand_in_v, move=False):
+                    staged_in_video = cand_in_v
+            if is_path_on_ssd(image_path) is not True:
+                cand_in_i = os.path.join(stage_dir, f"{_SSD_STAGE_PREFIX}ini_{uid}_{os.path.basename(image_path)}")
+                if atomic_transfer_file(image_path, cand_in_i, move=False):
+                    staged_in_image = cand_in_i
+            work_video = staged_in_video or video_path
+            work_image = staged_in_image or image_path
+            staged_out = os.path.join(stage_dir, f"{_SSD_STAGE_PREFIX}out_{uid}_{os.path.basename(output_path)}")
+            work_output = staged_out
+        else:
+            work_video = video_path
+            work_image = image_path
+            work_output = output_path
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+        # --- Chuẩn bị (1 lần ffprobe gộp + dựng filter) — chạy trên SSD, KHÔNG giữ semaphore ---
+        try:
+            probed_dur, has_audio, width, height, fps, has_dims = probe_video_meta(work_video)
+            fps_int = int(round(fps))
+            if fps_int <= 0:
+                fps_int = 24
+
+            # Xác định độ dài video AI (8s hoặc 10s): ưu tiên giá trị truyền trực tiếp, rồi thời lượng thật vừa đo
+            if ai_duration is not None and ai_duration > 0:
+                chosen_ai_dur = float(ai_duration)
+            elif probed_dur is not None and probed_dur > 0:
+                chosen_ai_dur = float(probed_dur)
+            elif fallback_duration is not None and fallback_duration > 0:
+                chosen_ai_dur = float(fallback_duration)
+            else:
+                chosen_ai_dur = 8.0
+
+            if chosen_ai_dur >= 9.0:
+                video_dur = 10.0
+                image_dur = 2.0
+            else:
+                video_dur = 8.0
+                image_dur = 4.0
+
+            total_image_frames = int(round(image_dur * fps_int))
+
+            # Hiệu ứng phóng to mượt mà (Zoom-In) 1.0x -> 1.25x trực tiếp ở đúng kích thước width x height
+            # trong không gian yuv420p + fast_bilinear (nhanh gấp ~4x so với upscale 1.3x + bicubic trên RGB/YUV444).
+            zoom_step = 0.25 / max(1, total_image_frames)
+            zoom_expr = f"min(zoom+{zoom_step:.6f},1.25)"
+            x_expr = "iw/2-(iw/zoom/2)"
+            y_expr = "ih/2-(ih/zoom/2)"
+
+            # Video AI nguyên bản, cắt chuẩn video_dur; chỉ tpad khi clip thật sự ngắn hơn video_dur (hoặc chưa đo được)
+            # để tránh nhân bản thừa cả 8s frame rồi cắt bỏ.
+            need_pad = (probed_dur is None) or (probed_dur < (video_dur - 0.05))
+            scale_v0 = "" if has_dims else f"scale={width}:{height}:flags=fast_bilinear,"
+            tpad_v0 = ""
+            if need_pad:
+                pad_sec = max(0.5, video_dur - (probed_dur or 0.0) + 0.5)
+                tpad_v0 = f"tpad=stop_mode=clone:stop_duration={pad_sec:.2f},"
+            v_part = f"[0:v]{scale_v0}fps={fps_int},{tpad_v0}trim=0:{video_dur},setsar=1,setpts=PTS-STARTPTS[v_part]"
+
+            # Outro ảnh chuyển động phóng to (zoom-in): đưa về yuv420p trước zoompan để giảm 3x lượng pixel chroma phải xử lý
+            i_v = (
+                f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase:flags=fast_bilinear,"
+                f"crop={width}:{height},format=yuv420p,"
+                f"zoompan=z='{zoom_expr}':d={total_image_frames}:x='{x_expr}':y='{y_expr}':s={width}x{height}:fps={fps_int},"
+                f"trim=0:{image_dur},setsar=1,setpts=PTS-STARTPTS[i_v]"
+            )
+
+            filter_parts = [v_part, i_v]
+            if has_audio:
+                fade_dur = 0.6
+                fade_start = max(0.0, video_dur - fade_dur)
+                # Làm mượt âm thanh: chuẩn hóa stereo 48kHz, chỉ apad khi clip ngắn hơn video_dur, fade-out 0.6s cuối AI
+                apad_a0 = f"apad=whole_dur={video_dur}," if need_pad else ""
+                a_part = (
+                    f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                    f"{apad_a0}atrim=0:{video_dur},"
+                    f"afade=t=out:st={fade_start:.2f}:d={fade_dur:.2f},asetpts=PTS-STARTPTS[a_part]"
+                )
+                i_a = f"anullsrc=r=48000:cl=stereo,atrim=0:{image_dur},asetpts=PTS-STARTPTS[i_a]"
+                concat = "[v_part][a_part][i_v][i_a]concat=n=2:v=1:a=1[outv][outa]"
+                filter_parts.extend([a_part, i_a, concat])
+                map_args = ["-map", "[outv]", "-map", "[outa]"]
+            else:
+                concat = "[v_part][i_v]concat=n=2:v=1:a=0[outv]"
+                filter_parts.append(concat)
+                map_args = ["-map", "[outv]"]
+
+            filter_complex_str = "; ".join(filter_parts)
+
+            # -reinit_filter 0: tránh FFmpeg reset filter khi clip Muse đổi pix_fmt giữa chừng.
+            # -sws_flags fast_bilinear: tăng tốc mạnh bộ lọc zoompan đơn luồng.
+            base_cmd = [
+                "ffmpeg", "-y",
+                *_ffmpeg_global_thread_args(),
+                "-sws_flags", "fast_bilinear",
+                "-threads", "2", "-reinit_filter", "0", "-i", work_video,
+                "-i", work_image,
+                "-filter_complex", filter_complex_str,
+                *map_args,
+                "-max_muxing_queue_size", "1024",
+            ]
         except Exception as e:
-            log.warning("Lỗi ghép video 12s bằng ffmpeg: %s", e)
+            log.warning("Lỗi chuẩn bị ghép video 12s: %s", e)
             return False
-        finally:
+
+        # --- Encode (nặng) trên SSD — giới hạn đồng thời qua FFMPEG_SEMAPHORE ---
+        ok_enc = False
+        enc_sec = 0.0
+        with FFMPEG_SEMAPHORE:
+            t_enc0 = time.time()
+            try:
+                def _build(try_gpu: bool) -> list[str]:
+                    cmd = list(base_cmd) + _video_encode_args(try_gpu)
+                    if has_audio:
+                        cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+                    cmd.extend(["-movflags", "+faststart", work_output])
+                    return cmd
+
+                ok_enc, last_err = _run_encode_with_gpu_fallback(_build, work_output, timeout=90)
+                enc_sec = time.time() - t_enc0
+                if not ok_enc:
+                    log.warning("ghep_anh_12s failed: %s", last_err)
+                    return False
+            except Exception as e:
+                log.warning("Lỗi ghép video 12s bằng ffmpeg: %s", e)
+                return False
+
+        # --- Ngoài FFMPEG_SEMAPHORE: kiểm tra hợp lệ trên SSD rồi mới move atomic sang thư mục output ---
+        if staged_out:
+            out_dur = probe_media_duration(staged_out)
+            if out_dur is not None and abs(out_dur - total_duration) > OUTRO_TOLERANCE_SECONDS:
+                log.warning(
+                    "ghep_anh_12s: video ghép trên SSD dài %.2fs (kỳ vọng %.1fs) -> hủy không move sang output",
+                    out_dur, total_duration,
+                )
+                return False
+            t_mv0 = time.time()
+            ok = atomic_transfer_file(staged_out, output_path, move=True)
+            mv_sec = time.time() - t_mv0
             if not ok:
-                _safe_remove(output_path)  # không để lại file video hỏng/dở dang
+                log.warning("ghep_anh_12s lỗi move từ SSD tạm %s -> %s", staged_out, output_path)
+                return False
+            if _drive_key(staged_out) != _drive_key(output_path):
+                log.info(
+                    "✓ [FFmpeg] Đã ghép Outro 12s vào %s thành công (encode %.2fs trên SSD %s, move->%s %.2fs, tổng %.2fs)",
+                    os.path.basename(output_path), enc_sec, stage_meta.get("drive") or "SSD",
+                    _drive_key(output_path) or "out", mv_sec, time.time() - t0,
+                )
+            else:
+                log.info(
+                    "✓ [FFmpeg] Đã ghép Outro 12s vào %s thành công (encode %.2fs, tổng %.2fs)",
+                    os.path.basename(output_path), enc_sec, time.time() - t0,
+                )
+            return True
+
+        ok = True
+        log.info("✓ [FFmpeg] Đã ghép Outro 12s vào %s thành công (encode %.2fs, tổng %.2fs)", os.path.basename(output_path), enc_sec, time.time() - t0)
+        return True
+    except Exception as e:
+        log.warning("Lỗi ghép video 12s: %s", e)
+        return False
+    finally:
+        _safe_remove(staged_in_video)
+        _safe_remove(staged_in_image)
+        if staged_out:
+            _safe_remove(staged_out)
+        elif not ok:
+            _safe_remove(output_path)  # không để lại file video hỏng/dở dang
